@@ -119,6 +119,7 @@ func TestHostilePeer(t *testing.T) {
 		confirm = `{"wg_public_key":"` + testKey + `"}`
 	)
 	helloWith := func(body string) string { return `{"type":"hello","hello":` + body + `}` + "\n" }
+	wl := testWelcome()
 	toServer := map[string]string{
 		"oversized line":    strings.Repeat("a", MaxMessageSize+1),
 		"no newline":        `{"type":"ok"}`,
@@ -126,7 +127,8 @@ func TestHostilePeer(t *testing.T) {
 		"no body":           `{"type":"hello"}` + "\n",
 		"two bodies":        `{"type":"hello","hello":` + hello + `,"confirm":` + confirm + `}` + "\n",
 		"mismatched body":   `{"type":"hello","confirm":` + confirm + `}` + "\n",
-		"welcome to server": `{"type":"ok"}` + "\n",
+		"ok to server":      `{"type":"ok"}` + "\n",
+		"welcome to server": wire(t, message{Type: "welcome", Welcome: &wl}),
 		"duplicate key":     `{"type":"hello","type":"hello","hello":` + hello + `}` + "\n",
 		"unknown field":     helloWith(`{"x":1,"name":"homelab","protocol":"meshly-pair/1","wg_public_key":"` + testKey + `"}`),
 		"capitalised key":   `{"Type":"hello","hello":` + hello + `}` + "\n",
@@ -173,6 +175,17 @@ func TestHostilePeer(t *testing.T) {
 		})
 	}
 
+	t.Run("silent peer joiner", func(t *testing.T) {
+		a, b := net.Pipe()
+		defer a.Close()
+		defer b.Close()
+		go io.Copy(io.Discard, b)
+		_, err := RequestJoin(a, time.Now().Add(50*time.Millisecond), testHello())
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("got %v, want deadline exceeded", err)
+		}
+	})
+
 	t.Run("silent peer", func(t *testing.T) {
 		_, err := ReadRequest(feed(t, "", true), time.Now().Add(50*time.Millisecond))
 		if !errors.Is(err, os.ErrDeadlineExceeded) {
@@ -215,5 +228,24 @@ func TestWriteRefusesInvalid(t *testing.T) {
 	}
 	if err := WriteReject(a, soon(), Reject{Reason: ReasonInvalid, Message: "a\x00"}); err == nil {
 		t.Fatal("non-printable reject was written")
+	}
+}
+
+func TestMessageSizeBoundary(t *testing.T) {
+	line := func(n int) string {
+		h := testHello()
+		base := wire(t, message{Type: "hello", Hello: &h})
+		return strings.TrimSuffix(base, "\n") + strings.Repeat(" ", n-len(base)) + "\n"
+	}
+	if l := line(MaxMessageSize); len(l) != MaxMessageSize {
+		t.Fatalf("test line is %d bytes", len(l))
+	}
+	req, err := ReadRequest(feed(t, line(MaxMessageSize), false), soon())
+	if err != nil || req.Hello == nil {
+		t.Fatalf("4096-byte line: %v", err)
+	}
+	_, err = ReadRequest(feed(t, line(MaxMessageSize+1), false), soon())
+	if !errors.Is(err, ErrProtocol) {
+		t.Fatalf("4097-byte line: got %v, want ErrProtocol", err)
 	}
 }
