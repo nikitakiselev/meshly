@@ -1,0 +1,9 @@
+/bin/
+/dist/
+*.test
+*.out
+/test/integration/.work/
+.DS_Store
+# never commit release signing keys
+*.key
+!internal/**/testdata/*.key

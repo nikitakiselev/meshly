@@ -1,0 +1,6 @@
+# Managed by meshly: systemd-networkd must not configure the meshly interface.
+[Match]
+Name=@IFACE@
+
+[Link]
+Unmanaged=yes

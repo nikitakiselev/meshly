@@ -1,0 +1,11 @@
+# Managed by meshly.
+[Unit]
+Description=Meshly periodic integrity check
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
