@@ -36,6 +36,7 @@ fuzz:
 	go test ./internal/model -run '^$$' -fuzz FuzzParseCIDR -fuzztime $(FUZZTIME)
 	go test ./internal/nft -run '^$$' -fuzz FuzzParseRuleset -fuzztime $(FUZZTIME)
 	go test ./internal/pairing -run '^$$' -fuzz FuzzParseCode -fuzztime $(FUZZTIME)
+	go test ./internal/pairing -run '^$$' -fuzz FuzzReadRequest -fuzztime $(FUZZTIME)
 	go test ./internal/store -run '^$$' -fuzz FuzzDecodeConfig -fuzztime $(FUZZTIME)
 
 # Integration tests run in privileged Docker containers, each with its own
