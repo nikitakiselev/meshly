@@ -1,0 +1,225 @@
+// Package pairing implements the one-time invite code that links two nodes:
+// the code format and the temporary keys derived from its secret.
+package pairing
+
+import (
+	"bytes"
+	"crypto/hkdf"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base32"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"math"
+	"net/netip"
+	"strings"
+	"time"
+	"unicode"
+
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+
+	"github.com/nikitakiselev/meshly/internal/model"
+)
+
+const (
+	DefaultTTL = 10 * time.Minute
+	MinTTL     = time.Minute
+	MaxTTL     = time.Hour
+	// ClockSkew is how long past its expiry a code is still accepted, to
+	// tolerate unsynchronized clocks.
+	ClockSkew = 5 * time.Minute
+)
+
+var (
+	ErrMalformed = errors.New("the invite code is damaged or incomplete")
+	ErrVersion   = errors.New("the invite code was made by another meshly version; upgrade meshly on both nodes")
+	ErrExpired   = errors.New("the invite code has expired")
+)
+
+const (
+	prefix    = "m1"
+	domain    = "meshly-pair/1"
+	checkLen  = 4
+	secretLen = 16
+)
+
+var b32 = base32.StdEncoding.WithPadding(base32.NoPadding)
+
+// Code is the content of an invite code. Secret is key material: never
+// print or log a Code.
+type Code struct {
+	Endpoint   netip.AddrPort // inviter's public UDP endpoint
+	InviterKey string         // inviter's WireGuard public key, base64
+	CIDR       netip.Prefix
+	ExpiresAt  time.Time // whole seconds, UTC
+	Secret     [secretLen]byte
+}
+
+// NewCode validates the fields and returns a Code with a fresh random
+// secret. expiresAt is truncated to whole seconds.
+func NewCode(endpoint netip.AddrPort, inviterKey string, cidr netip.Prefix, expiresAt time.Time) (*Code, error) {
+	c := &Code{
+		Endpoint:   endpoint,
+		InviterKey: inviterKey,
+		CIDR:       cidr,
+		ExpiresAt:  expiresAt.Truncate(time.Second).UTC(),
+	}
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	if _, err := rand.Read(c.Secret[:]); err != nil {
+		return nil, fmt.Errorf("read random secret: %w", err)
+	}
+	return c, nil
+}
+
+func (c *Code) validate() error {
+	if a := c.Endpoint.Addr(); a.Is4In6() {
+		return errors.New("endpoint must be a plain IPv4 or IPv6 address")
+	}
+	if err := model.ValidateEndpoint(c.Endpoint); err != nil {
+		return fmt.Errorf("endpoint: %w", err)
+	}
+	if err := model.ValidateWGPublicKey(c.InviterKey); err != nil {
+		return fmt.Errorf("inviter key: %w", err)
+	}
+	if err := model.ValidateCIDR(c.CIDR); err != nil {
+		return fmt.Errorf("CIDR: %w", err)
+	}
+	if u := c.ExpiresAt.Unix(); u < 0 || u > math.MaxUint32 {
+		return errors.New("expiry is out of range")
+	}
+	return nil
+}
+
+func checksum(body []byte) []byte {
+	h := sha256.New()
+	h.Write([]byte(domain))
+	h.Write([]byte{0})
+	h.Write(body)
+	return h.Sum(nil)[:checkLen]
+}
+
+// String returns the text form of the code. It contains the secret.
+func (c *Code) String() string {
+	var b []byte
+	if c.Endpoint.Addr().Is4() {
+		b = append(b, 4)
+		a := c.Endpoint.Addr().As4()
+		b = append(b, a[:]...)
+	} else {
+		b = append(b, 6)
+		a := c.Endpoint.Addr().As16()
+		b = append(b, a[:]...)
+	}
+	b = binary.BigEndian.AppendUint16(b, c.Endpoint.Port())
+	key, _ := wgtypes.ParseKey(c.InviterKey)
+	b = append(b, key[:]...)
+	base := c.CIDR.Addr().As4()
+	b = append(b, base[:]...)
+	b = append(b, byte(c.CIDR.Bits()))
+	b = binary.BigEndian.AppendUint32(b, uint32(c.ExpiresAt.Unix()))
+	b = append(b, c.Secret[:]...)
+	b = append(b, checksum(b)...)
+	return prefix + strings.ToLower(b32.EncodeToString(b))
+}
+
+// ParseCode decodes and validates a code typed or pasted by a person:
+// whitespace anywhere and letter case are ignored. A code is accepted up to
+// ClockSkew past its expiry.
+func ParseCode(s string, now time.Time) (*Code, error) {
+	s = strings.ToLower(strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s))
+	if len(s) >= 2 && s[0] == 'm' && s[1] >= '0' && s[1] <= '9' && s[:2] != prefix {
+		return nil, ErrVersion
+	}
+	if !strings.HasPrefix(s, prefix) {
+		return nil, ErrMalformed
+	}
+	raw, err := b32.DecodeString(strings.ToUpper(s[len(prefix):]))
+	if err != nil || len(raw) < 1+4+2+32+4+1+4+secretLen+checkLen {
+		return nil, ErrMalformed
+	}
+	body, sum := raw[:len(raw)-checkLen], raw[len(raw)-checkLen:]
+	if !bytes.Equal(sum, checksum(body)) {
+		return nil, ErrMalformed
+	}
+
+	var c Code
+	var ip netip.Addr
+	switch body[0] {
+	case 4:
+		if len(body) != 64 {
+			return nil, ErrMalformed
+		}
+		ip = netip.AddrFrom4([4]byte(body[1:5]))
+		body = body[5:]
+	case 6:
+		if len(body) != 76 {
+			return nil, ErrMalformed
+		}
+		ip = netip.AddrFrom16([16]byte(body[1:17]))
+		body = body[17:]
+	default:
+		return nil, ErrMalformed
+	}
+	c.Endpoint = netip.AddrPortFrom(ip, binary.BigEndian.Uint16(body))
+	c.InviterKey = wgtypes.Key(body[2:34]).String()
+	c.CIDR = netip.PrefixFrom(netip.AddrFrom4([4]byte(body[34:38])), int(body[38]))
+	c.ExpiresAt = time.Unix(int64(binary.BigEndian.Uint32(body[39:43])), 0).UTC()
+	copy(c.Secret[:], body[43:])
+	if c.validate() != nil {
+		return nil, ErrMalformed
+	}
+	if now.After(c.ExpiresAt.Add(ClockSkew)) {
+		return nil, fmt.Errorf("%w (valid until %s, now %s)", ErrExpired,
+			c.ExpiresAt.Format(time.RFC3339), now.UTC().Format(time.RFC3339))
+	}
+	return &c, nil
+}
+
+// Addresses returns the VPN addresses of the inviter and the joiner.
+func (c *Code) Addresses() (inviter, joiner netip.Addr) {
+	inviter, joiner, _ = model.AllocateAddresses(c.CIDR)
+	return inviter, joiner
+}
+
+// Wipe zeroes the secret.
+func (c *Code) Wipe() { clear(c.Secret[:]) }
+
+// Secrets are the temporary keys derived from a code's secret.
+type Secrets struct {
+	PrivateKey   wgtypes.Key // temporary WireGuard key of the joiner
+	PresharedKey wgtypes.Key
+}
+
+// Secrets derives the temporary keys with HKDF-SHA256.
+func (c *Code) Secrets() (*Secrets, error) {
+	priv, err := hkdf.Key(sha256.New, c.Secret[:], nil, domain+" wireguard-key", 32)
+	if err != nil {
+		return nil, fmt.Errorf("derive key: %w", err)
+	}
+	psk, err := hkdf.Key(sha256.New, c.Secret[:], nil, domain+" preshared-key", 32)
+	if err != nil {
+		return nil, fmt.Errorf("derive key: %w", err)
+	}
+	// Clamp as in RFC 7748.
+	priv[0] &= 248
+	priv[31] &= 127
+	priv[31] |= 64
+	return &Secrets{PrivateKey: wgtypes.Key(priv), PresharedKey: wgtypes.Key(psk)}, nil
+}
+
+// TempPublicKey returns the base64 public key of the temporary key.
+func (s *Secrets) TempPublicKey() string { return s.PrivateKey.PublicKey().String() }
+
+// Wipe zeroes the keys.
+func (s *Secrets) Wipe() {
+	clear(s.PrivateKey[:])
+	clear(s.PresharedKey[:])
+}
