@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src=".github/assets/banner.png" alt="meshly" width="100%">
+<img src=".github/assets/banner.webp" alt="meshly" width="100%">
 
 **A private, default-deny WireGuard link between two Linux servers: one command per step, nothing open by accident.**
 
@@ -24,13 +24,12 @@ monitoring, backups. meshly connects them in a few commands, without config file
 and without setting up WireGuard and a firewall by hand. Only what you allow gets
 through, for example `meshly allow 22/tcp from home`.
 
-```text
- home server (behind NAT)                                VPS (public IP)
- ┌───────────────────────┐   WireGuard, UDP 51820    ┌───────────────────────┐
- │ meshly0  10.100.0.2   │ ◄────────────────────────►│ meshly0  10.100.0.1   │
- │ allow 9100/tcp from vps│                           │ allow 22/tcp from home│
- └───────────────────────┘                           └───────────────────────┘
-   LAN, Docker networks and the public interfaces are never exposed to the peer
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 400}}}%%
+flowchart LR
+    home["🏠 <b>home</b> · behind NAT<br/>10.100.0.2<br/><br/>✅ :9100 open for vps<br/>🔒 LAN, Docker, the rest"]
+    vps["☁️ <b>VPS</b> · public IP<br/>10.100.0.1<br/><br/>✅ :22 open for home<br/>🔒 Docker, the rest"]
+    home <==>|"🔐 WireGuard<br/>UDP 51820"| vps
 ```
 
 > [!NOTE]

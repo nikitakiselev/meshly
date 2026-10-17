@@ -4,7 +4,8 @@ Images generated with ChatGPT from the prompts stored next to them, so they can 
 
 | File | Size | Use | Prompt |
 |---|---|---|---|
-| `banner.png` | 2172×724 (3:1) | README header | [`banner-prompt.json`](banner-prompt.json) |
+| `banner.png` | 2172×724 (3:1) | Source of the README header | [`banner-prompt.json`](banner-prompt.json) |
+| `banner.webp` | 1760×587 (3:1) | README header, 165 KB | `cwebp -q 85 -m 6 -resize 1760 0 banner.png -o banner.webp` |
 | `banner-alt.png` | 2172×724 (3:1) | Alternative header | [`banner-alt-prompt.json`](banner-alt-prompt.json) |
 | `logo.png` | 1254×1254 | Square icon, social avatar | [`logo-prompt.json`](logo-prompt.json), in the same chat as the banner |
 | `logo-512.png` | 512×512 | Web / app icon | resized from `logo.png` |

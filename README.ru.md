@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src=".github/assets/banner.png" alt="meshly" width="100%">
+<img src=".github/assets/banner.webp" alt="meshly" width="100%">
 
 **Закрытый по умолчанию WireGuard-канал между двумя Linux-серверами: одна команда на шаг и ничего не открыто случайно.**
 
@@ -24,13 +24,12 @@ meshly соединит их за несколько команд, без кон
 и firewall. Через канал будет доступно только то, что вы разрешили, например
 `meshly allow 22/tcp from home`.
 
-```text
- домашний сервер (за NAT)                                VPS (публичный IP)
- ┌───────────────────────┐   WireGuard, UDP 51820    ┌───────────────────────┐
- │ meshly0  10.100.0.2   │ ◄────────────────────────►│ meshly0  10.100.0.1   │
- │ allow 9100/tcp from vps│                           │ allow 22/tcp from home│
- └───────────────────────┘                           └───────────────────────┘
-   локальная сеть, сети Docker и публичные интерфейсы соседу не открываются
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 400}}}%%
+flowchart LR
+    home["🏠 <b>home</b> · за NAT<br/>10.100.0.2<br/><br/>✅ :9100 открыт для vps<br/>🔒 LAN, Docker, остальное"]
+    vps["☁️ <b>VPS</b> · белый IP<br/>10.100.0.1<br/><br/>✅ :22 открыт для home<br/>🔒 Docker, остальное"]
+    home <==>|"🔐 WireGuard<br/>UDP 51820"| vps
 ```
 
 > [!NOTE]

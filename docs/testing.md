@@ -96,14 +96,18 @@ distributions (default: both).
 
 Topology of each lab:
 
-```
-                     wan 198.51.100.0/24
-   vps .10 ───────────────┬───────────────── attacker .66
-                          │
-                     natgw .2 (masquerade)
-                          │ .2
-                     lan 192.168.77.0/24
-   home .10 ──────────────┴───────────────── lanhost .20
+```mermaid
+flowchart TB
+    subgraph wan["wan 198.51.100.0/24"]
+        vps["vps .10"]
+        attacker["attacker .66"]
+    end
+    natgw["natgw .2<br/>masquerade"]
+    subgraph lan["lan 192.168.77.0/24"]
+        home["home .10"]
+        lanhost["lanhost .20"]
+    end
+    wan --- natgw --- lan
 ```
 
 Images: `node.Dockerfile` on Debian 12 and Ubuntu 24.04 (nftables,
