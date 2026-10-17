@@ -13,11 +13,11 @@
 
 </div>
 
-meshly connects a server with a public IP (for example a VPS) and a server
-behind NAT (for example a home server) over kernel WireGuard. It owns the
-whole lifecycle: keys, interface, addresses, routes, nftables policy and the
-systemd service. Nothing is reachable through the tunnel until you allow it
-explicitly, port by port and peer by peer.
+meshly joins two Linux servers into one private network. For example, a VPS
+in the cloud and a home server behind your router: once set up, they reach each
+other at `10.100.0.1` and `10.100.0.2`, as if they were on the same local
+network. The connection is encrypted (WireGuard), and everything is closed by
+default: you decide which ports one server may connect to on the other.
 
 ```text
  home server (behind NAT)                                VPS (public IP)
