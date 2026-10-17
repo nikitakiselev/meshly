@@ -34,7 +34,7 @@ func (a *App) cmdInvite(ctx context.Context, args []string) error {
 	if *ttl < pairing.MinTTL || *ttl > pairing.MaxTTL {
 		return errorf(ExitUsage, "--ttl must be between %s and %s", humanDuration(pairing.MinTTL), humanDuration(pairing.MaxTTL))
 	}
-	defer a.quiet()()
+	defer a.progressToStderr()()
 	// The lock is held until the invite is closed: the check timer must not
 	// "repair" the temporary peer away, and no other change may interleave.
 	s, err := a.begin(ctx)
@@ -81,7 +81,7 @@ func (a *App) cmdInvite(ctx context.Context, args []string) error {
 // confirmed, the code expires or Ctrl+C. Every path closes it again.
 func (a *App) runInvite(ctx context.Context, cfg *model.Config, code *pairing.Code, sec *pairing.Secrets, ttl time.Duration) (*model.Peer, error) {
 	inviter, joiner := code.Addresses()
-	st := &inviteSession{a: a, ctx: ctx, code: code, sec: sec, t: a.pairTimeouts(), joiner: joiner, base: cfg}
+	st := &inviteSession{a: a, ctx: ctx, code: code, sec: sec, joiner: joiner, base: cfg}
 	wctx, stop := a.waitContext(ctx)
 	defer stop()
 	if err := st.arm(); err != nil {
@@ -107,7 +107,7 @@ func (a *App) runInvite(ctx context.Context, cfg *model.Config, code *pairing.Co
 	if err != nil {
 		return nil, fmt.Errorf("cannot listen for the joining node: %w", err)
 	}
-	srv = servePairing(l, st.t.Exchange)
+	srv = servePairing(l, a.pairTimeouts().Exchange)
 	expired := a.after(code.ExpiresAt.Sub(a.Now()))
 
 	fmt.Fprintf(a.Stderr, "Waiting for a node to join network %q until %s (%s). Ctrl+C cancels.\n", cfg.Network.Name, clockTime(code.ExpiresAt), humanDuration(ttl))
@@ -115,6 +115,11 @@ func (a *App) runInvite(ctx context.Context, cfg *model.Config, code *pairing.Co
 	fmt.Fprintln(a.Stdout, code.String())
 	fmt.Fprintln(a.Stderr)
 
+	joined := func() (*model.Peer, error) {
+		peer := st.member.Peers[len(st.member.Peers)-1]
+		outcome = "joined " + peer.Name
+		return &peer, nil
+	}
 	for {
 		// A node that joined in time may still confirm after the expiry.
 		armedExpiry := expired
@@ -134,13 +139,20 @@ func (a *App) runInvite(ctx context.Context, cfg *model.Config, code *pairing.Co
 			outcome = "expired"
 			return nil, errorf(ExitUnreachable, "the invite expired and no node joined")
 		case <-st.confirmDue():
+			// The deadline and a confirmation may come together.
+			if confirmed, err := st.servePending(srv); err != nil || confirmed {
+				if err != nil {
+					return nil, err
+				}
+				return joined()
+			}
 			if err := st.undo(); err != nil {
 				return nil, err
 			}
 			select {
 			case <-expired:
 				outcome = "expired"
-				return nil, errorf(ExitUnreachable, "the invite expired and no node joined")
+				return nil, errorf(ExitUnreachable, "the invite expired; the node that joined did not confirm the connection")
 			default:
 			}
 			if err := st.arm(); err != nil {
@@ -148,19 +160,12 @@ func (a *App) runInvite(ctx context.Context, cfg *model.Config, code *pairing.Co
 			}
 			fmt.Fprintf(a.Stderr, "The code stays valid until %s.\n", clockTime(code.ExpiresAt))
 		case in := <-srv.requests:
-			if in.err != nil {
-				srv.drop(in.conn)
-				continue
-			}
-			confirmed, err := st.answer(in.conn, in.req)
-			srv.drop(in.conn)
+			confirmed, err := st.serve(srv, in)
 			if err != nil {
 				return nil, err
 			}
 			if confirmed {
-				peer := st.member.Peers[len(st.member.Peers)-1]
-				outcome = "joined " + peer.Name
-				return &peer, nil
+				return joined()
 			}
 		}
 	}
@@ -174,7 +179,6 @@ type inviteSession struct {
 	ctx    context.Context // for transactions: Ctrl+C never cancels it
 	code   *pairing.Code
 	sec    *pairing.Secrets
-	t      pairing.Timeouts
 	joiner netip.Addr
 	base   *model.Config // the saved configuration without the new node
 	member *model.Config // the saved configuration with it, while committed
@@ -186,9 +190,34 @@ func (s *inviteSession) arm() error {
 	return s.a.applyOverlay(s.ctx, s.base, inviterOverlay(s.code, s.sec, true))
 }
 
+// serve answers one request read by srv, closes its connection and reports
+// whether the new node confirmed.
+func (s *inviteSession) serve(srv *pairServer, in inbound) (bool, error) {
+	defer srv.drop(in.conn)
+	if in.err != nil {
+		return false, nil
+	}
+	return s.answer(in.conn, in.req)
+}
+
+// servePending serves, without waiting, the requests srv has already read;
+// it stops at a confirmation.
+func (s *inviteSession) servePending(srv *pairServer) (bool, error) {
+	for {
+		select {
+		case in := <-srv.requests:
+			if confirmed, err := s.serve(srv, in); err != nil || confirmed {
+				return confirmed, err
+			}
+		default:
+			return false, nil
+		}
+	}
+}
+
 // answer replies to one request and reports whether the new node confirmed.
 func (s *inviteSession) answer(c net.Conn, req *pairing.Request) (bool, error) {
-	deadline := time.Now().Add(s.t.Exchange)
+	deadline := time.Now().Add(s.a.pairTimeouts().Exchange)
 	reject := func(reason, format string, args ...any) {
 		_ = pairing.WriteReject(c, deadline, pairing.Reject{Reason: reason, Message: fmt.Sprintf(format, args...)})
 	}
@@ -226,7 +255,8 @@ func (s *inviteSession) admit(c net.Conn, h *pairing.Hello) error {
 		Inviter: pairing.Node{Name: cfg.Self.Name, Address: cfg.Self.Address, WGPublicKey: cfg.Self.WGPublicKey, Endpoint: cfg.Self.Endpoint},
 		Address: s.joiner,
 	}
-	if err := pairing.WriteWelcome(c, time.Now().Add(s.t.Exchange), w); err != nil {
+	t := a.pairTimeouts()
+	if err := pairing.WriteWelcome(c, time.Now().Add(t.Exchange), w); err != nil {
 		return nil // the node went away
 	}
 	_ = c.Close()
@@ -248,7 +278,7 @@ func (s *inviteSession) admit(c net.Conn, h *pairing.Hello) error {
 		return nil
 	}
 	s.member = target
-	s.timer = time.NewTimer(s.t.Confirm)
+	s.timer = time.NewTimer(t.Confirm)
 	return nil
 }
 
@@ -321,11 +351,12 @@ func (a *App) applyOverlay(ctx context.Context, cfg *model.Config, ov *engine.Ov
 	return a.Engine.ApplyOverlay(ctx, cfg, cfg.Interface.Name, ov)
 }
 
-// quiet silences the engine's step list for the rest of a command whose
-// output is a few fixed lines (invite, join); the journal still has it.
-func (a *App) quiet() (restore func()) {
+// progressToStderr sends the engine's step list to stderr for the rest of a
+// command whose stdout carries only its result: the invite code, or the
+// summary of a join.
+func (a *App) progressToStderr() (restore func()) {
 	prev := a.Engine.Progress
-	a.Engine.Progress = nil
+	a.Engine.Progress = func(line string) { fmt.Fprintf(a.Stderr, "  %s\n", line) }
 	return func() { a.Engine.Progress = prev }
 }
 

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/nikitakiselev/meshly/internal/model"
 	"github.com/nikitakiselev/meshly/internal/netstack"
@@ -213,6 +214,20 @@ func (f *Links) LinkExists(name string) (exists, owned bool, kind string, err er
 	return l.Exists, l.Owned(), l.Type, nil
 }
 
+// Handshake records a completed WireGuard handshake with peer on device
+// dev at the given time, as authenticated traffic would.
+func (k *Kernel) Handshake(dev, peer string, at time.Time) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if d := k.Devs[dev]; d != nil {
+		for i := range d.Peers {
+			if d.Peers[i].PublicKey == peer {
+				d.Peers[i].LastHandshake = at
+			}
+		}
+	}
+}
+
 // PresharedKey returns the preshared key of the peer (zero when none).
 func (k *Kernel) PresharedKey(peer string) wgtypes.Key {
 	k.mu.Lock()
@@ -253,8 +268,13 @@ func (f *WG) Configure(name string, priv wgtypes.Key, port int, want []wg.Desire
 	var peers []wg.PeerState
 	for _, p := range want {
 		ps := wg.PeerState{PublicKey: p.PublicKey, Endpoint: p.Endpoint, AllowedIPs: []netip.Prefix{p.AllowedIP}, Keepalive: p.Keepalive}
-		if old, ok := d.Peer(p.PublicKey); ok && !p.Endpoint.IsValid() {
-			ps.Endpoint, ps.LastHandshake = old.Endpoint, old.LastHandshake
+		if old, ok := d.Peer(p.PublicKey); ok {
+			// Like the kernel, a peer updated in place keeps its last
+			// handshake, even across a new private or preshared key.
+			ps.LastHandshake = old.LastHandshake
+			if !p.Endpoint.IsValid() {
+				ps.Endpoint = old.Endpoint
+			}
 		}
 		peers = append(peers, ps)
 		if p.PresharedKey == (wgtypes.Key{}) {

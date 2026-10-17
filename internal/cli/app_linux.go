@@ -41,11 +41,9 @@ func NewApp() *App {
 		LockTimeout: 30 * time.Second,
 		Arch:        runtime.GOARCH,
 		Pairing:     pairing.Kernel{},
-		WaitContext: func(c context.Context) (context.Context, context.CancelFunc) {
-			return signal.NotifyContext(c, os.Interrupt, syscall.SIGTERM)
-		},
-		After:    time.After,
-		Hostname: os.Hostname,
+		WaitContext: interruptible,
+		After:       time.After,
+		Hostname:    os.Hostname,
 	}
 	a.Engine = &engine.Engine{
 		Links: links, WG: wg.Kernel{}, FW: fw, Paths: paths,
@@ -53,4 +51,15 @@ func NewApp() *App {
 		Progress: func(s string) { a.printf("  %s\n", s) },
 	}
 	return a
+}
+
+// interruptible ends with Ctrl+C, SIGTERM or the hang-up of the terminal (a
+// closed SSH session), so that the invite or join cleans up rather than dies
+// halfway. A SIGHUP ignored at start, as under nohup, stays ignored.
+func interruptible(c context.Context) (context.Context, context.CancelFunc) {
+	sigs := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if !signal.Ignored(syscall.SIGHUP) {
+		sigs = append(sigs, syscall.SIGHUP)
+	}
+	return signal.NotifyContext(c, sigs...)
 }

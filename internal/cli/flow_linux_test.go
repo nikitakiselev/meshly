@@ -11,14 +11,17 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/netip"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -199,6 +202,20 @@ func (s *syncBuffer) String() string {
 
 var codeRe = regexp.MustCompile(`^m1[a-z2-7]+$`)
 
+// terminal is where a command in the background writes: once gone, every
+// write fails the way it does to the terminal of a closed SSH session.
+type terminal struct {
+	w    io.Writer
+	gone *atomic.Bool
+}
+
+func (t terminal) Write(p []byte) (int, error) {
+	if t.gone.Load() {
+		return 0, syscall.EIO
+	}
+	return t.w.Write(p)
+}
+
 // inviteRun is a `meshly invite` running in the background.
 type inviteRun struct {
 	t       *testing.T
@@ -206,6 +223,7 @@ type inviteRun struct {
 	code    string       // the first line of stdout
 	stdout  bytes.Buffer // stdout after the code line
 	stderr  syncBuffer
+	gone    atomic.Bool // the terminal is gone: see hangUp
 	cancels chan context.CancelFunc
 	expiry  chan time.Time
 	done    chan int
@@ -233,7 +251,7 @@ func startInvite(t *testing.T, n *testNode, args ...string) *inviteRun {
 	}
 	n.app.After = func(time.Duration) <-chan time.Time { return r.expiry }
 	pr, pw := io.Pipe()
-	n.app.Stdout, n.app.Stderr = pw, &r.stderr
+	n.app.Stdout, n.app.Stderr = terminal{pw, &r.gone}, terminal{&r.stderr, &r.gone}
 	go func() {
 		code := n.app.Main(append([]string{"invite"}, args...))
 		_ = pw.Close()
@@ -268,6 +286,13 @@ func (r *inviteRun) cancel() {
 		r.cancels <- f
 	default:
 	}
+}
+
+// hangUp simulates the end of the SSH session the invite runs in: the
+// terminal is gone and SIGHUP arrives.
+func (r *inviteRun) hangUp() {
+	r.gone.Store(true)
+	r.cancel()
 }
 
 // expire ends the invite's validity.
@@ -526,9 +551,10 @@ func TestEndpointDetection(t *testing.T) {
 		{public, []string{"--endpoint", "auto", "--listen-port", "4000"}, "203.0.113.10:4000 listen 4000", "detected on eth0"},
 		// A cloud server behind 1:1 NAT, or a home server.
 		{private, nil, "none listen 51820", "no public IPv4 address"},
+		{private, nil, "none listen 51820", "until this node has an endpoint, no other node can join it"},
 		{nil, nil, "none listen 51820", "no public IPv4 address"},
 		{append(public, la("198.51.100.20", "eth1")), nil, "none listen 51820", "198.51.100.20 on eth1, 203.0.113.10 on eth0"},
-		{public, []string{"--endpoint", "none"}, "none listen 51820", "endpoint:     none (the joining node"},
+		{public, []string{"--endpoint", "none"}, "none listen 51820", "endpoint:     none (no other node can join this one until it has an endpoint: meshly set endpoint IP)"},
 		{private, []string{"--endpoint", "198.51.100.7"}, "198.51.100.7:51820 listen 51820", "198.51.100.7:51820 (UDP 51820"},
 		{private, []string{"--endpoint", "198.51.100.7", "--listen-port", "4000"}, "198.51.100.7:4000 listen 4000", ""},
 		{private, []string{"--endpoint", "198.51.100.7:4000"}, "198.51.100.7:4000 listen 4000", ""},
@@ -697,6 +723,12 @@ func TestPairFlow(t *testing.T) {
 	}
 	if code, out := inv.wait(); code != 0 || !strings.Contains(inv.stdout.String(), `Node "home" (10.100.0.2) joined. The invite is closed.`) {
 		t.Fatalf("invite: exit %d\n%s", code, out)
+	}
+	// The engine's steps go to stderr; stdout has only the results.
+	for _, o := range []struct{ name, stdout, stderr string }{{"join", out, errOut}, {"invite", inv.stdout.String(), inv.stderr.String()}} {
+		if strings.Contains(o.stdout, "  - ") || !strings.Contains(o.stderr, "  - configure WireGuard") {
+			t.Errorf("%s: the engine's steps are not on stderr only:\nstdout:\n%s\nstderr:\n%s", o.name, o.stdout, o.stderr)
+		}
 	}
 
 	vcfg, hcfg := vps.config(), home.config()
@@ -957,28 +989,30 @@ func TestJoinNameFromHostname(t *testing.T) {
 	n.untouched()
 }
 
+// inviteClosed checks that the invite on n, a node without peers, left
+// nothing behind and that the journal ends with its closing record.
+func (n *testNode) inviteClosed(detail string) {
+	n.t.Helper()
+	if d := n.drift(); len(d) != 0 {
+		n.t.Errorf("drift after the invite: %v", d)
+	}
+	if d := n.device(); len(d.Peers) != 0 {
+		n.t.Errorf("WireGuard peers left: %+v", d.Peers)
+	}
+	if strings.Contains(n.lastScript(), "tcp . 51820") {
+		n.t.Error("the pairing port is still allowed")
+	}
+	if _, err := n.app.Paths.LoadInviteMarker(); !errors.Is(err, fs.ErrNotExist) {
+		n.t.Errorf("invite marker: %v", err)
+	}
+	rs := journalRecords(n.t, n)
+	if last := rs[len(rs)-1]; last.Event != journal.EventAudit || last.Op != "invite" || last.Detail != detail {
+		n.t.Errorf("last journal record %+v, want audit %q", last, detail)
+	}
+}
+
 func TestInviteCancelAndExpiry(t *testing.T) {
 	vps, _, _ := newPair(t)
-	closed := func(detail string) {
-		t.Helper()
-		if d := vps.drift(); len(d) != 0 {
-			t.Errorf("drift after the invite: %v", d)
-		}
-		if d := vps.device(); len(d.Peers) != 0 {
-			t.Errorf("WireGuard peers left: %+v", d.Peers)
-		}
-		if strings.Contains(vps.lastScript(), "tcp . 51820") {
-			t.Error("the pairing port is still allowed")
-		}
-		if _, err := vps.app.Paths.LoadInviteMarker(); !errors.Is(err, fs.ErrNotExist) {
-			t.Errorf("invite marker: %v", err)
-		}
-		rs := journalRecords(t, vps)
-		if last := rs[len(rs)-1]; last.Event != journal.EventAudit || last.Op != "invite" || last.Detail != detail {
-			t.Errorf("last journal record %+v, want audit %q", last, detail)
-		}
-	}
-
 	inv := startInvite(t, vps)
 	tempPub, _ := tempKeys(t, inv.code)
 	vps.armed(tempPub)
@@ -986,17 +1020,74 @@ func TestInviteCancelAndExpiry(t *testing.T) {
 	if code, out := inv.wait(); code != ExitDeclined || !strings.Contains(out, "cancelled") {
 		t.Errorf("cancelled invite: exit %d\n%s", code, out)
 	}
-	closed("closed: cancelled")
+	vps.inviteClosed("closed: cancelled")
 	if vps.k.PresharedKey(tempPub) != (wgtypes.Key{}) {
 		t.Error("the preshared key is left")
 	}
 
 	inv = startInvite(t, vps, "--ttl", "5m")
 	inv.expire()
-	if code, out := inv.wait(); code != ExitUnreachable || !strings.Contains(out, "expired") {
+	if code, out := inv.wait(); code != ExitUnreachable || !strings.Contains(out, "no node joined") {
 		t.Errorf("expired invite: exit %d\n%s", code, out)
 	}
-	closed("closed: expired")
+	vps.inviteClosed("closed: expired")
+}
+
+// The SSH session of the invite closes: SIGHUP arrives and every write to
+// the terminal fails. The invite cleans up all the same, armed or with a
+// node that has yet to confirm.
+func TestInviteHangUp(t *testing.T) {
+	vps, home, mem := newPair(t)
+	inv := startInvite(t, vps)
+	inv.hangUp()
+	if code, _ := inv.wait(); code != ExitDeclined {
+		t.Errorf("armed invite hung up: exit %d", code)
+	}
+	vps.inviteClosed("closed: cancelled")
+
+	// The undo comes from the hang-up, not from the confirmation deadline.
+	vps.app.PairTimeouts = pairing.Timeouts{Connect: time.Second, Exchange: time.Second, Confirm: time.Hour}
+	home.app.PairTimeouts = shortTimeouts
+	inv = startInvite(t, vps)
+	tempPub, _ := tempKeys(t, inv.code)
+	var blocked atomic.Bool
+	blocked.Store(true)
+	home.app.Pairing = mem.View(blockReal(vps, home, tempPub, &blocked, inv.hangUp))
+	if code, out, errOut := joinWith(home, inv.code, "--name", "home"); code != ExitRolledBack {
+		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
+	}
+	if code, out := inv.wait(); code != ExitDeclined {
+		t.Errorf("invite hung up with a node to confirm: exit %d\n%s", code, out)
+	}
+	if cfg := vps.config(); len(cfg.Peers) != 0 {
+		t.Errorf("vps peers %s", peerNames(cfg))
+	}
+	if !hasRecord(journalRecords(t, vps), journal.EventCommit, "invite-undo", "") {
+		t.Error("vps journal has no invite-undo")
+	}
+	vps.inviteClosed("closed: cancelled")
+}
+
+// The invite expires while the node that joined has yet to confirm: when
+// the confirmation does not come, the undo ends the invite.
+func TestInviteExpiresWhileUnconfirmed(t *testing.T) {
+	vps, home, mem := newPair(t)
+	vps.app.PairTimeouts, home.app.PairTimeouts = shortTimeouts, shortTimeouts
+	inv := startInvite(t, vps)
+	tempPub, _ := tempKeys(t, inv.code)
+	var blocked atomic.Bool
+	blocked.Store(true)
+	home.app.Pairing = mem.View(blockReal(vps, home, tempPub, &blocked, inv.expire))
+	if code, out, errOut := joinWith(home, inv.code, "--name", "home"); code != ExitRolledBack {
+		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
+	}
+	home.untouched()
+	code, out := inv.wait()
+	if code != ExitUnreachable || !strings.Contains(out, "the invite expired; the node that joined did not confirm the connection") ||
+		strings.Contains(out, "no node joined") {
+		t.Errorf("invite: exit %d\n%s", code, out)
+	}
+	vps.inviteClosed("closed: expired")
 }
 
 // blockReal makes the dials of home fail while its device uses its real key:
@@ -1017,7 +1108,13 @@ func blockReal(vps, home *testNode, tempPub string, blocked *atomic.Bool, hook f
 	}
 }
 
-var shortTimeouts = pairing.Timeouts{Connect: time.Second, Exchange: time.Second, Confirm: 400 * time.Millisecond}
+// shortTimeouts make a failing confirmation quick; relaxedTimeouts give a
+// join that should work room on a loaded machine. The invite reads them as
+// each join starts, so a test may switch between joins.
+var (
+	shortTimeouts   = pairing.Timeouts{Connect: time.Second, Exchange: time.Second, Confirm: 400 * time.Millisecond}
+	relaxedTimeouts = pairing.Timeouts{Connect: time.Second, Exchange: time.Second, Confirm: 5 * time.Second}
+)
 
 func TestConfirmFailureRollsBackBoth(t *testing.T) {
 	vps, home, mem := newPair(t)
@@ -1043,6 +1140,7 @@ func TestConfirmFailureRollsBackBoth(t *testing.T) {
 	}
 
 	blocked.Store(false)
+	vps.app.PairTimeouts, home.app.PairTimeouts = relaxedTimeouts, relaxedTimeouts
 	if code, out, errOut := joinWith(home, inv.code, "--name", "home"); code != 0 {
 		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
 	}
@@ -1051,7 +1149,8 @@ func TestConfirmFailureRollsBackBoth(t *testing.T) {
 	}
 }
 
-// Review Focus 5: Ctrl+C on home while it waits for the confirmation.
+// Review Focus 5: the SSH session of home closes (SIGHUP, which cancels like
+// Ctrl+C) while it waits for the confirmation: home still rolls back.
 func TestJoinCancelDuringConfirm(t *testing.T) {
 	vps, home, mem := newPair(t)
 	vps.app.PairTimeouts, home.app.PairTimeouts = shortTimeouts, shortTimeouts
@@ -1063,12 +1162,18 @@ func TestJoinCancelDuringConfirm(t *testing.T) {
 		interrupt = cancel
 		return ctx, cancel
 	}
-	var blocked atomic.Bool
+	var blocked, gone atomic.Bool
 	blocked.Store(true)
-	home.app.Pairing = mem.View(blockReal(vps, home, tempPub, &blocked, func() { interrupt() }))
-	code, out, errOut := joinWith(home, inv.code, "--name", "home")
-	if code != ExitDeclined {
-		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
+	home.app.Pairing = mem.View(blockReal(vps, home, tempPub, &blocked, func() {
+		// The SSH session closes: SIGHUP, and writes to the terminal fail.
+		gone.Store(true)
+		interrupt()
+	}))
+	var out, errOut bytes.Buffer
+	home.app.Stdin = strings.NewReader(inv.code + "\n")
+	home.app.Stdout, home.app.Stderr = terminal{&out, &gone}, terminal{&errOut, &gone}
+	if code := home.app.Main([]string{"join", "--name", "home"}); code != ExitDeclined {
+		t.Fatalf("join: exit %d\n%s%s", code, out.String(), errOut.String())
 	}
 	home.untouched()
 	inv.waitFor(`Node "home" did not confirm`)
@@ -1077,6 +1182,7 @@ func TestJoinCancelDuringConfirm(t *testing.T) {
 
 	blocked.Store(false)
 	home.app.WaitContext = nil
+	vps.app.PairTimeouts, home.app.PairTimeouts = relaxedTimeouts, relaxedTimeouts
 	if code, out, errOut := joinWith(home, inv.code, "--name", "home"); code != 0 {
 		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
 	}
@@ -1134,11 +1240,10 @@ func TestJoinKeepsConfigAfterHandshake(t *testing.T) {
 	tempPub, _ := tempKeys(t, inv.code)
 	var blocked atomic.Bool
 	blocked.Store(true)
+	vpsKey := vps.config().Self.WGPublicKey
 	home.app.Pairing = mem.View(blockReal(vps, home, tempPub, &blocked, func() {
-		// Only this goroutine uses home's fake kernel now.
-		for i := range home.k.Devs["meshly0"].Peers {
-			home.k.Devs["meshly0"].Peers[i].LastHandshake = time.Now()
-		}
+		// The real tunnel is up, only the pairing exchange is lost.
+		home.k.Handshake("meshly0", vpsKey, time.Now())
 	}))
 	code, out, errOut := joinWith(home, inv.code, "--name", "home")
 	if code != ExitError || !strings.Contains(errOut, "did not acknowledge") || !strings.Contains(errOut, "meshly status") {
@@ -1154,5 +1259,266 @@ func TestJoinKeepsConfigAfterHandshake(t *testing.T) {
 	inv.cancel()
 	if code, out := inv.wait(); code != ExitDeclined {
 		t.Errorf("invite: exit %d\n%s", code, out)
+	}
+}
+
+// The kernel keeps the handshake of the temporary tunnel when the inviter's
+// peer moves to the real tunnel: it proves nothing about the real one, so
+// a join that is not confirmed still rolls back.
+func TestJoinIgnoresTemporaryHandshake(t *testing.T) {
+	vps, home, mem := newPair(t)
+	vps.app.PairTimeouts, home.app.PairTimeouts = shortTimeouts, shortTimeouts
+	inv := startInvite(t, vps)
+	tempPub, _ := tempKeys(t, inv.code)
+	var blocked atomic.Bool
+	blocked.Store(true)
+	vpsKey := vps.config().Self.WGPublicKey
+	gate := blockReal(vps, home, tempPub, &blocked, nil)
+	home.app.Pairing = mem.View(func(to netip.AddrPort) error {
+		if d, _ := home.k.WGOps().Observe("meshly0"); d != nil && d.PublicKey == tempPub {
+			home.k.Handshake("meshly0", vpsKey, time.Now())
+		}
+		return gate(to)
+	})
+	code, out, errOut := joinWith(home, inv.code, "--name", "home")
+	if code != ExitRolledBack || !strings.Contains(errOut, "rolled back") {
+		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
+	}
+	home.untouched()
+	if rs := journalRecords(t, home); !hasRecord(rs, journal.EventCommit, "join-undo", "") {
+		t.Error("home journal has no join-undo")
+	}
+	inv.waitFor(`Node "home" did not confirm the connection; its membership was undone.`)
+	inv.waitFor("The code stays valid until")
+	vps.armed(tempPub)
+}
+
+// A node that reaches the invite after another one joined is told the code
+// was used: exit 4, and nothing changed on it.
+func TestJoinCodeUsed(t *testing.T) {
+	vps, home, mem := newPair(t)
+	cfg := vps.config()
+	c, err := pairing.NewCode(cfg.Self.Endpoint, cfg.Self.WGPublicKey, cfg.Network.CIDR, start.Add(10*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inviter, _ := c.Addresses()
+	l, err := mem.View(nil).Listen(netip.AddrPortFrom(inviter, pairing.Port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		deadline := time.Now().Add(5 * time.Second)
+		if _, err := pairing.ReadRequest(conn, deadline); err == nil {
+			_ = pairing.WriteReject(conn, deadline, pairing.Reject{Reason: pairing.ReasonUsed, Message: "this invite was already used by another node"})
+		}
+	}()
+	home.app.Pairing = mem.View(nil)
+	code, out, errOut := joinWith(home, c.String(), "--name", "home")
+	if code != ExitInvalidCode || !strings.Contains(errOut, "already used") {
+		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
+	}
+	home.untouched()
+
+	for reason, want := range map[string]int{pairing.ReasonUsed: ExitInvalidCode, pairing.ReasonNameTaken: ExitConflict, pairing.ReasonInvalid: ExitError} {
+		err := refusal(context.Background(), &pairing.RejectError{Reject: pairing.Reject{Reason: reason, Message: "no"}})
+		if got := codeOf(err); got != want {
+			t.Errorf("refusal %s: exit %d, want %d", reason, got, want)
+		}
+	}
+}
+
+// testSession is an armed invite of network homelab on node vps, with no
+// engine behind it: enough for the answers that change nothing.
+func testSession(t *testing.T) *inviteSession {
+	t.Helper()
+	inviterKey := testPublicKey(t)
+	cidr := netip.MustParsePrefix("10.100.0.0/24")
+	code, err := pairing.NewCode(netip.MustParseAddrPort("203.0.113.10:51820"), inviterKey, cidr, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(code.Wipe)
+	sec, err := code.Secrets()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sec.Wipe)
+	inviter, joiner := code.Addresses()
+	base := &model.Config{
+		Network: model.Network{Name: "homelab", CIDR: cidr},
+		Self:    model.Self{Name: "vps", Address: inviter, WGPublicKey: inviterKey},
+	}
+	return &inviteSession{a: &App{}, ctx: context.Background(), code: code, sec: sec, joiner: joiner, base: base}
+}
+
+// commitForTest moves s to the committed state with node home of key.
+func commitForTest(t *testing.T, s *inviteSession, key string) {
+	m := s.base.Clone()
+	m.Peers = []model.Peer{{Name: "home", Address: s.joiner, WGPublicKey: key}}
+	s.member, s.timer = m, time.NewTimer(time.Hour)
+	t.Cleanup(s.stopTimer)
+}
+
+func testPublicKey(t *testing.T) string {
+	t.Helper()
+	k, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k.PublicKey().String()
+}
+
+// A client of the pairing port: it sends its request and returns the
+// inviter's verdict.
+type pairClient func(c net.Conn, deadline time.Time) error
+
+func confirmWith(key string) pairClient {
+	return func(c net.Conn, deadline time.Time) error {
+		return pairing.SendConfirm(c, deadline, pairing.Confirm{WGPublicKey: key})
+	}
+}
+
+func helloWith(name, key string) pairClient {
+	return func(c net.Conn, deadline time.Time) error {
+		_, err := pairing.RequestJoin(c, deadline, pairing.Hello{Protocol: pairing.Protocol, Name: name, WGPublicKey: key})
+		return err
+	}
+}
+
+// pending runs client against one end of a pipe and returns the other end
+// with the request read from it, the way pairServer queues it.
+func pending(t *testing.T, client pairClient) (inbound, <-chan error) {
+	t.Helper()
+	c, sc := net.Pipe()
+	verdict := make(chan error, 1)
+	go func() {
+		defer c.Close()
+		verdict <- client(c, time.Now().Add(5*time.Second))
+	}()
+	req, err := pairing.ReadRequest(sc, time.Now().Add(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return inbound{conn: sc, req: req}, verdict
+}
+
+func refused(err error) string {
+	var rej *pairing.RejectError
+	if errors.As(err, &rej) {
+		return rej.Reject.Reason
+	}
+	return fmt.Sprintf("not refused (%v)", err)
+}
+
+// The invite's answers, state by state.
+func TestInviteSessionAnswers(t *testing.T) {
+	s := testSession(t)
+	home, other := testPublicKey(t), testPublicKey(t)
+	ask := func(client pairClient) (bool, error) {
+		t.Helper()
+		in, verdict := pending(t, client)
+		defer in.conn.Close()
+		confirmed, err := s.answer(in.conn, in.req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return confirmed, <-verdict
+	}
+
+	// Armed: nobody joined, so there is nothing to confirm.
+	if ok, err := ask(confirmWith(home)); ok || refused(err) != pairing.ReasonInvalid {
+		t.Errorf("confirm while armed: %v, %v", ok, err)
+	}
+	if ok, err := ask(helloWith("vps", home)); ok || refused(err) != pairing.ReasonNameTaken {
+		t.Errorf("hello with the inviter's name: %v, %v", ok, err)
+	}
+	for _, key := range []string{s.base.Self.WGPublicKey, s.sec.TempPublicKey()} {
+		if ok, err := ask(helloWith("home", key)); ok || refused(err) != pairing.ReasonInvalid {
+			t.Errorf("hello with a key of the invite: %v, %v", ok, err)
+		}
+	}
+	if s.member != nil {
+		t.Fatal("a refused hello committed the invite")
+	}
+
+	// Committed: the invite is used, and only the node that joined confirms.
+	commitForTest(t, s, home)
+	if ok, err := ask(helloWith("laptop", other)); ok || refused(err) != pairing.ReasonUsed {
+		t.Errorf("hello while committed: %v, %v", ok, err)
+	}
+	if ok, err := ask(confirmWith(other)); ok || refused(err) != pairing.ReasonInvalid {
+		t.Errorf("confirm with another key: %v, %v", ok, err)
+	}
+	if s.member == nil || s.timer == nil {
+		t.Fatal("a wrong confirmation ended the wait for the right one")
+	}
+	if ok, err := ask(confirmWith(home)); !ok || err != nil {
+		t.Errorf("confirm of the node that joined: %v, %v", ok, err)
+	}
+}
+
+// The confirmation deadline and a confirmation arrive together: what was
+// already read is served before the undo, and the confirmation counts.
+func TestInviteConfirmAtDeadline(t *testing.T) {
+	s := testSession(t)
+	home, other := testPublicKey(t), testPublicKey(t)
+	commitForTest(t, s, home)
+	srv := &pairServer{requests: make(chan inbound, 2), conns: map[net.Conn]struct{}{}}
+	if ok, err := s.servePending(srv); ok || err != nil {
+		t.Fatalf("nothing pending: %v, %v", ok, err)
+	}
+	wrongIn, wrong := pending(t, confirmWith(other))
+	rightIn, right := pending(t, confirmWith(home))
+	srv.requests <- wrongIn
+	srv.requests <- rightIn
+	if ok, err := s.servePending(srv); !ok || err != nil {
+		t.Fatalf("servePending: %v, %v; want the confirmation", ok, err)
+	}
+	if err := <-wrong; refused(err) != pairing.ReasonInvalid {
+		t.Errorf("confirm with another key: %v", err)
+	}
+	if err := <-right; err != nil {
+		t.Errorf("confirm of the node that joined: %v", err)
+	}
+}
+
+// Ctrl+C, SIGTERM and the hang-up of the terminal end the waiting phases of
+// invite and join; a SIGHUP ignored at start, as under nohup, stays ignored.
+func TestInterruptibleHangUp(t *testing.T) {
+	if signal.Ignored(syscall.SIGHUP) {
+		t.Skip("SIGHUP is ignored where the test runs")
+	}
+	ctx, stop := interruptible(context.Background())
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("SIGHUP did not end the wait")
+	}
+	stop()
+
+	signal.Ignore(syscall.SIGHUP)
+	defer signal.Reset(syscall.SIGHUP)
+	ctx, stop = interruptible(context.Background())
+	defer stop()
+	if !signal.Ignored(syscall.SIGHUP) {
+		t.Fatal("waiting stopped ignoring SIGHUP")
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+		t.Fatal("an ignored SIGHUP ended the wait")
+	case <-time.After(100 * time.Millisecond):
 	}
 }

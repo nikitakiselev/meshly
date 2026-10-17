@@ -80,8 +80,9 @@ type App struct {
 	Arch        string
 
 	Pairing      pairing.Network
-	PairTimeouts pairing.Timeouts // zero value: pairing.DefaultTimeouts
-	// WaitContext derives the context that Ctrl+C cancels; only waiting phases use it,
+	PairTimeouts pairing.Timeouts // zero value: pairing.DefaultTimeouts; read as each join starts
+	// WaitContext derives the context that Ctrl+C, SIGTERM or a hang-up of the
+	// terminal cancels; only waiting phases use it,
 	// transactions keep the parent context so an interrupt never cuts one in half.
 	WaitContext func(context.Context) (context.Context, context.CancelFunc)
 	After       func(time.Duration) <-chan time.Time // invite expiry timer

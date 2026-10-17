@@ -80,7 +80,7 @@ func (a *App) cmdJoin(ctx context.Context, args []string) error {
 	}
 	defer sec.Wipe()
 
-	defer a.quiet()()
+	defer a.progressToStderr()()
 	s, err := a.begin(ctx)
 	if err != nil {
 		return err
@@ -210,6 +210,9 @@ func (a *App) runJoin(ctx context.Context, pcfg *model.Config, code *pairing.Cod
 		Name: "join", Args: fmt.Sprintf("network=%s peer=%s", w.NetworkName, w.Inviter.Name), Actor: actor(a.Euid),
 		Recovery: journal.Backward, Target: member,
 	}
+	// The inviter's peer is updated in place, so the kernel keeps the
+	// temporary tunnel's handshake; only a later one proves the real tunnel.
+	switched := time.Now()
 	if _, err := a.Engine.Execute(ctx, a.Journal, op); err != nil {
 		var ae *engine.ApplyError
 		if errors.As(err, &ae) && ae.SafeMode {
@@ -223,7 +226,7 @@ func (a *App) runJoin(ctx context.Context, pcfg *model.Config, code *pairing.Cod
 	if a.confirmJoin(wctx, inviter, pub, t) == nil {
 		return member, nil
 	}
-	if a.handshook(ifname, w.Inviter.WGPublicKey) {
+	if a.handshook(ifname, w.Inviter.WGPublicKey, switched) {
 		return member, errorf(ExitError, "joined, but the inviting node did not acknowledge the connection; check `meshly status` on both nodes")
 	}
 	undo := engine.Op{
@@ -288,14 +291,14 @@ func earliest(a, b time.Time) time.Time {
 }
 
 // handshook reports whether the kernel completed a WireGuard handshake with
-// the peer: then the tunnel works even though no "ok" arrived.
-func (a *App) handshook(ifname, peer string) bool {
+// the peer after since: then the tunnel works even though no "ok" arrived.
+func (a *App) handshook(ifname, peer string, since time.Time) bool {
 	d, err := a.Engine.WG.Observe(ifname)
 	if err != nil || d == nil {
 		return false
 	}
 	p, ok := d.Peer(peer)
-	return ok && !p.LastHandshake.IsZero()
+	return ok && p.LastHandshake.After(since)
 }
 
 // refusal turns a failed exchange into the command's error.

@@ -173,9 +173,9 @@ func (a *App) printEndpoint(ep netip.AddrPort, lp uint16, auto bool, found detec
 	case auto:
 		a.printf("  endpoint:     none: %s\n", found.why)
 		a.printf(pad + "if the internet reaches this server at a public IP (e.g. 1:1 NAT in AWS or GCP): meshly set endpoint IP\n")
-		a.printf(pad + "otherwise the joining node needs a public address of its own\n")
+		a.printf(pad + "until this node has an endpoint, no other node can join it\n")
 	default:
-		a.printf("  endpoint:     none (the joining node needs a public address of its own)\n")
+		a.printf("  endpoint:     none (no other node can join this one until it has an endpoint: meshly set endpoint IP)\n")
 	}
 }
 
