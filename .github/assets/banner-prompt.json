@@ -1,0 +1,59 @@
+{
+  "task": "generate_image",
+  "purpose": "Hero banner for the GitHub README of the open-source project \"meshly\"",
+  "project": {
+    "name": "meshly",
+    "description": "A command-line tool that creates a private, encrypted, default-deny WireGuard link between exactly two Linux servers: a VPS in the cloud and a home server behind NAT.",
+    "ideas_to_convey": [
+      "two nodes",
+      "one protected tunnel between them",
+      "nothing is open by accident",
+      "mesh / hexagon motif"
+    ]
+  },
+  "format": {
+    "orientation": "landscape",
+    "aspect_ratio": "3:1",
+    "fallback": "if 3:1 is not available, use the widest landscape format and keep all important content inside the central horizontal band so the image can be cropped to 3:1",
+    "viewing_context": "displayed about 880 px wide on GitHub, in both light and dark themes"
+  },
+  "style": {
+    "genre": "cyberpunk meets deep space",
+    "mood": "calm, secure, high-tech",
+    "rendering": "polished digital illustration, soft bloom, high contrast, clean and modern, not cluttered",
+    "palette": {
+      "background": ["#05060f near-black navy", "#1a0b2e deep purple"],
+      "accents": ["#22d3ee neon cyan", "#f0abfc neon magenta", "#8b5cf6 violet"]
+    }
+  },
+  "scene": {
+    "background": "deep space with a soft nebula and fine stars; a subtle perspective neon grid fading towards the horizon in the lower third",
+    "left_node": "a glowing node shaped like a compact server rack or small space station, labelled by nothing (no text)",
+    "right_node": "a matching glowing node on the right side, slightly different silhouette, also without text",
+    "link": "one single bright beam / tunnel of light connecting the two nodes, wrapped in a faint hexagonal shield pattern - the only path between them",
+    "composition": "symmetric; nodes near the left and right edges; logo in the exact center above the beam; generous dark empty margins around the logo"
+  },
+  "logo": {
+    "placement": "center",
+    "mark": "minimal geometric symbol: two small nodes joined by a link that subtly forms a lowercase \"m\" inside a hexagon outline, neon cyan to magenta gradient",
+    "wordmark": {
+      "text": "meshly",
+      "case": "lowercase",
+      "font": "bold, geometric, futuristic sans-serif",
+      "effect": "crisp edges, slight neon glow, perfectly legible",
+      "position": "to the right of the mark, vertically centered"
+    }
+  },
+  "constraints": {
+    "allowed_text": ["meshly"],
+    "spelling": "the only text in the image is exactly \"meshly\" - six lowercase letters, spelled m-e-s-h-l-y",
+    "avoid": [
+      "any other text, tagline, labels or numbers",
+      "watermarks or signatures",
+      "misspelled or extra letters",
+      "people or faces",
+      "real company logos or trademarks",
+      "busy clutter or excessive lens flare"
+    ]
+  }
+}

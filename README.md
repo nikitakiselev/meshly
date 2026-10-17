@@ -1,6 +1,6 @@
 <div align="center">
 
-# meshly
+<img src=".github/assets/banner.png" alt="meshly" width="100%">
 
 **A private, default-deny WireGuard link between two Linux servers: one command per step, nothing open by accident.**
 

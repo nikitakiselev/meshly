@@ -1,0 +1,33 @@
+{
+  "task": "generate_image",
+  "purpose": "Square app icon for meshly: website favicon, Apple touch icon (iPhone / iPad home screen), GitHub social avatar",
+  "reference": "Use exactly the same logo mark as in the meshly banner generated earlier in this conversation: the hexagonal lowercase \"m\" built from connected nodes, with the neon cyan to magenta gradient. Reproduce that mark faithfully; do not invent a different one.",
+  "format": {
+    "aspect_ratio": "1:1",
+    "size": "1024x1024",
+    "shape": "full-bleed square; do not draw rounded corners, a device frame or a drop shadow around the canvas (iOS and browsers apply their own mask)",
+    "safe_area": "keep the whole mark inside the central 70% of the canvas so it survives the iOS corner mask and tiny favicon sizes"
+  },
+  "composition": {
+    "subject": "only the logo mark, perfectly centered, filling about 60-65% of the canvas width",
+    "background": "deep near-black navy to deep purple, a soft radial glow behind the mark and a few faint stars; no grid, no scene, no servers, no planets"
+  },
+  "style": {
+    "genre": "cyberpunk meets deep space, matching the banner",
+    "rendering": "crisp vector-like edges with a soft neon glow; strong silhouette and thick strokes so the mark stays recognizable at 32x32 and 16x16 pixels; high contrast",
+    "palette": {
+      "background": ["#05060f near-black navy", "#1a0b2e deep purple"],
+      "accents": ["#22d3ee neon cyan", "#f0abfc neon magenta", "#8b5cf6 violet"]
+    }
+  },
+  "constraints": {
+    "text": "no text at all: no wordmark, no letters other than the \"m\" formed by the mark itself",
+    "avoid": [
+      "rounded-corner tile or app-icon frame drawn into the image",
+      "watermarks or signatures",
+      "thin hairline details that disappear at small sizes",
+      "busy background details",
+      "real company logos or trademarks"
+    ]
+  }
+}

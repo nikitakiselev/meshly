@@ -1,6 +1,6 @@
 <div align="center">
 
-# meshly
+<img src=".github/assets/banner.png" alt="meshly" width="100%">
 
 **Закрытый по умолчанию WireGuard-канал между двумя Linux-серверами: одна команда на шаг и ничего не открыто случайно.**
 
