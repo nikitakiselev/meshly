@@ -13,11 +13,16 @@
 
 </div>
 
-meshly joins two Linux servers into one private network. For example, a VPS
-in the cloud and a home server behind your router: once set up, they reach each
-other at `10.100.0.1` and `10.100.0.2`, as if they were on the same local
-network. The connection is encrypted (WireGuard), and everything is closed by
-default: you decide which ports one server may connect to on the other.
+meshly joins two Linux servers into one private network: they reach each other
+at `10.100.0.1` and `10.100.0.2`, as if they were on the same local network. The
+connection is encrypted (WireGuard), and everything is closed by default: you
+decide which ports one server may connect to on the other.
+
+For example, you have a VPS with a public IP and a homelab behind your home
+router, and you want them to talk to each other securely: SSH, a database,
+monitoring, backups. meshly connects them in a few commands, without config files
+and without setting up WireGuard and a firewall by hand. Only what you allow gets
+through, for example `meshly allow 22/tcp from home`.
 
 ```text
  home server (behind NAT)                                VPS (public IP)
