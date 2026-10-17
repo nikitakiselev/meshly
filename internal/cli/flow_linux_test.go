@@ -79,6 +79,24 @@ func newTestNode(t *testing.T, start time.Time) *testNode {
 	return n
 }
 
+// sibling is a second meshly process on the same node: the same root and
+// kernel, its own App, journal and output.
+func (n *testNode) sibling() *testNode {
+	s := &testNode{t: n.t, k: n.k, root: n.root, now: n.now}
+	app := *n.app
+	clock := func() time.Time { return s.now }
+	app.Now = clock
+	app.Journal = journal.Open(app.Paths.JournalFile(), clock)
+	app.Stdin = strings.NewReader("")
+	app.WaitContext, app.After = nil, nil
+	eng := *n.app.Engine
+	eng.Now = clock
+	eng.Progress = func(m string) { s.app.printf("  %s\n", m) }
+	app.Engine = &eng
+	s.app = &app
+	return s
+}
+
 // run executes a command and returns exit code, stdout and stderr.
 func (n *testNode) run(args ...string) (int, string, string) {
 	var o, e bytes.Buffer
@@ -1520,5 +1538,42 @@ func TestInterruptibleHangUp(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("an ignored SIGHUP ended the wait")
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestOpenInviteIsVisible(t *testing.T) {
+	vps, _, _ := newPair(t)
+	inv := startInvite(t, vps)
+	vps2 := vps.sibling()
+
+	out := vps2.expect(0, "status")
+	if !strings.Contains(out, "Invite open until") || strings.Contains(out, "Drift") {
+		t.Errorf("status:\n%s", out)
+	}
+	var st struct {
+		Invite *struct {
+			ExpiresAt time.Time `json:"expires_at"`
+		} `json:"invite"`
+		Drift []string `json:"drift"`
+	}
+	js := vps2.expect(0, "status", "--json")
+	if err := json.Unmarshal([]byte(js), &st); err != nil || st.Invite == nil || len(st.Drift) != 0 {
+		t.Errorf("status --json: %v\n%s", err, js)
+	}
+	if strings.Contains(js+out, inv.code) {
+		t.Error("the invite code is shown")
+	}
+	_, doc, _ := vps2.run("doctor")
+	if strings.Contains(doc, "✗") || strings.Contains(doc, " drift  ") || !strings.Contains(doc, "an invite is open until") {
+		t.Errorf("doctor:\n%s", doc)
+	}
+	if out := vps2.expect(ExitBusy, "allow", "22/tcp", "from", "home"); !strings.Contains(out, "meshly invite is waiting") {
+		t.Errorf("allow: %s", out)
+	}
+
+	inv.cancel()
+	inv.wait()
+	if out := vps2.expect(0, "status"); strings.Contains(out, "Invite open") {
+		t.Errorf("status after cancel:\n%s", out)
 	}
 }

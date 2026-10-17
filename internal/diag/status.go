@@ -39,8 +39,31 @@ type Status struct {
 	Firewall    *FirewallInfo    `json:"firewall,omitempty"`
 	Peers       []PeerInfo       `json:"peers"`
 	Transaction *TransactionInfo `json:"transaction"`
+	Invite      *InviteInfo      `json:"invite,omitempty"`
 	Drift       []string         `json:"drift"`
 	Errors      []string         `json:"errors,omitempty"`
+}
+
+// InviteInfo is an open `meshly invite`. Only its expiry is ever shown.
+type InviteInfo struct {
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// OpenInvite reports the invite that waits for a node to join, or nil. It
+// is open only for a privileged run (the marker is root's), while the marker
+// is readable, the lock is held and the invite has not expired.
+func OpenInvite(d Deps) *InviteInfo {
+	if !d.Privileged {
+		return nil
+	}
+	m, err := d.Paths.LoadInviteMarker()
+	if err != nil || !m.ExpiresAt.After(d.Now()) {
+		return nil
+	}
+	if held, err := lock.Probe(d.Paths.LockFile()); err != nil || !held {
+		return nil
+	}
+	return &InviteInfo{ExpiresAt: m.ExpiresAt}
 }
 
 // ConfigInfo is the saved desired configuration.
@@ -260,6 +283,11 @@ func Collect(ctx context.Context, d Deps) *Status {
 			}
 		}
 		st.Peers = append(st.Peers, pi)
+	}
+	// The overlay of an open invite is not in the saved configuration.
+	st.Invite = OpenInvite(d)
+	if st.Invite != nil {
+		return st
 	}
 	if steps, err := d.Engine.Plan(desired, obs); err != nil {
 		st.Drift = append(st.Drift, err.Error())

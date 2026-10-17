@@ -119,7 +119,9 @@ func (a *App) renderStatus(st *diag.Status) {
 	case t.LastOp != "":
 		p("Transaction\n  none pending; last: %s %s at %s\n", t.LastOp, t.LastEvent, t.LastTime.Format(time.RFC3339))
 	}
-	if st.Privileged {
+	if st.Invite != nil {
+		p("Invite open until %s: waiting for a node to join (run `sudo meshly join` on the other node).\n", st.Invite.ExpiresAt.Local().Format(time.RFC3339))
+	} else if st.Privileged {
 		if len(st.Drift) == 0 {
 			p("Drift\n  none: kernel state matches the configuration\n")
 		} else {

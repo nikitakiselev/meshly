@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nikitakiselev/meshly/internal/diag"
 	"github.com/nikitakiselev/meshly/internal/engine"
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/lock"
@@ -313,6 +314,11 @@ func (a *App) begin(ctx context.Context) (*session, error) {
 		return nil, withCode(ExitPreflight, err)
 	}
 	l, err := lock.Acquire(a.Paths.LockFile(), a.LockTimeout)
+	if errors.Is(err, lock.ErrBusy) {
+		if inv := diag.OpenInvite(a.deps()); inv != nil {
+			return nil, errorf(ExitBusy, "meshly invite is waiting for a node to join until %s; let it finish or cancel it with Ctrl+C", inv.ExpiresAt.Local().Format(time.RFC3339))
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
