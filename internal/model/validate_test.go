@@ -454,9 +454,6 @@ func TestValidateKeys(t *testing.T) {
 		if err := ValidateWGPublicKey(tt.key); (err == nil) != tt.ok {
 			t.Errorf("ValidateWGPublicKey(%s) = %v, want ok=%v", tt.name, err, tt.ok)
 		}
-		if err := ValidateIdentityKey(tt.key); (err == nil) != tt.ok {
-			t.Errorf("ValidateIdentityKey(%s) = %v, want ok=%v", tt.name, err, tt.ok)
-		}
 	}
 }
 

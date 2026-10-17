@@ -9,14 +9,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"os/user"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/nikitakiselev/meshly/internal/bootstrap"
 	"github.com/nikitakiselev/meshly/internal/engine"
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/lock"
@@ -32,7 +30,7 @@ const (
 	ExitError       = 1
 	ExitUsage       = 2
 	ExitPreflight   = 3  // unsupported or unprepared environment, nothing changed
-	ExitInvalidFile = 4  // bootstrap file rejected (signature, binding, expiry, schema)
+	ExitInvalidCode = 4  // invite code rejected: damaged, other version, expired or already used
 	ExitConflict    = 5  // ownership/address/state conflict, nothing changed
 	ExitBusy        = 6  // another meshly operation holds the lock
 	ExitRolledBack  = 7  // apply failed, previous configuration restored
@@ -41,6 +39,7 @@ const (
 	ExitDeclined    = 10 // confirmation missing or declined
 	ExitWarnings    = 11 // doctor: warnings
 	ExitProblems    = 12 // doctor: problems
+	ExitUnreachable = 13 // the other node did not come: no answer to join, or nobody joined before the invite expired
 )
 
 // exitError carries an exit code.
@@ -90,10 +89,6 @@ type command struct {
 func commands() []command {
 	return []command{
 		{"init", "create a network on this node (usually the server with a public UDP endpoint)", false, (*App).cmdInit},
-		{"invite", "create a one-time, time-limited invite file for the second node", false, (*App).cmdInvite},
-		{"join", "create a join request from an invite (on the second node)", false, (*App).cmdJoin},
-		{"approve", "verify a join request and explicitly approve the new node", false, (*App).cmdApprove},
-		{"activate", "activate the approved membership from an accept file", false, (*App).cmdActivate},
 		{"allow", "allow a peer to reach a local service through the VPN", false, (*App).cmdAllow},
 		{"deny", "remove an allow rule (existing connections stop as well)", false, (*App).cmdDeny},
 		{"rules", "list allow rules", false, (*App).cmdRules},
@@ -187,8 +182,6 @@ func codeOf(err error) int {
 		return ExitBusy
 	case errors.Is(err, store.ErrNotInitialized):
 		return ExitNotInit
-	case errors.Is(err, bootstrap.ErrInvalid), errors.Is(err, bootstrap.ErrExpired):
-		return ExitInvalidFile
 	case errors.Is(err, store.ErrInsecure):
 		return ExitPreflight
 	case errors.Is(err, store.ErrExists):
@@ -237,21 +230,6 @@ func (a *App) requireRoot() error {
 		return errorf(ExitPreflight, "this command changes system configuration and must run as root (use sudo)")
 	}
 	return nil
-}
-
-// writeOutput writes a bootstrap file for the administrator. Under sudo the
-// file is given to the invoking user, so that they can copy it to the
-// other node (scp) without root.
-func (a *App) writeOutput(path string, data []byte, mode fs.FileMode, force bool) error {
-	uid, gid := -1, -1
-	if a.Euid == 0 {
-		u, err1 := strconv.Atoi(os.Getenv("SUDO_UID"))
-		g, err2 := strconv.Atoi(os.Getenv("SUDO_GID"))
-		if err1 == nil && err2 == nil && u > 0 && g >= 0 {
-			uid, gid = u, g
-		}
-	}
-	return store.WriteOutputAs(path, data, mode, force, uid, gid)
 }
 
 // actor identifies who ran the command, for the audit trail.

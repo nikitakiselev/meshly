@@ -8,9 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // knownBug marks a check that documents a defect in production code. The
@@ -74,7 +71,6 @@ func dirNames(t *testing.T, dir string) []string {
 func TestPaths(t *testing.T) {
 	d := DefaultPaths()
 	if d.ConfigFile() != "/etc/meshly/meshly.json" || d.WGKeyFile() != "/etc/meshly/keys/wireguard.key" ||
-		d.IdentityFile() != "/etc/meshly/keys/identity.key" || d.BootstrapFile() != "/var/lib/meshly/bootstrap.json" ||
 		d.JournalFile() != "/var/lib/meshly/journal.jsonl" || d.LockFile() != "/run/meshly/lock" ||
 		d.RuntimeFile() != "/var/lib/meshly/runtime.json" || d.HistoryFile(42) != "/var/lib/meshly/history/meshly-42.json" ||
 		d.Owner != 0 {
@@ -234,48 +230,6 @@ func TestReadFile(t *testing.T) {
 	}
 }
 
-func TestReadUntrusted(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "msg")
-	writeFile(t, path, "SECRET-CONTENT", 0o644)
-
-	b, err := ReadUntrusted(path, 1024)
-	if err != nil || string(b) != "SECRET-CONTENT" {
-		t.Fatalf("ReadUntrusted = %q, %v", b, err)
-	}
-	if _, err := ReadUntrusted(path, 4); err == nil || strings.Contains(err.Error(), "SECRET") {
-		t.Errorf("oversized file: %v", err)
-	}
-
-	link := filepath.Join(dir, "link")
-	must(t, os.Symlink(path, link))
-	if _, err := ReadUntrusted(link, 1024); !errors.Is(err, ErrInsecure) {
-		t.Errorf("symlink: %v, want ErrInsecure", err)
-	}
-	if _, err := ReadUntrusted(dir, 1024); err == nil || !strings.Contains(err.Error(), "not a regular file") {
-		t.Errorf("directory: %v", err)
-	}
-	if _, err := ReadUntrusted(filepath.Join(dir, "missing"), 1024); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("missing: %v", err)
-	}
-
-	// A FIFO must be refused without blocking on open.
-	fifo := filepath.Join(dir, "fifo")
-	if err := unix.Mkfifo(fifo, 0o600); err != nil {
-		t.Skipf("mkfifo: %v", err)
-	}
-	done := make(chan error, 1)
-	go func() { _, err := ReadUntrusted(fifo, 1024); done <- err }()
-	select {
-	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
-			t.Errorf("fifo: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("ReadUntrusted blocked on a FIFO")
-	}
-}
-
 func TestWriteAtomic(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "file.json")
@@ -328,75 +282,6 @@ func TestWriteAtomicRefusesNonRegularTarget(t *testing.T) {
 func TestWriteAtomicMissingDir(t *testing.T) {
 	if err := WriteAtomic(filepath.Join(t.TempDir(), "no", "file"), []byte("x"), 0o600); err == nil {
 		t.Error("WriteAtomic into a missing directory succeeded")
-	}
-}
-
-func TestWriteOutput(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "invite.txt")
-
-	if err := WriteOutput(path, []byte("first"), 0o600, false); err != nil {
-		t.Fatal(err)
-	}
-	if got := readString(t, path); got != "first" {
-		t.Fatalf("content = %q", got)
-	}
-	if got := permOf(t, path); got != 0o600 {
-		t.Errorf("mode = %04o", got)
-	}
-
-	// Same content: idempotent, with or without force.
-	for _, force := range []bool{false, true} {
-		if err := WriteOutput(path, []byte("first"), 0o600, force); err != nil {
-			t.Errorf("identical re-run (force=%v): %v", force, err)
-		}
-	}
-
-	// Different content without force: ErrExists, file untouched.
-	err := WriteOutput(path, []byte("second"), 0o600, false)
-	if !errors.Is(err, ErrExists) {
-		t.Errorf("different content = %v, want ErrExists", err)
-	}
-	if err != nil && strings.Contains(err.Error(), "second") {
-		t.Errorf("error echoes content: %v", err)
-	}
-	if got := readString(t, path); got != "first" {
-		t.Errorf("file modified without force: %q", got)
-	}
-
-	// With force the regular file is replaced.
-	if err := WriteOutput(path, []byte("second"), 0o600, true); err != nil {
-		t.Fatal(err)
-	}
-	if got := readString(t, path); got != "second" {
-		t.Errorf("forced content = %q", got)
-	}
-}
-
-func TestWriteOutputRefusesNonRegular(t *testing.T) {
-	dir := t.TempDir()
-	victim := filepath.Join(dir, "victim")
-	writeFile(t, victim, "original", 0o600)
-	link := filepath.Join(dir, "link")
-	must(t, os.Symlink(victim, link))
-	dangling := filepath.Join(dir, "dangling")
-	ghost := filepath.Join(dir, "ghost")
-	must(t, os.Symlink(ghost, dangling))
-	sub := filepath.Join(dir, "sub")
-	must(t, os.Mkdir(sub, 0o700))
-
-	for _, target := range []string{link, dangling, sub} {
-		for _, force := range []bool{false, true} {
-			if err := WriteOutput(target, []byte("evil"), 0o600, force); !errors.Is(err, ErrInsecure) {
-				t.Errorf("WriteOutput(%s, force=%v) = %v, want ErrInsecure", filepath.Base(target), force, err)
-			}
-		}
-	}
-	if got := readString(t, victim); got != "original" {
-		t.Errorf("symlink target modified: %q", got)
-	}
-	if _, err := os.Lstat(ghost); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("dangling symlink target was created: %v", err)
 	}
 }
 

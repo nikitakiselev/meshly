@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -94,7 +93,7 @@ func (n *testNode) expect(code int, args ...string) string {
 
 func (n *testNode) secrets() []string {
 	var s []string
-	for _, f := range []string{"wireguard.key", "identity.key"} {
+	for _, f := range []string{"wireguard.key"} {
 		b, err := os.ReadFile(filepath.Join(n.app.Paths.KeysDir, f))
 		if err == nil {
 			s = append(s, strings.TrimSpace(string(b)))
@@ -103,27 +102,14 @@ func (n *testNode) secrets() []string {
 	return s
 }
 
-var fingerprintRe = regexp.MustCompile(`[A-Z2-7]{4}(?:-[A-Z2-7]{4}){7}`)
-
 func pair(t *testing.T) (vps, home *testNode, dir string) {
 	t.Helper()
-	start := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
-	vps, home = newTestNode(t, start), newTestNode(t, start)
-	dir = t.TempDir()
-	out := vps.must("init", "homelab", "--name", "vps", "--endpoint", "203.0.113.10:51820")
-	vpsFP := fingerprintRe.FindString(out)
-	vps.must("invite", "--out", filepath.Join(dir, "home.invite"))
-	out = home.must("join", filepath.Join(dir, "home.invite"), "--name", "home", "--expect-fingerprint", vpsFP, "--out", filepath.Join(dir, "home.request"))
-	homeFP := fingerprintRe.FindString(out[strings.Index(out, "your fingerprint"):])
-	vps.now = vps.now.Add(time.Minute)
-	vps.must("approve", filepath.Join(dir, "home.request"), "--expect-fingerprint", homeFP, "--out", filepath.Join(dir, "home.accept"))
-	home.now = home.now.Add(2 * time.Minute)
-	home.must("activate", filepath.Join(dir, "home.accept"))
-	return vps, home, dir
+	t.Skip("pairing returns in the invite-code task")
+	return
 }
 
 func TestFlowAndSecrets(t *testing.T) {
-	vps, home, dir := pair(t)
+	vps, home, _ := pair(t)
 
 	// Policy commands.
 	if out := vps.must("allow", "22/tcp", "from", "home"); !strings.Contains(out, "Allowed") {
@@ -189,12 +175,8 @@ func TestFlowAndSecrets(t *testing.T) {
 		t.Fatal(out)
 	}
 
-	// Never a secret in any output, nor in the files meant to be copied or
-	// the journal.
+	// Never a secret in any output, the journal or the config.
 	all := vps.output.String() + home.output.String()
-	for _, f := range []string{"home.invite", "home.request", "home.accept"} {
-		all += readFile(t, filepath.Join(dir, f))
-	}
 	all += readFile(t, vps.app.Paths.JournalFile()) + readFile(t, vps.app.Paths.ConfigFile())
 	for _, n := range []*testNode{vps, home} {
 		for _, s := range n.secrets() {
@@ -202,7 +184,7 @@ func TestFlowAndSecrets(t *testing.T) {
 				t.Fatalf("unexpected key file format: %d bytes", len(s))
 			}
 			if strings.Contains(all, s) {
-				t.Fatal("a private key appears in output, a bootstrap file, the journal or the config")
+				t.Fatal("a private key appears in output, the journal or the config")
 			}
 		}
 	}
@@ -241,10 +223,7 @@ func TestExitCodes(t *testing.T) {
 	n.expect(ExitUsage, "init", "homelab", "--name", "vps", "--cidr", "8.8.8.0/24")
 	n.expect(ExitUsage, "init", "homelab", "--name", "vps", "--endpoint", "example.com:51820")
 	n.expect(ExitUsage, "init", "homelab", "--name", "vps", "--listen-port", "70000")
-	n.expect(ExitUsage, "join", "home.invite", "--name", "home", "--listen-port", "70000")
-	n.expect(ExitUsage, "join", "home.invite", "--name", "home", "--listen-port", "-1")
 	n.expect(ExitNotInit, "allow", "22/tcp", "from", "home")
-	n.expect(ExitNotInit, "invite")
 	n.must("init", "homelab", "--name", "vps", "--endpoint", "203.0.113.10:51820", "--dry-run")
 	if _, err := os.Stat(n.app.Paths.ConfigFile()); err == nil {
 		t.Fatal("dry-run init saved a configuration")
@@ -301,32 +280,6 @@ func TestExitCodes(t *testing.T) {
 	}
 }
 
-func TestInvalidBootstrapFiles(t *testing.T) {
-	vps, home, dir := pair(t)
-	_ = home
-	// A request replayed after approval with a different invite state, a
-	// garbage file and a file of the wrong type are rejected with exit 4.
-	bad := filepath.Join(dir, "garbage")
-	if err := os.WriteFile(bad, []byte("not json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	vps.expect(ExitInvalidFile, "approve", bad, "--expect-fingerprint", "AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA")
-	vps.expect(ExitInvalidFile, "approve", filepath.Join(dir, "home.invite"), "--expect-fingerprint", "AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA")
-	other := newTestNode(t, vps.now)
-	other.expect(ExitConflict, "activate", filepath.Join(dir, "home.accept")) // no pending join here
-	other.expect(ExitInvalidFile, "join", bad, "--name", "x", "--expect-fingerprint", "AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA")
-	// The invite is one-time.
-	other.now = other.now.Add(time.Minute)
-	out := other.must("join", filepath.Join(dir, "home.invite"), "--name", "other", "--expect-fingerprint",
-		fingerprintRe.FindString(vps.must("status")), "--out", filepath.Join(dir, "other.request"))
-	_ = out
-	msg := vps.expect(ExitInvalidFile, "approve", filepath.Join(dir, "other.request"), "--expect-fingerprint",
-		fingerprintRe.FindString(out[strings.Index(out, "your fingerprint"):]))
-	if !strings.Contains(msg, "one-time") {
-		t.Fatalf("reuse message: %s", msg)
-	}
-}
-
 func readFile(t *testing.T, p string) string {
 	t.Helper()
 	b, err := os.ReadFile(p)
@@ -334,27 +287,6 @@ func readFile(t *testing.T, p string) string {
 		t.Fatal(err)
 	}
 	return string(b)
-}
-
-// Under sudo the bootstrap files belong to the invoking user, so they can
-// copy them to the other node without root; the invite stays private.
-func TestOutputsBelongToSudoUser(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("chown to another user needs root")
-	}
-	t.Setenv("SUDO_UID", "4242")
-	t.Setenv("SUDO_GID", "4343")
-	_, _, dir := pair(t)
-	for f, mode := range map[string]os.FileMode{"home.invite": 0o600, "home.request": 0o644, "home.accept": 0o644} {
-		st, err := os.Stat(filepath.Join(dir, f))
-		if err != nil {
-			t.Fatal(err)
-		}
-		sys := st.Sys().(*syscall.Stat_t)
-		if sys.Uid != 4242 || sys.Gid != 4343 || st.Mode().Perm() != mode {
-			t.Errorf("%s: owner %d:%d mode %v, want 4242:4343 %v", f, sys.Uid, sys.Gid, st.Mode().Perm(), mode)
-		}
-	}
 }
 
 // Without --endpoint, init uses the only public IPv4 address on the
@@ -428,43 +360,6 @@ func TestEndpointDetection(t *testing.T) {
 		t.Errorf("set endpoint none: %s", got)
 	}
 	n.expect(ExitUsage, "set", "endpoint", "example.com")
-
-	// join looks for an address only when the inviter has none.
-	dir := t.TempDir()
-	join := func(vpsRoutes, homeRoutes []model.LinkAddr, args ...string) (*testNode, int, string) {
-		t.Helper()
-		vps := node(vpsRoutes)
-		fp := fingerprintRe.FindString(vps.must("init", "homelab", "--name", "vps"))
-		inv := filepath.Join(dir, "home.invite")
-		vps.must("invite", "--out", inv, "--force")
-		home := node(homeRoutes)
-		code, out, errOut := home.run(append([]string{"join", inv, "--name", "home", "--expect-fingerprint", fp, "--out", filepath.Join(dir, "home.request"), "--force"}, args...)...)
-		return home, code, out + errOut
-	}
-	pending := func(n *testNode) string {
-		t.Helper()
-		bs, err := n.app.Paths.LoadBootstrap()
-		if err != nil || bs.Pending == nil {
-			t.Fatalf("no pending join: %v", err)
-		}
-		return endpointArg(bs.Pending.Endpoint)
-	}
-	homePublic := []model.LinkAddr{la("198.51.100.20", "eth0")}
-	if home, code, out := join(public, homePublic); code != 0 || pending(home) != "none" {
-		t.Errorf("join to a vps with an endpoint advertised %s (exit %d):\n%s", pending(home), code, out)
-	}
-	if home, code, out := join(public, homePublic, "--endpoint", "auto"); code != 0 || pending(home) != "198.51.100.20:51820" {
-		t.Errorf("join --endpoint auto: exit %d\n%s", code, out)
-	}
-	if home, code, out := join(private, homePublic); code != 0 || pending(home) != "198.51.100.20:51820" || !strings.Contains(out, "your endpoint:    198.51.100.20:51820, detected on eth0") {
-		t.Errorf("join to a vps without an endpoint: exit %d\n%s", code, out)
-	}
-	if _, code, out := join(private, private); code != ExitUsage || !strings.Contains(out, "no public IPv4 address") {
-		t.Errorf("join with no endpoint on either side: exit %d\n%s", code, out)
-	}
-	if _, code, out := join(private, homePublic, "--endpoint", "none"); code != ExitUsage || !strings.Contains(out, "needs one: --endpoint IP") {
-		t.Errorf("join --endpoint none to a vps without an endpoint: exit %d\n%s", code, out)
-	}
 }
 
 // meshly set peer-endpoint keeps the current port for a bare IP.

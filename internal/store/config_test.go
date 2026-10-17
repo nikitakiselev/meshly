@@ -29,13 +29,13 @@ func testConfig() *model.Config {
 		Self: model.Self{
 			Name: "alpha", Address: netip.MustParseAddr("10.100.0.1"), ListenPort: 51820,
 			Endpoint:    netip.MustParseAddrPort("203.0.113.10:51820"),
-			WGPublicKey: b64(1), IdentityKey: b64(2),
+			WGPublicKey: b64(1),
 		},
 		Interface: model.Interface{Name: "meshly0", MTU: 1420},
 		Firewall:  model.Firewall{Profile: model.ProfileNftables, Mark: model.DefaultFirewallMark},
 		Peers: []model.Peer{{
-			Name: "beta", Address: netip.MustParseAddr("10.100.0.2"), WGPublicKey: b64(3), IdentityKey: b64(4),
-			Keepalive: 25, AddedAt: t0, TrustedVia: "approve", TrustDigest: strings.Repeat("cd", 32),
+			Name: "beta", Address: netip.MustParseAddr("10.100.0.2"), WGPublicKey: b64(3),
+			Keepalive: 25, AddedAt: t0,
 		}},
 		Rules: []model.Rule{{Peer: "beta", Proto: model.ProtoTCP, Port: 22}, {Peer: "beta", Proto: model.ProtoPing}},
 	}

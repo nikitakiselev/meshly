@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os/exec"
 	"time"
@@ -40,9 +39,6 @@ func (a *App) cmdUpgrade(ctx context.Context, args []string) error {
 	c := a.upgradeClient()
 	rel, err := c.Resolve(ctx, *want)
 	if err != nil {
-		if errors.Is(err, upgrade.ErrVerify) {
-			return withCode(ExitInvalidFile, err)
-		}
 		return err
 	}
 	cmp := upgrade.Compare(rel.Version, cur)
@@ -78,9 +74,6 @@ func (a *App) cmdUpgrade(ctx context.Context, args []string) error {
 	a.printf("Downloading %s ...\n", rel.Asset)
 	bin, err := c.Download(ctx, rel)
 	if err != nil {
-		if errors.Is(err, upgrade.ErrVerify) {
-			return withCode(ExitInvalidFile, err)
-		}
 		return err
 	}
 	a.printf("Verified: SHA256SUMS signed by the meshly release key, SHA-256 %s.\n", rel.SHA256[:16])

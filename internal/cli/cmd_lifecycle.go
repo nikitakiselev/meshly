@@ -189,12 +189,8 @@ func (a *App) cmdSet(ctx context.Context, args []string) error {
 		if err != nil {
 			return withCode(ExitUsage, err)
 		}
-		bs, err := a.Paths.LoadBootstrap()
-		if err != nil {
-			return err
-		}
-		if len(cfg.Peers) > 0 || bs.ActiveInvite(a.Now()) != nil {
-			return errorf(ExitConflict, "the network can only be renumbered before a peer joins and while no invite is outstanding (revoke the peer or wait for the invite to expire)")
+		if len(cfg.Peers) > 0 {
+			return errorf(ExitConflict, "the network can only be renumbered before a peer joins (revoke the peer first)")
 		}
 		t.Network.CIDR = cidr
 		t.Self.Address, _, _ = model.AllocateAddresses(cidr)
@@ -228,7 +224,7 @@ func (a *App) cmdReset(ctx context.Context, args []string) error {
 		if !a.Interactive {
 			return errorf(ExitDeclined, "reset needs --yes when not running interactively")
 		}
-		if !a.confirm("Remove the meshly link, configuration, keys and pending invites from this node? Type 'yes':") {
+		if !a.confirm("Remove the meshly link, configuration, keys from this node? Type 'yes':") {
 			return errorf(ExitDeclined, "reset cancelled")
 		}
 	}
@@ -255,7 +251,7 @@ func (a *App) cmdReset(ctx context.Context, args []string) error {
 	}
 	var errs []error
 	errs = append(errs, a.Paths.RemoveKeys())
-	for _, f := range []string{a.Paths.BootstrapFile(), a.Paths.RuntimeFile()} {
+	for _, f := range []string{a.Paths.RuntimeFile()} {
 		if err := os.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
@@ -265,7 +261,7 @@ func (a *App) cmdReset(ctx context.Context, args []string) error {
 			_ = os.Remove(a.Paths.HistoryDir() + "/" + e.Name())
 		}
 	}
-	a.audit("reset", "", "configuration, keys and bootstrap state removed")
+	a.audit("reset", "", "configuration and keys removed")
 	s.end()
 	if a.Systemd != nil && a.Systemd.Installed() {
 		if a.Systemd.Available {

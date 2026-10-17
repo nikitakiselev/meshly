@@ -43,12 +43,7 @@ func (a *App) renderStatus(st *diag.Status) {
 		p("! another meshly operation is in progress\n")
 	}
 	if !st.Initialized {
-		if st.Pending != nil {
-			p("Pending join as %q (request %s): waiting for the accept file, expires %s.\n", st.Pending.Name, st.Pending.RequestID, st.Pending.ExpiresAt.Format(time.RFC3339))
-			p("Next: meshly activate <file.accept>\n")
-		} else {
-			p("meshly is not initialized on this node.\n")
-		}
+		p("meshly is not initialized on this node.\n")
 		for _, e := range st.Errors {
 			p("! %s\n", e)
 		}
@@ -61,7 +56,7 @@ func (a *App) renderStatus(st *diag.Status) {
 	if c.Endpoint != "" {
 		p("  endpoint %s", c.Endpoint)
 	}
-	p("\n  fingerprint  %s\n", c.Fingerprint)
+	p("\n  public key   %s\n", c.WGPublicKey)
 	p("  admin state  %s   firewall profile %s   %d allow rule(s)\n", c.AdminState, c.Profile, len(c.Rules))
 	if s := st.Service; s != nil {
 		p("Service\n  meshly.service %s/%s, check timer %s   (systemd state says nothing about connectivity)\n", s.Active, s.Enabled, s.TimerActive)
@@ -90,7 +85,7 @@ func (a *App) renderStatus(st *diag.Status) {
 	}
 	for _, pi := range st.Peers {
 		p("Peer %s\n", pi.Name)
-		p("  address %s   fingerprint %s\n", pi.Address, pi.Fingerprint)
+		p("  address %s   public key %s\n", pi.Address, pi.WGPublicKey)
 		p("  wireguard %s, allowed-ips %s, route %s, keepalive %ds\n", yesno(pi.InWireGuard, "configured", "MISSING"), yesno(pi.AllowedIPsOK, pi.Address+"/32", "WRONG"), yesno(pi.RouteOK, "ok", "MISSING"), pi.Keepalive)
 		ep := pi.CurrentEndpoint
 		if ep == "" {

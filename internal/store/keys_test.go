@@ -1,7 +1,6 @@
 package store
 
 import (
-	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -32,22 +31,14 @@ func TestLoadOrCreateKeys(t *testing.T) {
 	if m := permOf(t, p.KeysDir); m != 0o700 {
 		t.Errorf("keys dir mode %04o, want 0700", m)
 	}
-	for _, f := range []string{p.WGKeyFile(), p.IdentityFile()} {
-		if m := permOf(t, f); m != 0o600 {
-			t.Errorf("%s mode %04o, want 0600", f, m)
-		}
+	if m := permOf(t, p.WGKeyFile()); m != 0o600 {
+		t.Errorf("%s mode %04o, want 0600", p.WGKeyFile(), m)
 	}
 	if got, want := readString(t, p.WGKeyFile()), base64.StdEncoding.EncodeToString(k.WG[:])+"\n"; got != want {
 		t.Error("wireguard.key does not hold the generated key")
 	}
-	if got, want := readString(t, p.IdentityFile()), base64.StdEncoding.EncodeToString(k.Identity.Seed())+"\n"; got != want {
-		t.Error("identity.key does not hold the generated seed")
-	}
 	if err := model.ValidateWGPublicKey(k.WGPublic()); err != nil {
 		t.Errorf("WGPublic: %v", err)
-	}
-	if err := model.ValidateIdentityKey(k.IdentityPublic()); err != nil {
-		t.Errorf("IdentityPublic: %v", err)
 	}
 	if k.WGPublic() == base64.StdEncoding.EncodeToString(k.WG[:]) {
 		t.Error("WGPublic returns the private key")
@@ -60,18 +51,11 @@ func TestLoadOrCreateKeys(t *testing.T) {
 	if created {
 		t.Error("created = true for existing keys")
 	}
-	if k2.WGPublic() != k.WGPublic() || k2.IdentityPublic() != k.IdentityPublic() {
+	if k2.WGPublic() != k.WGPublic() {
 		t.Error("reloaded keys differ")
 	}
-	if !k2.Identity.Equal(k.Identity) || k2.WG != k.WG {
+	if k2.WG != k.WG {
 		t.Error("reloaded private keys differ")
-	}
-
-	// The identity key signs and verifies after a reload.
-	msg := []byte("hello")
-	pub, _ := base64.StdEncoding.DecodeString(k.IdentityPublic())
-	if !ed25519.Verify(pub, msg, ed25519.Sign(k2.Identity, msg)) {
-		t.Error("reloaded identity key does not match the published public key")
 	}
 }
 
@@ -81,7 +65,6 @@ func TestLoadKeysRefusesInsecure(t *testing.T) {
 		setup func(t *testing.T, p Paths)
 	}{
 		{"group-readable wireguard key", func(t *testing.T, p Paths) { must(t, os.Chmod(p.WGKeyFile(), 0o640)) }},
-		{"world-readable identity key", func(t *testing.T, p Paths) { must(t, os.Chmod(p.IdentityFile(), 0o604)) }},
 		{"open keys dir", func(t *testing.T, p Paths) { must(t, os.Chmod(p.KeysDir, 0o755)) }},
 		{"symlinked key", func(t *testing.T, p Paths) {
 			real := p.WGKeyFile() + ".real"
@@ -132,12 +115,12 @@ func TestLoadKeysCorrupted(t *testing.T) {
 	if _, _, err := p.LoadOrCreateKeys(); err != nil {
 		t.Fatal(err)
 	}
-	must(t, os.Remove(p.IdentityFile()))
+	must(t, os.Remove(p.WGKeyFile()))
 	if _, err := p.LoadKeys(); err == nil || !strings.Contains(err.Error(), "missing") {
-		t.Errorf("LoadKeys with missing identity = %v", err)
+		t.Errorf("LoadKeys with a missing key file = %v", err)
 	}
 	if p.KeysExist() {
-		t.Error("KeysExist with one file missing")
+		t.Error("KeysExist with the key file missing")
 	}
 }
 
@@ -174,18 +157,13 @@ func TestKeysWipe(t *testing.T) {
 			t.Fatal("WireGuard key not wiped")
 		}
 	}
-	for _, b := range k.Identity {
-		if b != 0 {
-			t.Fatal("identity key not wiped")
-		}
-	}
 }
 
 // secretForms returns encodings of k's private material that must never
 // appear in any rendering of the Keys value.
 func secretForms(k *Keys) []string {
 	var out []string
-	for _, raw := range [][]byte{k.WG[:], k.Identity.Seed(), k.Identity} {
+	for _, raw := range [][]byte{k.WG[:]} {
 		for _, s := range []string{
 			base64.StdEncoding.EncodeToString(raw),
 			base64.RawURLEncoding.EncodeToString(raw),

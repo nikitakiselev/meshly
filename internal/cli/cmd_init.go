@@ -2,13 +2,10 @@ package cli
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"net/netip"
 
-	"github.com/nikitakiselev/meshly/internal/bootstrap"
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/model"
 	"github.com/nikitakiselev/meshly/internal/store"
@@ -74,7 +71,7 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 	defer s.end()
 	if cur, err := a.Paths.LoadConfig(); err == nil {
 		if cur.Network.Name == netName && cur.Self.Name == *name {
-			a.printf("This node is already initialized as %q in network %q (fingerprint %s).\n", cur.Self.Name, cur.Network.Name, bootstrap.Fingerprint(cur.Self.IdentityKey, cur.Self.WGPublicKey))
+			a.printf("This node is already initialized as %q in network %q.\n", cur.Self.Name, cur.Network.Name)
 			a.printf("Use `meshly set` to change settings, or `meshly reset` to start over.\n")
 			return nil
 		}
@@ -82,15 +79,8 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 	} else if !errors.Is(err, store.ErrNotInitialized) {
 		return err
 	}
-	bs, err := a.Paths.LoadBootstrap()
-	if err != nil {
-		return err
-	}
-	if bs.Pending != nil {
-		return errorf(ExitConflict, "this node has a pending join request; finish it with `meshly activate` or run `meshly reset`")
-	}
 
-	wgPub, idPub, err := a.publicKeys(*dry)
+	wgPub, err := a.publicKey(*dry)
 	if err != nil {
 		return err
 	}
@@ -111,7 +101,7 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 		SchemaVersion: model.ConfigSchemaVersion,
 		AdminState:    model.AdminUp,
 		Network:       model.Network{ID: netID, Name: netName, CIDR: cidr},
-		Self:          model.Self{Name: *name, Address: selfAddr, ListenPort: lp, Endpoint: ep, WGPublicKey: wgPub, IdentityKey: idPub},
+		Self:          model.Self{Name: *name, Address: selfAddr, ListenPort: lp, Endpoint: ep, WGPublicKey: wgPub},
 		Interface:     model.Interface{Name: *ifname, MTU: *mtu},
 		Firewall:      model.Firewall{Mark: model.DefaultFirewallMark},
 		Peers:         []model.Peer{},
@@ -133,40 +123,33 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 	s.end()
 	a.ensureService(ctx, cfg.Interface.Name)
 
-	fp := bootstrap.Fingerprint(cfg.Self.IdentityKey, cfg.Self.WGPublicKey)
 	a.printf("\nNetwork %q created.\n", netName)
 	a.printf("  this node:    %s  %s on %s\n", *name, selfAddr, *ifname)
 	a.printEndpoint(ep, lp, auto, found)
 	a.printf("  firewall:     profile %s; all inbound VPN traffic is denied until `meshly allow`\n", cfg.Firewall.Profile)
-	a.printf("  fingerprint:  %s\n", fp)
-	a.printf("\nNext: meshly invite --out <peer>.invite\n")
+	a.printf("  public key:   %s\n", cfg.Self.WGPublicKey)
 	return nil
 }
 
-// publicKeys loads or generates the node keys; in dry-run mode keys are
-// generated in memory only and discarded.
-func (a *App) publicKeys(dry bool) (wgPub, idPub string, err error) {
+// publicKey loads or generates the node's WireGuard key; in dry-run mode the
+// key is generated in memory only and discarded.
+func (a *App) publicKey(dry bool) (string, error) {
 	if dry && !a.Paths.KeysExist() {
 		k, err := wgtypes.GeneratePrivateKey()
 		if err != nil {
-			return "", "", err
+			return "", err
 		}
-		pub, _, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return "", "", err
-		}
-		k2 := (&store.Keys{WG: k}).WGPublic()
-		return k2, b64(pub), nil
+		return (&store.Keys{WG: k}).WGPublic(), nil
 	}
 	keys, created, err := a.Paths.LoadOrCreateKeys()
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	defer keys.Wipe()
 	if created {
-		a.printf("Generated new WireGuard and identity keys in %s (private keys never leave this node).\n", a.Paths.KeysDir)
+		a.printf("Generated a new WireGuard key in %s (the private key never leaves this node).\n", a.Paths.KeysDir)
 	}
-	return keys.WGPublic(), keys.IdentityPublic(), nil
+	return keys.WGPublic(), nil
 }
 
 func opFor(name, args, recovery string, base, target *model.Config) opArgs {

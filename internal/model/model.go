@@ -72,7 +72,6 @@ type Self struct {
 	ListenPort  uint16         `json:"listen_port"`
 	Endpoint    netip.AddrPort `json:"endpoint,omitzero"`
 	WGPublicKey string         `json:"wg_public_key"`
-	IdentityKey string         `json:"identity_key"`
 }
 
 // Interface holds settings of the managed WireGuard interface.
@@ -87,19 +86,14 @@ type Firewall struct {
 	Mark    uint32 `json:"mark"`
 }
 
-// Peer is a remote node trusted through the bootstrap procedure.
+// Peer is a remote node paired through an invite code.
 type Peer struct {
 	Name        string         `json:"name"`
 	Address     netip.Addr     `json:"address"`
 	WGPublicKey string         `json:"wg_public_key"`
-	IdentityKey string         `json:"identity_key"`
 	Endpoint    netip.AddrPort `json:"endpoint,omitzero"`
 	Keepalive   int            `json:"keepalive"`
 	AddedAt     time.Time      `json:"added_at"`
-	// TrustedVia records how trust was established ("approve" or "activate")
-	// together with the digest of the bootstrap message.
-	TrustedVia  string `json:"trusted_via"`
-	TrustDigest string `json:"trust_digest"`
 }
 
 // Clone returns a deep copy of the config.
@@ -173,9 +167,6 @@ func (c *Config) Validate() error {
 	if err := ValidateWGPublicKey(c.Self.WGPublicKey); err != nil {
 		add("self.wg_public_key: %v", err)
 	}
-	if err := ValidateIdentityKey(c.Self.IdentityKey); err != nil {
-		add("self.identity_key: %v", err)
-	}
 	if err := ValidateInterfaceName(c.Interface.Name); err != nil {
 		add("interface.name: %v", err)
 	}
@@ -213,9 +204,6 @@ func (c *Config) Validate() error {
 			add("peers[%d].wg_public_key is not unique", i)
 		}
 		keys[p.WGPublicKey] = true
-		if err := ValidateIdentityKey(p.IdentityKey); err != nil {
-			add("peers[%d].identity_key: %v", i, err)
-		}
 		if p.Endpoint.IsValid() {
 			if err := ValidateEndpoint(p.Endpoint); err != nil {
 				add("peers[%d].endpoint: %v", i, err)

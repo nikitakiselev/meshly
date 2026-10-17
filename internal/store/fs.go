@@ -1,6 +1,5 @@
-// Package store persists Meshly configuration, secrets and bootstrap state
-// as versioned files with atomic, fsync'ed replacement and strict
-// ownership/permission checks.
+// Package store persists Meshly configuration and secrets as versioned files
+// with atomic, fsync'ed replacement and strict ownership/permission checks.
 package store
 
 import (
@@ -49,14 +48,12 @@ func RootedPaths(root string, owner int) Paths {
 	}
 }
 
-func (p Paths) ConfigFile() string    { return filepath.Join(p.ConfigDir, "meshly.json") }
-func (p Paths) WGKeyFile() string     { return filepath.Join(p.KeysDir, "wireguard.key") }
-func (p Paths) IdentityFile() string  { return filepath.Join(p.KeysDir, "identity.key") }
-func (p Paths) BootstrapFile() string { return filepath.Join(p.StateDir, "bootstrap.json") }
-func (p Paths) JournalFile() string   { return filepath.Join(p.StateDir, "journal.jsonl") }
-func (p Paths) HistoryDir() string    { return filepath.Join(p.StateDir, "history") }
-func (p Paths) LockFile() string      { return filepath.Join(p.RuntimeDir, "lock") }
-func (p Paths) RuntimeFile() string   { return filepath.Join(p.StateDir, "runtime.json") }
+func (p Paths) ConfigFile() string  { return filepath.Join(p.ConfigDir, "meshly.json") }
+func (p Paths) WGKeyFile() string   { return filepath.Join(p.KeysDir, "wireguard.key") }
+func (p Paths) JournalFile() string { return filepath.Join(p.StateDir, "journal.jsonl") }
+func (p Paths) HistoryDir() string  { return filepath.Join(p.StateDir, "history") }
+func (p Paths) LockFile() string    { return filepath.Join(p.RuntimeDir, "lock") }
+func (p Paths) RuntimeFile() string { return filepath.Join(p.StateDir, "runtime.json") }
 func (p Paths) HistoryFile(rev uint64) string {
 	return filepath.Join(p.HistoryDir(), "meshly-"+strconv.FormatUint(rev, 10)+".json")
 }
@@ -156,34 +153,6 @@ func ReadFile(path string, maxMode fs.FileMode, owner int, maxSize int64) ([]byt
 	return readBounded(f, maxSize)
 }
 
-// ReadUntrusted reads an operator-supplied input file (bootstrap message):
-// regular file only, symlinks refused, size bounded. Content is never
-// echoed back in errors.
-func ReadUntrusted(path string, maxSize int64) ([]byte, error) {
-	if path == "-" {
-		return readBounded(os.Stdin, maxSize)
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
-	if err != nil {
-		if errors.Is(err, unix.ELOOP) {
-			return nil, fmt.Errorf("%w: %s is a symlink; pass the real file", ErrInsecure, path)
-		}
-		return nil, err
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file", path)
-	}
-	if st.Size() > maxSize {
-		return nil, fmt.Errorf("%s is larger than %d bytes", path, maxSize)
-	}
-	return readBounded(f, maxSize)
-}
-
 func readBounded(r io.Reader, maxSize int64) ([]byte, error) {
 	b, err := io.ReadAll(io.LimitReader(r, maxSize+1))
 	if err != nil {
@@ -199,10 +168,6 @@ func readBounded(r io.Reader, maxSize int64) ([]byte, error) {
 // fsync, rename, fsync of the directory. The directory must already be a
 // verified managed directory.
 func WriteAtomic(path string, data []byte, mode fs.FileMode) error {
-	return writeAtomic(path, data, mode, -1, -1)
-}
-
-func writeAtomic(path string, data []byte, mode fs.FileMode, uid, gid int) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -214,13 +179,6 @@ func writeAtomic(path string, data []byte, mode fs.FileMode, uid, gid int) error
 		tmp.Close()
 		cleanup()
 		return err
-	}
-	if uid >= 0 {
-		if err := tmp.Chown(uid, gid); err != nil {
-			tmp.Close()
-			cleanup()
-			return err
-		}
 	}
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
@@ -256,60 +214,6 @@ func SyncDir(dir string) error {
 	}
 	defer d.Close()
 	return d.Sync()
-}
-
-// WriteOutput writes an operator-requested output file (bootstrap
-// message). It never follows a symlink and never overwrites an existing
-// file unless force is set, in which case only a regular file is replaced.
-func WriteOutput(path string, data []byte, mode fs.FileMode, force bool) error {
-	return WriteOutputAs(path, data, mode, force, -1, -1)
-}
-
-// WriteOutputAs is WriteOutput that also gives the new file to uid:gid
-// (uid < 0: keep the caller's owner). The owner is set on the open file,
-// never through the path.
-func WriteOutputAs(path string, data []byte, mode fs.FileMode, force bool, uid, gid int) error {
-	if path == "-" {
-		_, err := os.Stdout.Write(data)
-		return err
-	}
-	flags := os.O_WRONLY | os.O_CREATE | os.O_EXCL | unix.O_NOFOLLOW | unix.O_CLOEXEC
-	f, err := os.OpenFile(path, flags, mode)
-	if errors.Is(err, fs.ErrExist) {
-		st, lerr := os.Lstat(path)
-		if lerr != nil {
-			return lerr
-		}
-		if !st.Mode().IsRegular() {
-			return fmt.Errorf("%w: %s exists and is not a regular file", ErrInsecure, path)
-		}
-		existing, rerr := ReadUntrusted(path, 1<<20)
-		if rerr == nil && string(existing) == string(data) {
-			return nil // identical content: idempotent re-run
-		}
-		if !force {
-			return fmt.Errorf("%w: %s already exists with different content (use --force to replace it)", ErrExists, path)
-		}
-		return writeAtomic(path, data, mode, uid, gid)
-	}
-	if err != nil {
-		return err
-	}
-	if uid >= 0 {
-		if err := f.Chown(uid, gid); err != nil {
-			f.Close()
-			return err
-		}
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
 }
 
 // Now is the clock used for timestamps (overridable in tests).

@@ -29,7 +29,6 @@ test:
 	go test ./...
 
 fuzz:
-	go test ./internal/bootstrap -run '^$$' -fuzz FuzzOpen -fuzztime $(FUZZTIME)
 	go test ./internal/model -run '^$$' -fuzz FuzzParseRule -fuzztime $(FUZZTIME)
 	go test ./internal/model -run '^$$' -fuzz '^FuzzParseEndpoint$$' -fuzztime $(FUZZTIME)
 	go test ./internal/model -run '^$$' -fuzz FuzzParseEndpointOrAddr -fuzztime $(FUZZTIME)

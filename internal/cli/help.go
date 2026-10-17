@@ -28,56 +28,6 @@ Usually run on the server whose UDP port is reachable from the internet.
 Examples:
   meshly init homelab --name vps
   meshly init homelab --name vps --endpoint 203.0.113.10`,
-	"invite": `meshly invite [--out FILE] [--ttl DURATION] [--new] [--force]
-
-Create a one-time invite for the second node (default validity 1h, max 24h).
-Running it again returns the same unused invite; --new replaces it.
-Transfer the file over a trusted channel (scp with a verified host key).
-
-  --out FILE    where to write the invite (default peer.invite; - = stdout)
-  --force       replace an existing FILE with different content
-
-Example:
-  meshly invite --out home.invite`,
-	"join": `meshly join <invite-file> --name <node> [--out FILE] [options]
-
-Verify an invite, generate this node's keys and write a join request.
-This does not grant anything yet: the inviting node must approve it.
-
-  <invite-file>                the invite, or - to read it from stdin
-  --name NAME                  name of this node
-  --out FILE                   where to write the request (default <name>.request; - = stdout)
-  --force                      replace an existing FILE with different content
-  --expect-fingerprint FP      inviter fingerprint (required when not interactive)
-  --endpoint IP[:PORT]|auto    public address of this node, if it has one; by
-                               default it is detected (as for init) only when
-                               the invite has no endpoint
-  --listen-port PORT           local UDP port (default 51820 or a free port)
-  --keepalive SECONDS          persistent keepalive towards the inviter (default 25;
-                               the inviter always uses 25 towards this node)
-  --interface NAME, --firewall PROFILE   as for init
-
-Example:
-  meshly join home.invite --name home --out home.request`,
-	"approve": `meshly approve <request-file> [--out FILE] [--expect-fingerprint FP] [--force] [--dry-run]
-
-Show the candidate's identity and keys and approve it explicitly. In
-non-interactive use --expect-fingerprint is mandatory.
-
-  <request-file>   the join request, or - to read it from stdin
-  --out FILE       where to write the accept (default <name>.accept; - = stdout)
-  --force          replace an existing FILE with different content
-
-Example:
-  meshly approve home.request --out home.accept`,
-	"activate": `meshly activate <accept-file> [--dry-run]
-
-Activate the membership approved by the inviting node. Only the accept that
-answers this node's own pending request is accepted. <accept-file> may be -
-to read it from stdin.
-
-Example:
-  meshly activate home.accept`,
 	"allow": `meshly allow <port>/<tcp|udp> from <peer> [--dry-run]
 meshly allow ping from <peer>
 
@@ -116,7 +66,7 @@ Examples:
   meshly set peer-endpoint vps 198.51.100.7`,
 	"logs":    "meshly logs [-n N] [--json]\n\nShow the operation journal (who changed what, rollbacks, recoveries).\nService output is in: journalctl -u meshly",
 	"upgrade": "meshly upgrade [--check] [--version X.Y.Z] [--force] [--yes]\n\nDownload a release from github.com/nikitakiselev/meshly, verify the Ed25519\nsignature of SHA256SUMS with the key built into this binary and the SHA-256\nof the binary, replace the executable atomically (previous one kept as\n<exe>.prev) and restart meshly.service. Downgrades need --force.",
-	"reset":   "meshly reset [--yes]\n\nStop the link and remove configuration, keys, bootstrap state and units\nfrom this node. The operation journal is kept for audit.",
+	"reset":   "meshly reset [--yes]\n\nStop the link and remove configuration, keys and units\nfrom this node. The operation journal is kept for audit.",
 	"version": "meshly version [--short] [--json]",
 	"recover": "meshly recover\n\nFinish or roll back an operation interrupted by a crash or power loss (every\ncommand does this first; this command does only that).",
 	"service": "meshly service start|stop|reload|check|install\n\nEntry points used by meshly.service and meshly-check.service; not meant to be\nrun by hand. `install` (re)writes the unit files for the current binary.",
@@ -130,10 +80,6 @@ Usage: meshly <command> [arguments]
 
 Typical setup:
   vps$  meshly init homelab --name vps
-  vps$  meshly invite --out home.invite             # copy to home via scp
-  home$ meshly join home.invite --name home --out home.request   # copy back
-  vps$  meshly approve home.request --out home.accept            # copy to home
-  home$ meshly activate home.accept
   vps$  meshly allow 22/tcp from home
 
 Commands:

@@ -11,7 +11,6 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/nikitakiselev/meshly/internal/bootstrap"
 	"github.com/nikitakiselev/meshly/internal/engine"
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/lock"
@@ -34,7 +33,6 @@ type Status struct {
 	Initialized bool             `json:"initialized"`
 	Privileged  bool             `json:"privileged"`
 	Busy        bool             `json:"operation_in_progress"`
-	Pending     *PendingInfo     `json:"pending_join,omitempty"`
 	Config      *ConfigInfo      `json:"config,omitempty"`
 	Service     *ServiceInfo     `json:"service,omitempty"`
 	Interface   *InterfaceInfo   `json:"interface,omitempty"`
@@ -43,14 +41,6 @@ type Status struct {
 	Transaction *TransactionInfo `json:"transaction"`
 	Drift       []string         `json:"drift"`
 	Errors      []string         `json:"errors,omitempty"`
-}
-
-// PendingInfo describes a join waiting for its accept file.
-type PendingInfo struct {
-	Network   string    `json:"network"`
-	Name      string    `json:"name"`
-	RequestID string    `json:"request_id"`
-	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // ConfigInfo is the saved desired configuration.
@@ -65,7 +55,7 @@ type ConfigInfo struct {
 	Address     string     `json:"address"`
 	ListenPort  int        `json:"listen_port"`
 	Endpoint    string     `json:"endpoint,omitempty"`
-	Fingerprint string     `json:"fingerprint"`
+	WGPublicKey string     `json:"wg_public_key"`
 	Interface   string     `json:"interface"`
 	MTU         int        `json:"mtu"`
 	Profile     string     `json:"firewall_profile"`
@@ -121,7 +111,6 @@ type FirewallInfo struct {
 type PeerInfo struct {
 	Name               string     `json:"name"`
 	Address            string     `json:"address"`
-	Fingerprint        string     `json:"fingerprint"`
 	WGPublicKey        string     `json:"wg_public_key"`
 	ConfiguredEndpoint string     `json:"configured_endpoint,omitempty"`
 	CurrentEndpoint    string     `json:"current_endpoint,omitempty"`
@@ -182,11 +171,6 @@ func Collect(ctx context.Context, d Deps) *Status {
 		st.Errors = append(st.Errors, "config: "+err.Error())
 	default:
 		st.Initialized = true
-	}
-	if d.Privileged {
-		if bs, err := d.Paths.LoadBootstrap(); err == nil && bs.Pending != nil {
-			st.Pending = &PendingInfo{Name: bs.Pending.Name, RequestID: bs.Pending.RequestID, ExpiresAt: bs.Pending.ExpiresAt, Network: bs.Pending.NetworkID}
-		}
 	}
 	collectJournal(d, st)
 	if d.Systemd != nil {
@@ -289,7 +273,7 @@ func Collect(ctx context.Context, d Deps) *Status {
 
 func basePeer(cfg *model.Config, p model.Peer) PeerInfo {
 	pi := PeerInfo{
-		Name: p.Name, Address: p.Address.String(), Fingerprint: bootstrap.Fingerprint(p.IdentityKey, p.WGPublicKey),
+		Name: p.Name, Address: p.Address.String(),
 		WGPublicKey: p.WGPublicKey, Keepalive: p.Keepalive, Connectivity: "unknown", AllowedFrom: []string{},
 	}
 	if p.Endpoint.IsValid() {
@@ -306,7 +290,7 @@ func configInfo(cfg *model.Config) *ConfigInfo {
 		Revision: cfg.Revision, UpdatedAt: cfg.UpdatedAt, AdminState: string(cfg.AdminState),
 		NetworkID: cfg.Network.ID, NetworkName: cfg.Network.Name, CIDR: cfg.Network.CIDR.String(),
 		Name: cfg.Self.Name, Address: cfg.Self.Address.String(), ListenPort: int(cfg.Self.ListenPort),
-		Fingerprint: bootstrap.Fingerprint(cfg.Self.IdentityKey, cfg.Self.WGPublicKey),
+		WGPublicKey: cfg.Self.WGPublicKey,
 		Interface:   cfg.Interface.Name, MTU: cfg.Interface.MTU, Profile: cfg.Firewall.Profile, Rules: []RuleInfo{},
 	}
 	if cfg.Self.Endpoint.IsValid() {

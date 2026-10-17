@@ -1,7 +1,6 @@
 package model
 
 import (
-	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -306,18 +305,6 @@ func ValidateWGPublicKey(s string) error {
 	b, err := decodeKey(s)
 	if err != nil || len(b) != 32 {
 		return errors.New("must be a base64-encoded 32-byte WireGuard key")
-	}
-	if isZero(b) {
-		return errors.New("all-zero key is not allowed")
-	}
-	return nil
-}
-
-// ValidateIdentityKey checks a base64 Ed25519 public key.
-func ValidateIdentityKey(s string) error {
-	b, err := decodeKey(s)
-	if err != nil || len(b) != ed25519.PublicKeySize {
-		return errors.New("must be a base64-encoded 32-byte Ed25519 key")
 	}
 	if isZero(b) {
 		return errors.New("all-zero key is not allowed")

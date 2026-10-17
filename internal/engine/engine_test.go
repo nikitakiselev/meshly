@@ -59,11 +59,11 @@ func (v *env) config() *model.Config {
 	c := &model.Config{
 		SchemaVersion: model.ConfigSchemaVersion, AdminState: model.AdminUp,
 		Network:   model.Network{ID: strings.Repeat("ab", 16), Name: "homelab", CIDR: netip.MustParsePrefix("10.100.0.0/24")},
-		Self:      model.Self{Name: "vps", Address: netip.MustParseAddr("10.100.0.1"), ListenPort: 51820, WGPublicKey: v.keys.WGPublic(), IdentityKey: v.keys.IdentityPublic()},
+		Self:      model.Self{Name: "vps", Address: netip.MustParseAddr("10.100.0.1"), ListenPort: 51820, WGPublicKey: v.keys.WGPublic()},
 		Interface: model.Interface{Name: "meshly0", MTU: 1420},
 		Firewall:  model.Firewall{Profile: model.ProfileNone, Mark: model.DefaultFirewallMark},
-		Peers: []model.Peer{{Name: "home", Address: netip.MustParseAddr("10.100.0.2"), WGPublicKey: randKey(), IdentityKey: randKey(),
-			Keepalive: 25, AddedAt: time.Date(2026, 10, 17, 11, 0, 0, 0, time.UTC), TrustedVia: "approve", TrustDigest: strings.Repeat("cd", 32)}},
+		Peers: []model.Peer{{Name: "home", Address: netip.MustParseAddr("10.100.0.2"), WGPublicKey: randKey(),
+			Keepalive: 25, AddedAt: time.Date(2026, 10, 17, 11, 0, 0, 0, time.UTC)}},
 		Rules: []model.Rule{},
 	}
 	if err := c.Validate(); err != nil {

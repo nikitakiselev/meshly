@@ -78,12 +78,7 @@ func RunDoctor(ctx context.Context, d Deps, sys *preflight.System, probe *Probe)
 	}
 	cfg, err := d.Paths.LoadConfig()
 	if errors.Is(err, store.ErrNotInitialized) {
-		st := Collect(ctx, d)
-		if st.Pending != nil {
-			doc.add("bootstrap", "info", Fact, fmt.Sprintf("join request %s is waiting for an accept file (expires %s)", st.Pending.RequestID, st.Pending.ExpiresAt.Format(time.RFC3339)), "run `meshly activate <file.accept>` after the inviting node approved")
-		} else {
-			doc.add("config", "info", Fact, "meshly is not initialized on this node", "meshly init <network> --name <node>   or   meshly join <file.invite> --name <node>")
-		}
+		doc.add("config", "info", Fact, "meshly is not initialized on this node", "meshly init <network> --name <node>")
 		return finish(doc)
 	}
 	if err != nil {
@@ -95,8 +90,8 @@ func RunDoctor(ctx context.Context, d Deps, sys *preflight.System, probe *Probe)
 		if keys, err := d.Paths.LoadKeys(); err != nil {
 			doc.add("keys", "fail", Fact, err.Error(), "keys must be root-owned 0600 files in /etc/meshly/keys (0700)")
 		} else {
-			if keys.WGPublic() != cfg.Self.WGPublicKey || keys.IdentityPublic() != cfg.Self.IdentityKey {
-				doc.add("keys", "fail", Fact, "key files do not match the public keys in the configuration", "restore the original keys; changing keys requires a new trust procedure (meshly reset, then join again)")
+			if keys.WGPublic() != cfg.Self.WGPublicKey {
+				doc.add("keys", "fail", Fact, "key files do not match the public keys in the configuration", "restore the original keys; changing the key requires pairing again (meshly reset, then join again)")
 			} else {
 				doc.add("keys", "ok", Fact, "key files are private and match the configuration", "")
 			}
@@ -202,7 +197,7 @@ func peerFindings(doc *Doctor, cfg *model.Config, st *Status, p PeerInfo) {
 		case weListen && transport:
 			doc.add(id, "fail", Likely,
 				fmt.Sprintf("%d UDP packets arrived on port %d but no handshake completed", *st.Firewall.TransportPkts, cfg.Self.ListenPort),
-				"the packets are not from this peer's key (wrong peer, peer reset its keys) — compare fingerprints in `meshly status` on both nodes")
+				"the packets are not from this peer's key (wrong peer, peer reset its keys) — compare the WireGuard public keys shown by `meshly status` on both nodes")
 		case p.TxBytes > 0 && p.RxBytes == 0:
 			doc.add(id, "fail", Possible,
 				fmt.Sprintf("handshake initiations are sent to %s but nothing comes back", p.ConfiguredEndpoint),
