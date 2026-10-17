@@ -16,7 +16,10 @@ import (
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/model"
 	"github.com/nikitakiselev/meshly/internal/netstack"
+	"github.com/nikitakiselev/meshly/internal/nft"
 	"github.com/nikitakiselev/meshly/internal/store"
+	"github.com/nikitakiselev/meshly/internal/wg"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 // ---- fixtures ----
@@ -361,5 +364,168 @@ func TestEndpointHint(t *testing.T) {
 	}
 	if p := v.plan(saved); len(p) != 0 {
 		t.Fatalf("endpoint hint causes drift: %v", p)
+	}
+}
+
+// ---- overlay ----
+
+func genKey(t *testing.T) wgtypes.Key {
+	t.Helper()
+	k, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+func tempOverlay(t *testing.T) (*Overlay, string, wgtypes.Key) {
+	t.Helper()
+	temp := genKey(t).PublicKey().String()
+	psk := genKey(t)
+	return &Overlay{
+		Peer:  &wg.DesiredPeer{PublicKey: temp, AllowedIP: netip.MustParsePrefix("10.100.0.2/32"), Keepalive: 25, PresharedKey: psk},
+		Allow: []nft.AllowEntry{{Peer: netip.MustParseAddr("10.100.0.2"), Proto: model.ProtoTCP, Port: 51820}},
+	}, temp, psk
+}
+
+func TestOverlayPeerAndAllow(t *testing.T) {
+	v := newEnv(t)
+	ctx := context.Background()
+	c := v.config()
+	c.Peers = nil
+	v.commit(c)
+	ov, temp, psk := tempOverlay(t)
+	if err := v.e.ApplyOverlay(ctx, c, "meshly0", ov); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mustObserve(t, v).Peer(temp); !ok {
+		t.Fatal("temporary peer missing")
+	}
+	if got := v.k.PresharedKey(temp); got != psk {
+		t.Fatal("preshared key not applied")
+	}
+	l, _ := v.k.LinkOps().Observe("meshly0")
+	if len(l.Routes) != 1 || l.Routes[0].Dst != netip.MustParsePrefix("10.100.0.2/32") {
+		t.Fatalf("routes %v", l.Routes)
+	}
+	if last := v.k.Scripts[len(v.k.Scripts)-1]; !strings.Contains(last, "10.100.0.2 . tcp . 51820") {
+		t.Fatalf("allow entry missing in:\n%s", last)
+	}
+	if drift, err := v.e.Drift(ctx, c); err != nil || len(drift) == 0 {
+		t.Fatalf("drift while overlay is in place: %v %v", drift, err)
+	}
+	if _, err := v.e.Reconcile(ctx, c, "meshly0", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mustObserve(t, v).Peer(temp); ok {
+		t.Fatal("temporary peer still present")
+	}
+	if got := v.k.PresharedKey(temp); got != (wgtypes.Key{}) {
+		t.Fatal("preshared key not cleared")
+	}
+	if drift, _ := v.e.Drift(ctx, c); len(drift) != 0 {
+		t.Fatalf("drift after removing overlay: %v", drift)
+	}
+	if last := v.k.Scripts[len(v.k.Scripts)-1]; strings.Contains(last, "tcp . 51820") {
+		t.Fatalf("allow entry still present in:\n%s", last)
+	}
+}
+
+func mustObserve(t *testing.T, v *env) *wg.Device {
+	t.Helper()
+	d, err := v.e.WG.Observe("meshly0")
+	if err != nil || d == nil {
+		t.Fatalf("observe: %v %v", d, err)
+	}
+	return d
+}
+
+func TestOverlayPrivateKey(t *testing.T) {
+	v := newEnv(t)
+	c := v.config()
+	c.Peers = nil
+	v.e.LoadKeys = func() (*store.Keys, error) { return nil, errors.New("no key file") }
+	k := genKey(t)
+	if err := v.e.ApplyOverlay(context.Background(), c, "meshly0", &Overlay{PrivateKey: &k}); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustObserve(t, v).PublicKey; got != k.PublicKey().String() {
+		t.Fatalf("public key %s, want %s", got, k.PublicKey())
+	}
+}
+
+func TestOverlayFailureRestoresConfig(t *testing.T) {
+	v := newEnv(t)
+	c := v.config()
+	c.Peers = nil
+	v.commit(c)
+	ov, _, _ := tempOverlay(t)
+	v.k.Fail("wireguard.configure", 1)
+	if err := v.e.ApplyOverlay(context.Background(), c, "meshly0", ov); err == nil {
+		t.Fatal("expected an error")
+	}
+	if drift, err := v.e.Drift(context.Background(), c); err != nil || len(drift) != 0 {
+		t.Fatalf("drift after failed overlay: %v %v", drift, err)
+	}
+}
+
+func TestExecuteWithOverlay(t *testing.T) {
+	v := newEnv(t)
+	base := v.config()
+	base.Peers = nil
+	v.commit(base)
+	target := v.config()
+	ov, temp, psk := tempOverlay(t)
+	if _, err := v.e.Execute(context.Background(), v.j, Op{Name: "approve", Recovery: journal.Backward, Base: base, Target: target, Overlay: ov}); err != nil {
+		t.Fatal(err)
+	}
+	dev := mustObserve(t, v)
+	if _, ok := dev.Peer(target.Peers[0].WGPublicKey); !ok {
+		t.Fatal("real peer missing")
+	}
+	if _, ok := dev.Peer(temp); !ok {
+		t.Fatal("overlay peer missing")
+	}
+	saved, err := v.paths.LoadConfig()
+	if err != nil || len(saved.Peers) != 1 || len(saved.Rules) != 0 {
+		t.Fatalf("saved config %+v %v", saved, err)
+	}
+	raw, err := os.ReadFile(v.paths.JournalFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []wgtypes.Key{psk, v.keys.WG} {
+		if strings.Contains(string(raw), k.String()) || strings.Contains(string(raw), string(k[:])) {
+			t.Fatal("journal contains key material")
+		}
+	}
+	if strings.Contains(string(raw), "51820 tcp") || strings.Contains(string(raw), temp) {
+		t.Fatal("journal contains overlay data")
+	}
+}
+
+func TestInPlaceUpdateClearsPresharedKey(t *testing.T) {
+	v := newEnv(t)
+	ctx := context.Background()
+	c := v.config()
+	c.Peers = nil
+	p := genKey(t).PublicKey().String()
+	psk := genKey(t)
+	tmpPriv := genKey(t)
+	ov := &Overlay{PrivateKey: &tmpPriv, Peer: &wg.DesiredPeer{PublicKey: p, AllowedIP: netip.MustParsePrefix("10.100.0.2/32"), PresharedKey: psk}}
+	if err := v.e.ApplyOverlay(ctx, c, "meshly0", ov); err != nil {
+		t.Fatal(err)
+	}
+	if v.k.PresharedKey(p) != psk {
+		t.Fatal("preshared key not applied")
+	}
+	c2 := v.config()
+	c2.Peers[0].WGPublicKey = p
+	c2.Peers[0].Keepalive = 0
+	if _, err := v.e.Reconcile(ctx, c2, "meshly0", nil); err != nil {
+		t.Fatal(err)
+	}
+	if v.k.PresharedKey(p) != (wgtypes.Key{}) {
+		t.Fatal("preshared key survived an in-place update")
 	}
 }

@@ -25,6 +25,8 @@ type Kernel struct {
 	Links  map[string]*netstack.Link
 	Sysctl map[string][]string
 	Devs   map[string]*wg.Device
+	// psks maps a peer public key to its preshared key.
+	psks map[string]wgtypes.Key
 	// Table is the marker comment of the meshly table ("" = absent).
 	Table string
 	// Tamper adds a rule to the meshly table (modified outside meshly).
@@ -46,7 +48,7 @@ type Kernel struct {
 // New returns an empty kernel.
 func New() *Kernel {
 	return &Kernel{
-		Links: map[string]*netstack.Link{}, Sysctl: map[string][]string{}, Devs: map[string]*wg.Device{},
+		Links: map[string]*netstack.Link{}, Sysctl: map[string][]string{}, Devs: map[string]*wg.Device{}, psks: map[string]wgtypes.Key{},
 		failOn: map[string]int{}, after: map[string]int{}, cascade: map[string]string{}, Version: "nftables v1.0.6 (Lester Gooch #5)",
 	}
 }
@@ -128,6 +130,11 @@ func (f *Links) Delete(name string) error {
 		return err
 	}
 	delete(f.k.Links, name)
+	if d := f.k.Devs[name]; d != nil {
+		for _, p := range d.Peers {
+			delete(f.k.psks, p.PublicKey)
+		}
+	}
 	delete(f.k.Devs, name)
 	return nil
 }
@@ -206,6 +213,13 @@ func (f *Links) LinkExists(name string) (exists, owned bool, kind string, err er
 	return l.Exists, l.Owned(), l.Type, nil
 }
 
+// PresharedKey returns the preshared key of the peer (zero when none).
+func (k *Kernel) PresharedKey(peer string) wgtypes.Key {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.psks[peer]
+}
+
 // ---- WireGuard (engine.WGOps) ----
 
 // WGOps returns the WireGuard implementation.
@@ -243,6 +257,16 @@ func (f *WG) Configure(name string, priv wgtypes.Key, port int, want []wg.Desire
 			ps.Endpoint, ps.LastHandshake = old.Endpoint, old.LastHandshake
 		}
 		peers = append(peers, ps)
+		if p.PresharedKey == (wgtypes.Key{}) {
+			delete(f.k.psks, p.PublicKey)
+		} else {
+			f.k.psks[p.PublicKey] = p.PresharedKey
+		}
+	}
+	for _, old := range d.Peers {
+		if !slices.ContainsFunc(want, func(p wg.DesiredPeer) bool { return p.PublicKey == old.PublicKey }) {
+			delete(f.k.psks, old.PublicKey)
+		}
 	}
 	d.Peers = peers
 	return nil
@@ -252,6 +276,9 @@ func (f *WG) RemoveAllPeers(name string) error {
 	f.k.mu.Lock()
 	defer f.k.mu.Unlock()
 	if d, ok := f.k.Devs[name]; ok {
+		for _, p := range d.Peers {
+			delete(f.k.psks, p.PublicKey)
+		}
 		d.Peers = nil
 	}
 	return nil

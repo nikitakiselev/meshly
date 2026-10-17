@@ -74,12 +74,28 @@ type Desired struct {
 	Peers      []wg.DesiredPeer
 	Routes     []netstack.Route
 	Firewall   nft.Rendered
+	// PrivateKey replaces the key file when set (overlay only).
+	PrivateKey *wgtypes.Key
+}
+
+// Overlay is temporary kernel state applied on top of a config. It is
+// never saved, journaled or printed.
+type Overlay struct {
+	Peer       *wg.DesiredPeer  // extra peer (nil: none)
+	Allow      []nft.AllowEntry // extra allow entries
+	PrivateKey *wgtypes.Key     // replaces the key file (nil: use it)
 }
 
 // DesiredFrom derives desired state; a nil config or admin state "down"
 // means nothing may exist. ifname names the interface to tear down when
 // the config is nil.
 func DesiredFrom(cfg *model.Config, ifname string) (*Desired, error) {
+	return DesiredWith(cfg, ifname, nil)
+}
+
+// DesiredWith derives desired state with a temporary overlay on top of cfg
+// (nil: none). The overlay is ignored when nothing may exist.
+func DesiredWith(cfg *model.Config, ifname string, ov *Overlay) (*Desired, error) {
 	if cfg == nil {
 		if ifname == "" {
 			ifname = model.DefaultInterface
@@ -105,7 +121,23 @@ func DesiredFrom(cfg *model.Config, ifname string) (*Desired, error) {
 		})
 		d.Routes = append(d.Routes, netstack.Route{Dst: netip.PrefixFrom(p.Address, 32), Src: cfg.Self.Address})
 	}
-	r, err := nft.Render(nft.InputFromConfig(cfg, false))
+	in := nft.InputFromConfig(cfg, false)
+	if ov != nil {
+		if ov.Peer != nil {
+			d.Peers = append(d.Peers, *ov.Peer)
+			d.Routes = append(d.Routes, netstack.Route{Dst: ov.Peer.AllowedIP, Src: cfg.Self.Address})
+			if a := ov.Peer.AllowedIP.Addr(); !slices.Contains(in.Peers, a) {
+				in.Peers = append(in.Peers, a)
+			}
+		}
+		in.Allow = append(in.Allow, ov.Allow...)
+		if ov.PrivateKey != nil {
+			k := *ov.PrivateKey
+			d.PrivateKey = &k
+			d.WGPublic = k.PublicKey().String()
+		}
+	}
+	r, err := nft.Render(in)
 	if err != nil {
 		return nil, err
 	}
@@ -291,13 +323,19 @@ func (e *Engine) applyFirewall(ctx context.Context, fw nft.Rendered) error {
 }
 
 func (e *Engine) configureWG(name string, d *Desired) error {
-	keys, err := e.LoadKeys()
-	if err != nil {
-		return err
-	}
-	defer keys.Wipe()
-	if keys.WGPublic() != d.WGPublic {
-		return errors.New("WireGuard private key does not match the public key in the config; refusing to configure")
+	var priv wgtypes.Key
+	if d.PrivateKey != nil {
+		priv = *d.PrivateKey
+	} else {
+		keys, err := e.LoadKeys()
+		if err != nil {
+			return err
+		}
+		defer keys.Wipe()
+		if keys.WGPublic() != d.WGPublic {
+			return errors.New("WireGuard private key does not match the public key in the config; refusing to configure")
+		}
+		priv = keys.WG
 	}
 	cur, err := e.WG.Observe(name)
 	if err != nil {
@@ -319,7 +357,7 @@ func (e *Engine) configureWG(name string, d *Desired) error {
 			}
 		}
 	}
-	return e.WG.Configure(name, keys.WG, d.ListenPort, peers, cur)
+	return e.WG.Configure(name, priv, d.ListenPort, peers, cur)
 }
 
 // RememberEndpoints records the endpoints the kernel learned for peers
@@ -422,6 +460,10 @@ func (e *Engine) Reconcile(ctx context.Context, cfg *model.Config, ifname string
 	if err != nil {
 		return nil, err
 	}
+	return e.reconcileTo(ctx, d, hook)
+}
+
+func (e *Engine) reconcileTo(ctx context.Context, d *Desired, hook func(Step) error) ([]Step, error) {
 	o, err := e.Observe(ctx, d.Interface)
 	if err != nil {
 		return nil, err
@@ -434,6 +476,21 @@ func (e *Engine) Reconcile(ctx context.Context, cfg *model.Config, ifname string
 		return steps, err
 	}
 	return steps, e.Verify(ctx, d)
+}
+
+// ApplyOverlay reconciles cfg plus the temporary overlay ov and verifies
+// it. On failure it restores cfg without the overlay and returns the
+// original error. Removing the overlay is a plain Reconcile(cfg).
+func (e *Engine) ApplyOverlay(ctx context.Context, cfg *model.Config, ifname string, ov *Overlay) error {
+	d, err := DesiredWith(cfg, ifname, ov)
+	if err == nil {
+		_, err = e.reconcileTo(ctx, d, nil)
+	}
+	if err != nil {
+		_, _ = e.Reconcile(ctx, cfg, ifname, nil)
+		return err
+	}
+	return nil
 }
 
 // Verify checks local invariants: observing again must yield an empty

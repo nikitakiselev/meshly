@@ -87,11 +87,14 @@ func (Kernel) Configure(name string, priv wgtypes.Key, listenPort int, want []De
 		}
 		wanted[p.PublicKey] = true
 		ka := time.Duration(p.Keepalive) * time.Second
+		// Always set: the zero key clears the PSK of a peer updated in place.
+		psk := p.PresharedKey
 		pc := wgtypes.PeerConfig{
 			PublicKey:                   key,
 			ReplaceAllowedIPs:           true,
 			AllowedIPs:                  []net.IPNet{{IP: p.AllowedIP.Addr().AsSlice(), Mask: net.CIDRMask(p.AllowedIP.Bits(), 32)}},
 			PersistentKeepaliveInterval: &ka,
+			PresharedKey:                &psk,
 		}
 		if p.Endpoint.IsValid() {
 			pc.Endpoint = net.UDPAddrFromAddrPort(p.Endpoint)

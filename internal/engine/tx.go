@@ -25,6 +25,9 @@ type Op struct {
 	Recovery string
 	Base     *model.Config // last committed config (nil: none)
 	Target   *model.Config // desired config (nil: remove the config)
+	// Overlay is applied on top of Target; rollback and recovery use
+	// Base/the saved config without it. It is never journaled.
+	Overlay *Overlay
 }
 
 // Result describes a completed operation.
@@ -84,7 +87,7 @@ func SameConfig(a, b *model.Config) bool {
 
 // Preview computes the plan of op without changing anything.
 func (e *Engine) Preview(ctx context.Context, op Op) (*Desired, []Step, error) {
-	d, err := DesiredFrom(op.Target, ifnameOf(op.Target, op.Base))
+	d, err := DesiredWith(op.Target, ifnameOf(op.Target, op.Base), op.Overlay)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -117,7 +120,7 @@ func (e *Engine) Execute(ctx context.Context, j *journal.Journal, op Op) (*Resul
 			return nil, fmt.Errorf("invalid target configuration: %w", err)
 		}
 	}
-	d, err := DesiredFrom(op.Target, ifname)
+	d, err := DesiredWith(op.Target, ifname, op.Overlay)
 	if err != nil {
 		return nil, err
 	}

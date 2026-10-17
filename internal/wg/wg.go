@@ -6,6 +6,8 @@ package wg
 import (
 	"net/netip"
 	"time"
+
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 // PeerState is the observed state of a WireGuard peer.
@@ -45,4 +47,7 @@ type DesiredPeer struct {
 	Endpoint  netip.AddrPort
 	AllowedIP netip.Prefix
 	Keepalive int
+	// PresharedKey is the optional PSK of the peer. The zero key means none
+	// and clears a PSK left on an existing peer.
+	PresharedKey wgtypes.Key
 }
