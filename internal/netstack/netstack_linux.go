@@ -357,6 +357,47 @@ func (n *Netlink) LocalAddrs() ([]netip.Addr, error) {
 	return out, nil
 }
 
+// DefaultRouteAddrs returns the IPv4 addresses of the interfaces that carry
+// an IPv4 default route in the main table. It only reads the kernel state.
+func (n *Netlink) DefaultRouteAddrs() ([]model.LinkAddr, error) {
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return nil, fmt.Errorf("list routes: %w", err)
+	}
+	var idx []int
+	for _, r := range routes {
+		if r.Dst != nil {
+			if ones, _ := r.Dst.Mask.Size(); ones != 0 {
+				continue
+			}
+		}
+		idx = append(idx, r.LinkIndex)
+		for _, nh := range r.MultiPath {
+			idx = append(idx, nh.LinkIndex)
+		}
+	}
+	var out []model.LinkAddr
+	for _, i := range idx {
+		if i <= 0 {
+			continue
+		}
+		l, err := netlink.LinkByIndex(i)
+		if err != nil {
+			return nil, fmt.Errorf("read link %d: %w", i, err)
+		}
+		addrs, err := netlink.AddrList(l, netlink.FAMILY_V4)
+		if err != nil {
+			return nil, fmt.Errorf("list addresses of %s: %w", l.Attrs().Name, err)
+		}
+		for _, a := range addrs {
+			if p, ok := prefixOf(a.IPNet); ok && a.Scope == int(netlink.SCOPE_UNIVERSE) {
+				out = append(out, model.LinkAddr{Addr: p.Addr(), Link: l.Attrs().Name})
+			}
+		}
+	}
+	return out, nil
+}
+
 // LinkExists reports whether any link (of any type) has the name, and
 // whether it is owned by Meshly.
 func (n *Netlink) LinkExists(name string) (exists, owned bool, kind string, err error) {

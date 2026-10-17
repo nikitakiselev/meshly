@@ -193,6 +193,7 @@ func (f *fakeLinks) UsedPrefixes(exclude string) ([]model.UsedPrefix, error) {
 func (f *fakeLinks) LocalAddrs() ([]netip.Addr, error) {
 	return []netip.Addr{netip.MustParseAddr("203.0.113.10")}, nil
 }
+func (f *fakeLinks) DefaultRouteAddrs() ([]model.LinkAddr, error) { return nil, nil }
 func (f *fakeLinks) LinkExists(string) (bool, bool, string, error) {
 	return f.exists, f.owned, f.kind, f.linkErr
 }

@@ -8,13 +8,16 @@ import (
 )
 
 var helpTexts = map[string]string{
-	"init": `meshly init <network> --name <node> [--endpoint IP:PORT] [options]
+	"init": `meshly init <network> --name <node> [--endpoint IP[:PORT]|auto|none] [options]
 
 Create a new network on this node and bring up the protected interface.
 Usually run on the server whose UDP port is reachable from the internet.
 
   --name NAME          name of this node (a-z, 0-9, '-')
-  --endpoint IP:PORT   public UDP endpoint other nodes connect to (numeric)
+  --endpoint ADDR      public IP or IP:PORT other nodes connect to (the port
+                       defaults to --listen-port). Default auto: the public
+                       IPv4 address of this server's interface, found
+                       locally. none = no public address
   --listen-port PORT   local UDP port (default: endpoint port or 51820)
   --cidr CIDR          VPN network (default 10.100.0.0/24, IPv4 /16-/30)
   --mtu N              interface MTU (default 1420)
@@ -22,8 +25,9 @@ Usually run on the server whose UDP port is reachable from the internet.
   --firewall PROFILE   auto | none | nftables (default auto)
   --dry-run            show what would change, change nothing
 
-Example:
-  meshly init homelab --name vps --endpoint 203.0.113.10:51820`,
+Examples:
+  meshly init homelab --name vps
+  meshly init homelab --name vps --endpoint 203.0.113.10`,
 	"invite": `meshly invite [--out FILE] [--ttl DURATION] [--new] [--force]
 
 Create a one-time invite for the second node (default validity 1h, max 24h).
@@ -45,7 +49,9 @@ This does not grant anything yet: the inviting node must approve it.
   --out FILE                   where to write the request (default <name>.request; - = stdout)
   --force                      replace an existing FILE with different content
   --expect-fingerprint FP      inviter fingerprint (required when not interactive)
-  --endpoint IP:PORT           public endpoint of this node, if it has one
+  --endpoint IP[:PORT]|auto    public address of this node, if it has one; by
+                               default it is detected (as for init) only when
+                               the invite has no endpoint
   --listen-port PORT           local UDP port (default 51820 or a free port)
   --keepalive SECONDS          persistent keepalive towards the inviter (default 25;
                                the inviter always uses 25 towards this node)
@@ -98,13 +104,16 @@ service are dropped as well.`,
 
   mtu <1280-8920>                 interface MTU (set the same value on both nodes)
   keepalive <seconds>             persistent keepalive towards all peers (0 = off)
-  endpoint <IP:PORT|none>         this node's public endpoint (used in new invites)
-  peer-endpoint <peer> <IP:PORT|none>   where to reach the peer
+  endpoint <IP[:PORT]|auto|none>  this node's public address (used in new invites;
+                                  the port defaults to the listen port)
+  peer-endpoint <peer> <IP[:PORT]|none>   where to reach the peer (the port
+                                  defaults to the current one, or 51820)
   cidr <CIDR>                     VPN network (only before a peer joins)
 
 Examples:
   meshly set mtu 1380
-  meshly set peer-endpoint vps 198.51.100.7:51820`,
+  meshly set endpoint auto
+  meshly set peer-endpoint vps 198.51.100.7`,
 	"logs":    "meshly logs [-n N] [--json]\n\nShow the operation journal (who changed what, rollbacks, recoveries).\nService output is in: journalctl -u meshly",
 	"upgrade": "meshly upgrade [--check] [--version X.Y.Z] [--force] [--yes]\n\nDownload a release from github.com/nikitakiselev/meshly, verify the Ed25519\nsignature of SHA256SUMS with the key built into this binary and the SHA-256\nof the binary, replace the executable atomically (previous one kept as\n<exe>.prev) and restart meshly.service. Downgrades need --force.",
 	"reset":   "meshly reset [--yes]\n\nStop the link and remove configuration, keys, bootstrap state and units\nfrom this node. The operation journal is kept for audit.",
@@ -120,7 +129,7 @@ func (a *App) usage(w io.Writer) {
 Usage: meshly <command> [arguments]
 
 Typical setup:
-  vps$  meshly init homelab --name vps --endpoint 203.0.113.10:51820
+  vps$  meshly init homelab --name vps
   vps$  meshly invite --out home.invite             # copy to home via scp
   home$ meshly join home.invite --name home --out home.request   # copy back
   vps$  meshly approve home.request --out home.accept            # copy to home

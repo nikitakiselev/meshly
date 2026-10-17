@@ -22,7 +22,7 @@ never written to JSON output.
 
 The protocol behind these commands is specified in [bootstrap-protocol.md](bootstrap-protocol.md).
 
-### `meshly init <network> --name <node> [--endpoint IP:PORT] [options]`
+### `meshly init <network> --name <node> [--endpoint IP[:PORT]|auto|none] [options]`
 
 Creates a network on this node and brings up the protected interface. It is usually run on the server whose UDP
 port is reachable from the internet. Keys are generated locally.
@@ -30,7 +30,7 @@ port is reachable from the internet. Keys are generated locally.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--name NAME` | (required) | Node name: `a-z`, `0-9`, `-` |
-| `--endpoint IP:PORT` | none | Public UDP endpoint the other node connects to. Numeric only; host names are not supported |
+| `--endpoint ADDR` | `auto` | Public address the other node connects to: `IP` or `IP:PORT` (numeric; host names are not supported; the port defaults to `--listen-port`), `auto` or `none`. See [Endpoint detection](#endpoint-detection) |
 | `--listen-port PORT` | endpoint port or `51820` | Local UDP port |
 | `--cidr CIDR` | `10.100.0.0/24` | VPN network: private IPv4, `/16`–`/30`, must not overlap local addresses or routes |
 | `--mtu N` | `1420` | Interface MTU |
@@ -41,6 +41,16 @@ port is reachable from the internet. Keys are generated locally.
 Preflight runs first. If the environment is unsupported (no kernel WireGuard, nftables older than 1.0.6, ufw,
 firewalld, iptables-legacy rules, a foreign drop chain without integration, a CIDR conflict or a busy port), init
 stops with exit code 3 and changes nothing.
+
+#### Endpoint detection
+
+With `--endpoint auto` (the default) meshly looks at the interfaces that carry the IPv4 default route and takes their
+public IPv4 address, if there is exactly one. Private (RFC 1918), shared (RFC 6598, carrier-grade NAT), loopback and
+link-local addresses are skipped. meshly reads only the local network configuration and does not ask any service on the
+internet, so it cannot see a public address that the provider maps from outside: AWS, GCP and other clouds with 1:1 NAT
+give the server a private address only. In that case, or when there are several public addresses, init reports why and
+creates the network without an endpoint; set it with `meshly set endpoint IP`. The endpoint is only advertised in
+invites: the firewall accepts WireGuard on the listen port with or without one.
 
 ### `meshly invite [--out FILE] [--ttl DURATION] [--new] [--force]`
 
@@ -59,7 +69,7 @@ this node's keys and writes a signed join request. Nothing is trusted or changed
 | `--name NAME` | (required) | Name of this node |
 | `--out FILE` | `<name>.request` | Request file (`-` = stdout) |
 | `--expect-fingerprint FP` | | Inviter fingerprint. **Required when stdin is not a terminal** |
-| `--endpoint IP:PORT` | none | Public endpoint of this node, if it has one |
+| `--endpoint IP[:PORT]` | detected only if needed | Public address of this node, if it has one. Without the flag, an address is [detected](#endpoint-detection) only when the invite has no endpoint, so a node behind NAT advertises none. `auto` detects it anyway |
 | `--listen-port PORT` | `51820` or a free port | Local UDP port |
 | `--keepalive SECONDS` | `25` | Keepalive towards the inviter. The inviter always uses 25 towards this node |
 | `--interface NAME`, `--firewall PROFILE` | | As for `init` |
@@ -135,8 +145,8 @@ for a running link: a link stopped with `meshly stop` is brought back with `mesh
 |---|---|---|
 | `mtu` | `1280`–`8920` | Set the same value on both nodes |
 | `keepalive` | `0`–`3600` seconds | Towards all peers. `0` turns it off (not recommended behind NAT) |
-| `endpoint` | `IP:PORT` or `none` | This node's public endpoint (used in new invites) |
-| `peer-endpoint` | `<peer> IP:PORT` or `<peer> none` | Where to reach the peer, e.g. after the VPS changed its IP |
+| `endpoint` | `IP`, `IP:PORT`, `auto` or `none` | This node's public address, used in new invites. A bare IP gets the listen port; `auto` [detects](#endpoint-detection) the address and fails if there is not exactly one |
+| `peer-endpoint` | `<peer> IP`, `<peer> IP:PORT` or `<peer> none` | Where to reach the peer, e.g. after the VPS changed its IP. A bare IP keeps the current port (or gets `51820`) |
 | `cidr` | `CIDR` | VPN network; only before a peer joined |
 
 ## Information

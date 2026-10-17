@@ -91,6 +91,7 @@ func (e *Error) Error() string { return e.msg }
 type Links interface {
 	UsedPrefixes(exclude string) ([]model.UsedPrefix, error)
 	LocalAddrs() ([]netip.Addr, error)
+	DefaultRouteAddrs() ([]model.LinkAddr, error)
 	LinkExists(name string) (exists, owned bool, kind string, err error)
 }
 

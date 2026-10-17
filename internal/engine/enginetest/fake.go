@@ -39,6 +39,8 @@ type Kernel struct {
 	cascade map[string]string
 	// Version is reported by `nft --version`.
 	Version string
+	// DefaultRoute lists the addresses of the interfaces with a default route.
+	DefaultRoute []model.LinkAddr
 }
 
 // New returns an empty kernel.
@@ -191,6 +193,12 @@ func (f *Links) UsedPrefixes(exclude string) ([]model.UsedPrefix, error) {
 
 func (f *Links) LocalAddrs() ([]netip.Addr, error) {
 	return []netip.Addr{netip.MustParseAddr("192.0.2.10")}, nil
+}
+
+func (f *Links) DefaultRouteAddrs() ([]model.LinkAddr, error) {
+	f.k.mu.Lock()
+	defer f.k.mu.Unlock()
+	return slices.Clone(f.k.DefaultRoute), nil
 }
 
 func (f *Links) LinkExists(name string) (exists, owned bool, kind string, err error) {

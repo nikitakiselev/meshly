@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 
 	"github.com/nikitakiselev/meshly/internal/engine"
@@ -161,3 +162,46 @@ func (a *App) unknownPeer(c *model.Config, name string) error {
 type opArgs = engine.Op
 
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
+
+// parseEndpointArg parses an endpoint argument: IP, IP:PORT, "auto" (look
+// for this host's public address) or "none". A bare IP gets defPort.
+func parseEndpointArg(s string, defPort uint16) (ep netip.AddrPort, auto bool, err error) {
+	switch s {
+	case "auto":
+		return netip.AddrPort{}, true, nil
+	case "none":
+		return netip.AddrPort{}, false, nil
+	}
+	ep, err = model.ParseEndpointOrAddr(s, defPort)
+	return ep, false, err
+}
+
+// detectedEndpoint is the result of detectEndpoint.
+type detectedEndpoint struct {
+	ep   netip.AddrPort
+	link string
+	why  string // why there is no endpoint, when ep is not valid
+}
+
+// detectEndpoint looks for the address other nodes reach this host at: the
+// only public IPv4 address on the interfaces with the default route. It
+// reads local state only and never asks a service on the internet, so a
+// cloud server behind 1:1 NAT (AWS, GCP) has no detectable address.
+func (a *App) detectEndpoint(port uint16) detectedEndpoint {
+	addrs, err := a.Sys.Links.DefaultRouteAddrs()
+	if err != nil {
+		return detectedEndpoint{why: fmt.Sprintf("the network interfaces could not be read (%v)", err)}
+	}
+	pub := model.PublicIPv4(addrs)
+	switch len(pub) {
+	case 0:
+		return detectedEndpoint{why: "this server has no public IPv4 address on its network interfaces"}
+	case 1:
+		return detectedEndpoint{ep: netip.AddrPortFrom(pub[0].Addr, port), link: pub[0].Link}
+	}
+	list := make([]string, len(pub))
+	for i, p := range pub {
+		list[i] = p.Addr.String() + " on " + p.Link
+	}
+	return detectedEndpoint{why: "this server has several public IPv4 addresses (" + strings.Join(list, ", ") + ")"}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -505,5 +506,85 @@ func TestNewRandomID(t *testing.T) {
 	boom := errors.New("boom")
 	if _, err := NewRandomID(func([]byte) (int, error) { return 0, boom }); !errors.Is(err, boom) {
 		t.Errorf("error not wrapped: %v", err)
+	}
+}
+
+func TestParseEndpointOrAddr(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    string // canonical result; "" means an error is expected
+		wantErr string
+	}{
+		// A bare address gets the default port.
+		{in: "203.0.113.10", want: "203.0.113.10:51820"},
+		{in: "2001:db8::1", want: "[2001:db8::1]:51820"},
+		{in: "[2001:db8::1]", want: "[2001:db8::1]:51820"},
+		{in: "::ffff:203.0.113.10", want: "203.0.113.10:51820"},
+		// An explicit port wins.
+		{in: "203.0.113.10:4000", want: "203.0.113.10:4000"},
+		{in: "[2001:db8::1]:4000", want: "[2001:db8::1]:4000"},
+		// Without brackets the last group belongs to the address.
+		{in: "2001:db8::1:4000", want: "[2001:db8::1:4000]:51820"},
+
+		{in: "", wantErr: "expected a numeric IP or IP:PORT"},
+		{in: "example.com", wantErr: "host names are not supported"},
+		{in: "example.com:51820", wantErr: "host names are not supported"},
+		{in: "[203.0.113.10]", wantErr: "invalid endpoint"},
+		{in: "203.0.113.10:", wantErr: "invalid endpoint"},
+		{in: " 203.0.113.10", wantErr: "invalid endpoint"},
+		{in: "203.0.113.10:051820", wantErr: "leading zeros"},
+		{in: "fe80::1%eth0", wantErr: "zone"},
+		{in: "[fe80::1%eth0]", wantErr: "zone"},
+		{in: "0.0.0.0", wantErr: "not a unicast"},
+		{in: "169.254.1.1", wantErr: "link-local"},
+	}
+	for _, tt := range tests {
+		ap, err := ParseEndpointOrAddr(tt.in, 51820)
+		if tt.want != "" {
+			if err != nil {
+				t.Errorf("ParseEndpointOrAddr(%q) = %v", tt.in, err)
+			} else if ap.String() != tt.want {
+				t.Errorf("ParseEndpointOrAddr(%q) = %s, want %s", tt.in, ap, tt.want)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("ParseEndpointOrAddr(%q) = %s, want error containing %q", tt.in, ap, tt.wantErr)
+		} else if !strings.Contains(err.Error(), tt.wantErr) {
+			t.Errorf("ParseEndpointOrAddr(%q) = %v, want error containing %q", tt.in, err, tt.wantErr)
+		}
+	}
+	if _, err := ParseEndpointOrAddr("203.0.113.10", 0); err == nil {
+		t.Error("ParseEndpointOrAddr with port 0 succeeded")
+	}
+}
+
+func TestPublicIPv4(t *testing.T) {
+	for _, s := range []string{"203.0.113.10", "198.51.100.10", "8.8.8.8", "100.63.255.255", "100.128.0.1", "172.32.0.1", "223.255.255.254"} {
+		if !IsPublicIPv4(netip.MustParseAddr(s)) {
+			t.Errorf("IsPublicIPv4(%s) = false", s)
+		}
+	}
+	for _, s := range []string{
+		"10.0.0.5", "172.16.0.1", "192.168.1.10", "100.64.0.1", "100.127.255.255", "127.0.0.1",
+		"169.254.1.1", "224.0.0.1", "0.0.0.0", "0.1.2.3", "240.0.0.1", "255.255.255.255",
+		"2001:db8::1", "::ffff:203.0.113.10",
+	} {
+		if IsPublicIPv4(netip.MustParseAddr(s)) {
+			t.Errorf("IsPublicIPv4(%s) = true", s)
+		}
+	}
+
+	la := func(a, link string) LinkAddr { return LinkAddr{Addr: netip.MustParseAddr(a), Link: link} }
+	got := PublicIPv4([]LinkAddr{
+		la("198.51.100.20", "eth1"), la("10.0.0.5", "eth0"), la("::ffff:203.0.113.10", "eth0"),
+		la("203.0.113.10", "eth0"), la("192.168.1.1", "eth1"),
+	})
+	want := []LinkAddr{la("198.51.100.20", "eth1"), la("203.0.113.10", "eth0")}
+	if !slices.Equal(got, want) {
+		t.Errorf("PublicIPv4 = %v, want %v", got, want)
+	}
+	if got := PublicIPv4([]LinkAddr{la("10.0.0.5", "eth0")}); got != nil {
+		t.Errorf("PublicIPv4(private) = %v", got)
 	}
 }

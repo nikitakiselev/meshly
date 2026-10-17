@@ -16,6 +16,9 @@ First public release.
 - Point-to-point network of two Linux nodes over kernel WireGuard: `init`, `invite`, `join`, `approve`, `activate`.
   Bootstrap files are signed (Ed25519), one-time, time-limited and bound to each other; fingerprints are confirmed
   interactively or with `--expect-fingerprint`.
+- Endpoint detection: `init` takes the public IPv4 address of the interface with the default route, so
+  `meshly init homelab --name vps` needs no address; `join` does the same when the inviter has no endpoint. Endpoints
+  accept a bare IP, with the listen port (by default 51820).
 - Default-deny policy in a single atomically replaced nftables table `inet meshly`: `allow`, `deny`, `rules`,
   `revoke`. Per-packet decisions (deny cuts established flows), no forwarding, no LAN access, no IPv6 inside the
   VPN, DNAT/redirect from the tunnel refused, spoofing protection.

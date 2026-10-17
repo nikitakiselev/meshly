@@ -31,7 +31,8 @@ test:
 fuzz:
 	go test ./internal/bootstrap -run '^$$' -fuzz FuzzOpen -fuzztime $(FUZZTIME)
 	go test ./internal/model -run '^$$' -fuzz FuzzParseRule -fuzztime $(FUZZTIME)
-	go test ./internal/model -run '^$$' -fuzz FuzzParseEndpoint -fuzztime $(FUZZTIME)
+	go test ./internal/model -run '^$$' -fuzz '^FuzzParseEndpoint$$' -fuzztime $(FUZZTIME)
+	go test ./internal/model -run '^$$' -fuzz FuzzParseEndpointOrAddr -fuzztime $(FUZZTIME)
 	go test ./internal/model -run '^$$' -fuzz FuzzParseCIDR -fuzztime $(FUZZTIME)
 	go test ./internal/nft -run '^$$' -fuzz FuzzParseRuleset -fuzztime $(FUZZTIME)
 	go test ./internal/store -run '^$$' -fuzz FuzzDecodeConfig -fuzztime $(FUZZTIME)

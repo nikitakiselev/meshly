@@ -70,6 +70,35 @@ func FuzzParseEndpoint(f *testing.F) {
 	})
 }
 
+func FuzzParseEndpointOrAddr(f *testing.F) {
+	for _, s := range []string{
+		"203.0.113.10", "203.0.113.10:4000", "2001:db8::1", "[2001:db8::1]", "[2001:db8::1]:4000",
+		"[203.0.113.10]", "::ffff:1.2.3.4", "fe80::1%eth0", "[fe80::1%eth0]", "example.com", "",
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		ap, err := ParseEndpointOrAddr(s, 51820)
+		if err != nil {
+			return
+		}
+		if err := ValidateEndpoint(ap); err != nil {
+			t.Fatalf("ParseEndpointOrAddr(%q) = %s which does not validate: %v", s, ap, err)
+		}
+		if a := ap.Addr(); a.Is4In6() || a.Zone() != "" {
+			t.Fatalf("ParseEndpointOrAddr(%q) = %s is not normalised", s, ap)
+		}
+		// Anything ParseEndpoint accepts means the same here.
+		if strict, err := ParseEndpoint(s); err == nil && strict != ap {
+			t.Fatalf("ParseEndpointOrAddr(%q) = %s, ParseEndpoint = %s", s, ap, strict)
+		}
+		again, err := ParseEndpoint(ap.String())
+		if err != nil || again != ap {
+			t.Fatalf("round trip of %s: %s, %v", ap, again, err)
+		}
+	})
+}
+
 func FuzzParseCIDR(f *testing.F) {
 	for _, s := range []string{
 		"10.100.0.0/24", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/30",

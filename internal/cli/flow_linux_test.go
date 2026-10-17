@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,6 +21,7 @@ import (
 	"github.com/nikitakiselev/meshly/internal/engine/enginetest"
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/lock"
+	"github.com/nikitakiselev/meshly/internal/model"
 	"github.com/nikitakiselev/meshly/internal/preflight"
 	"github.com/nikitakiselev/meshly/internal/store"
 )
@@ -237,6 +240,9 @@ func TestExitCodes(t *testing.T) {
 	n.expect(ExitUsage, "init", "homelab", "--name", "Bad_Name")
 	n.expect(ExitUsage, "init", "homelab", "--name", "vps", "--cidr", "8.8.8.0/24")
 	n.expect(ExitUsage, "init", "homelab", "--name", "vps", "--endpoint", "example.com:51820")
+	n.expect(ExitUsage, "init", "homelab", "--name", "vps", "--listen-port", "70000")
+	n.expect(ExitUsage, "join", "home.invite", "--name", "home", "--listen-port", "70000")
+	n.expect(ExitUsage, "join", "home.invite", "--name", "home", "--listen-port", "-1")
 	n.expect(ExitNotInit, "allow", "22/tcp", "from", "home")
 	n.expect(ExitNotInit, "invite")
 	n.must("init", "homelab", "--name", "vps", "--endpoint", "203.0.113.10:51820", "--dry-run")
@@ -349,4 +355,142 @@ func TestOutputsBelongToSudoUser(t *testing.T) {
 			t.Errorf("%s: owner %d:%d mode %v, want 4242:4343 %v", f, sys.Uid, sys.Gid, st.Mode().Perm(), mode)
 		}
 	}
+}
+
+// Without --endpoint, init uses the only public IPv4 address on the
+// interfaces with the default route; a bare IP gets the listen port.
+func TestEndpointDetection(t *testing.T) {
+	start := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	la := func(a, link string) model.LinkAddr { return model.LinkAddr{Addr: netip.MustParseAddr(a), Link: link} }
+	public := []model.LinkAddr{la("10.0.0.5", "eth0"), la("203.0.113.10", "eth0")}
+	private := []model.LinkAddr{la("10.0.0.5", "eth0")}
+	node := func(routes []model.LinkAddr) *testNode {
+		n := newTestNode(t, start)
+		n.k.DefaultRoute = routes
+		return n
+	}
+	endpoint := func(n *testNode) string {
+		t.Helper()
+		cfg, err := n.app.Paths.LoadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return endpointArg(cfg.Self.Endpoint) + fmt.Sprintf(" listen %d", cfg.Self.ListenPort)
+	}
+	initVPS := func(routes []model.LinkAddr, args ...string) (*testNode, string) {
+		t.Helper()
+		n := node(routes)
+		return n, n.must(append([]string{"init", "homelab", "--name", "vps"}, args...)...)
+	}
+
+	for _, tt := range []struct {
+		routes []model.LinkAddr
+		args   []string
+		want   string
+		out    string
+	}{
+		{public, nil, "203.0.113.10:51820 listen 51820", "203.0.113.10:51820, detected on eth0"},
+		{public, []string{"--endpoint", "auto", "--listen-port", "4000"}, "203.0.113.10:4000 listen 4000", "detected on eth0"},
+		// A cloud server behind 1:1 NAT, or a home server.
+		{private, nil, "none listen 51820", "no public IPv4 address"},
+		{nil, nil, "none listen 51820", "no public IPv4 address"},
+		{append(public, la("198.51.100.20", "eth1")), nil, "none listen 51820", "198.51.100.20 on eth1, 203.0.113.10 on eth0"},
+		{public, []string{"--endpoint", "none"}, "none listen 51820", "endpoint:     none (the joining node"},
+		{private, []string{"--endpoint", "198.51.100.7"}, "198.51.100.7:51820 listen 51820", "198.51.100.7:51820 (UDP 51820"},
+		{private, []string{"--endpoint", "198.51.100.7", "--listen-port", "4000"}, "198.51.100.7:4000 listen 4000", ""},
+		{private, []string{"--endpoint", "198.51.100.7:4000"}, "198.51.100.7:4000 listen 4000", ""},
+	} {
+		n, out := initVPS(tt.routes, tt.args...)
+		if got := endpoint(n); got != tt.want || !strings.Contains(out, tt.out) {
+			t.Errorf("init %v with %v: endpoint %s, want %s; output:\n%s", tt.args, tt.routes, got, tt.want, out)
+		}
+	}
+	if out := node(public).must("init", "homelab", "--name", "vps", "--dry-run"); !strings.Contains(out, "203.0.113.10:51820, detected on eth0") {
+		t.Errorf("dry-run init does not show the detected endpoint:\n%s", out)
+	}
+
+	// meshly set endpoint.
+	n, _ := initVPS(private)
+	if out := n.expect(ExitUsage, "set", "endpoint", "auto"); !strings.Contains(out, "no public IPv4 address") {
+		t.Error(out)
+	}
+	n.k.DefaultRoute = public
+	n.must("set", "endpoint", "auto")
+	if got := endpoint(n); got != "203.0.113.10:51820 listen 51820" {
+		t.Errorf("set endpoint auto: %s", got)
+	}
+	n.must("set", "endpoint", "198.51.100.7")
+	if got := endpoint(n); got != "198.51.100.7:51820 listen 51820" {
+		t.Errorf("set endpoint IP: %s", got)
+	}
+	n.must("set", "endpoint", "none")
+	if got := endpoint(n); got != "none listen 51820" {
+		t.Errorf("set endpoint none: %s", got)
+	}
+	n.expect(ExitUsage, "set", "endpoint", "example.com")
+
+	// join looks for an address only when the inviter has none.
+	dir := t.TempDir()
+	join := func(vpsRoutes, homeRoutes []model.LinkAddr, args ...string) (*testNode, int, string) {
+		t.Helper()
+		vps := node(vpsRoutes)
+		fp := fingerprintRe.FindString(vps.must("init", "homelab", "--name", "vps"))
+		inv := filepath.Join(dir, "home.invite")
+		vps.must("invite", "--out", inv, "--force")
+		home := node(homeRoutes)
+		code, out, errOut := home.run(append([]string{"join", inv, "--name", "home", "--expect-fingerprint", fp, "--out", filepath.Join(dir, "home.request"), "--force"}, args...)...)
+		return home, code, out + errOut
+	}
+	pending := func(n *testNode) string {
+		t.Helper()
+		bs, err := n.app.Paths.LoadBootstrap()
+		if err != nil || bs.Pending == nil {
+			t.Fatalf("no pending join: %v", err)
+		}
+		return endpointArg(bs.Pending.Endpoint)
+	}
+	homePublic := []model.LinkAddr{la("198.51.100.20", "eth0")}
+	if home, code, out := join(public, homePublic); code != 0 || pending(home) != "none" {
+		t.Errorf("join to a vps with an endpoint advertised %s (exit %d):\n%s", pending(home), code, out)
+	}
+	if home, code, out := join(public, homePublic, "--endpoint", "auto"); code != 0 || pending(home) != "198.51.100.20:51820" {
+		t.Errorf("join --endpoint auto: exit %d\n%s", code, out)
+	}
+	if home, code, out := join(private, homePublic); code != 0 || pending(home) != "198.51.100.20:51820" || !strings.Contains(out, "your endpoint:    198.51.100.20:51820, detected on eth0") {
+		t.Errorf("join to a vps without an endpoint: exit %d\n%s", code, out)
+	}
+	if _, code, out := join(private, private); code != ExitUsage || !strings.Contains(out, "no public IPv4 address") {
+		t.Errorf("join with no endpoint on either side: exit %d\n%s", code, out)
+	}
+	if _, code, out := join(private, homePublic, "--endpoint", "none"); code != ExitUsage || !strings.Contains(out, "needs one: --endpoint IP") {
+		t.Errorf("join --endpoint none to a vps without an endpoint: exit %d\n%s", code, out)
+	}
+}
+
+// meshly set peer-endpoint keeps the current port for a bare IP.
+func TestSetPeerEndpoint(t *testing.T) {
+	_, home, _ := pair(t)
+	peer := func() string {
+		t.Helper()
+		cfg, err := home.app.Paths.LoadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return endpointArg(cfg.Peers[0].Endpoint)
+	}
+	home.must("set", "peer-endpoint", "vps", "198.51.100.7")
+	if got := peer(); got != "198.51.100.7:51820" {
+		t.Errorf("peer endpoint %s", got)
+	}
+	home.must("set", "peer-endpoint", "vps", "198.51.100.7:4000")
+	home.must("set", "peer-endpoint", "vps", "198.51.100.8")
+	if got := peer(); got != "198.51.100.8:4000" {
+		t.Errorf("peer endpoint %s, want the port kept", got)
+	}
+	home.must("set", "peer-endpoint", "vps", "none")
+	home.must("set", "peer-endpoint", "vps", "198.51.100.9")
+	if got := peer(); got != "198.51.100.9:51820" {
+		t.Errorf("peer endpoint %s", got)
+	}
+	home.expect(ExitUsage, "set", "peer-endpoint", "vps", "auto")
 }

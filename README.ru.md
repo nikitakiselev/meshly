@@ -145,9 +145,11 @@ meshly передаёт доверие через небольшие файлы.
 **1. На vps:** создайте сеть и приглашение.
 
 ```console
-admin@vps:~$ sudo meshly init homelab --name vps --endpoint 203.0.113.10:51820
+admin@vps:~$ sudo meshly init homelab --name vps
 Network "homelab" created.
   this node:    vps  10.100.0.1 on meshly0
+  endpoint:     203.0.113.10:51820, detected on eth0 (to change: meshly set endpoint IP)
+                UDP 51820 must be reachable; cloud firewalls are not managed by meshly
   firewall:     profile none; all inbound VPN traffic is denied until `meshly allow`
   fingerprint:  VJW7-OEX7-FGSZ-Y6TN-AID5-LTGJ-YBDE-OJNN
 
@@ -155,6 +157,10 @@ admin@vps:~$ sudo meshly invite --out home.invite
 Invite written to home.invite (one-time, expires 2026-10-17T20:30:33Z).
   fingerprint:  VJW7-OEX7-FGSZ-Y6TN-AID5-LTGJ-YBDE-OJNN   <- the joining admin must see exactly this
 ```
+
+Искать адрес VPS не нужно: meshly сам находит публичный IP на его сетевом интерфейсе и берёт стандартный порт WireGuard
+51820. Некоторые облака (AWS, GCP) дают серверу только приватный адрес, а публичный подставляют снаружи. Тогда meshly
+сообщит, что адрес не найден, и его нужно указать самому: `--endpoint 203.0.113.10`.
 
 **2. На home:** заберите приглашение, подключитесь и отправьте запрос обратно.
 
@@ -220,7 +226,7 @@ sudo meshly doctor     # все проверки с вердиктом; код 0
 | Список правил | `sudo meshly rules` |
 | Состояние и диагностика | `sudo meshly status`, `sudo meshly doctor`, `sudo meshly doctor --probe 22/tcp` |
 | Остановить или запустить канал (stop сохраняется после перезагрузки) | `sudo meshly stop`, `sudo meshly start`, `sudo meshly restart` |
-| У VPS сменился IP | `sudo meshly set peer-endpoint vps 198.51.100.7:51820` (на home) |
+| У VPS сменился IP | `sudo meshly set peer-endpoint vps 198.51.100.7` (на home) |
 | Путь с меньшим MTU | `sudo meshly set mtu 1380` (на обоих узлах) |
 | Кто и что менял | `sudo meshly logs` |
 | Обновиться до последнего релиза | `sudo meshly upgrade` (`--check` — только проверить) |

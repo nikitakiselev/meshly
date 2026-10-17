@@ -146,9 +146,11 @@ SSH key you have verified. All copies below are run on **home**, because it can 
 **1. On vps:** create the network and an invite.
 
 ```console
-admin@vps:~$ sudo meshly init homelab --name vps --endpoint 203.0.113.10:51820
+admin@vps:~$ sudo meshly init homelab --name vps
 Network "homelab" created.
   this node:    vps  10.100.0.1 on meshly0
+  endpoint:     203.0.113.10:51820, detected on eth0 (to change: meshly set endpoint IP)
+                UDP 51820 must be reachable; cloud firewalls are not managed by meshly
   firewall:     profile none; all inbound VPN traffic is denied until `meshly allow`
   fingerprint:  VJW7-OEX7-FGSZ-Y6TN-AID5-LTGJ-YBDE-OJNN
 
@@ -156,6 +158,10 @@ admin@vps:~$ sudo meshly invite --out home.invite
 Invite written to home.invite (one-time, expires 2026-10-17T20:30:33Z).
   fingerprint:  VJW7-OEX7-FGSZ-Y6TN-AID5-LTGJ-YBDE-OJNN   <- the joining admin must see exactly this
 ```
+
+You do not need to look up the VPS address: meshly finds the public IP on its network interface and uses the standard
+WireGuard port 51820. Some clouds (AWS, GCP) give the server only a private address and map the public one from outside;
+there meshly reports that it found none, and you pass the address yourself: `--endpoint 203.0.113.10`.
 
 **2. On home:** fetch the invite, join, and send the request back.
 
@@ -220,7 +226,7 @@ The link starts at boot via `meshly.service`. For scripts and automation, the no
 | List rules | `sudo meshly rules` |
 | Health and diagnostics | `sudo meshly status`, `sudo meshly doctor`, `sudo meshly doctor --probe 22/tcp` |
 | Stop or start the link (stop survives reboot) | `sudo meshly stop`, `sudo meshly start`, `sudo meshly restart` |
-| VPS changed its IP | `sudo meshly set peer-endpoint vps 198.51.100.7:51820` (on home) |
+| VPS changed its IP | `sudo meshly set peer-endpoint vps 198.51.100.7` (on home) |
 | Path with a smaller MTU | `sudo meshly set mtu 1380` (on both nodes) |
 | Who changed what | `sudo meshly logs` |
 | Upgrade to the latest release | `sudo meshly upgrade` (`--check` to only look) |

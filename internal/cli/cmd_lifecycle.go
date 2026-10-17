@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/netip"
 	"os"
 	"strconv"
 	"time"
@@ -155,9 +154,17 @@ func (a *App) cmdSet(ctx context.Context, args []string) error {
 			t.Peers[i].Keepalive = n
 		}
 	case key == "endpoint" && len(pos) == 2:
-		ep, err := parseOptionalEndpoint(pos[1])
+		ep, auto, err := parseEndpointArg(pos[1], t.Self.ListenPort)
 		if err != nil {
-			return err
+			return withCode(ExitUsage, err)
+		}
+		if auto {
+			found := a.detectEndpoint(t.Self.ListenPort)
+			if !found.ep.IsValid() {
+				return errorf(ExitUsage, "%s; set the address explicitly: meshly set endpoint IP", found.why)
+			}
+			ep = found.ep
+			a.printf("Detected %s on %s.\n", ep, found.link)
 		}
 		t.Self.Endpoint = ep
 	case key == "peer-endpoint" && len(pos) == 3:
@@ -165,9 +172,16 @@ func (a *App) cmdSet(ctx context.Context, args []string) error {
 		if !ok {
 			return a.unknownPeer(cfg, pos[1])
 		}
-		ep, err := parseOptionalEndpoint(pos[2])
+		port := uint16(model.DefaultListenPort)
+		if p.Endpoint.IsValid() {
+			port = p.Endpoint.Port()
+		}
+		ep, auto, err := parseEndpointArg(pos[2], port)
 		if err != nil {
-			return err
+			return withCode(ExitUsage, err)
+		}
+		if auto {
+			return errorf(ExitUsage, "the peer's endpoint cannot be detected here: use IP, IP:PORT or none")
 		}
 		p.Endpoint = ep
 	case key == "cidr" && len(pos) == 2:
@@ -202,17 +216,6 @@ func (a *App) cmdSet(ctx context.Context, args []string) error {
 		a.printf("Set the same MTU on the peer as well.\n")
 	}
 	return nil
-}
-
-func parseOptionalEndpoint(s string) (netip.AddrPort, error) {
-	if s == "none" {
-		return netip.AddrPort{}, nil
-	}
-	ep, err := model.ParseEndpoint(s)
-	if err != nil {
-		return ep, withCode(ExitUsage, err)
-	}
-	return ep, nil
 }
 
 func (a *App) cmdReset(ctx context.Context, args []string) error {

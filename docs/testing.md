@@ -60,6 +60,7 @@ docker run --rm -v "$PWD/bin:/t" debian:12 /t/cli.test -test.v
 | `internal/bootstrap` `FuzzOpen` | bootstrap envelopes (invite, request, accept files) |
 | `internal/model` `FuzzParseRule` | `allow`/`deny` arguments |
 | `internal/model` `FuzzParseEndpoint` | `IP:PORT` endpoints |
+| `internal/model` `FuzzParseEndpointOrAddr` | Endpoints with an optional port; agrees with `FuzzParseEndpoint` where both accept |
 | `internal/model` `FuzzParseCIDR` | VPN network CIDRs |
 | `internal/nft` `FuzzParseRuleset` | `nft -j list ruleset` JSON, seeded with the fixtures; analysis must not panic |
 | `internal/store` `FuzzDecodeConfig` | `meshly.json` |
@@ -126,6 +127,7 @@ nftables tables are recreated empty, and systemd boots again.
 | `TestIdempotency` | Repeating `init`, `invite` (same invite), `activate` and `allow` leaves the kernel state (interface, routes, WireGuard, nftables) exactly as before. |
 | `TestConcurrentOperations` | Parallel commands are serialised by the lock; `status` works while they run. |
 | `TestBootstrapTrust` | Modified invites, requests and accepts are rejected (exit 4); a wrong expected fingerprint stops `join`/`approve` (exit 10); invites are one-time; an accept activates only the node whose request it answers; private keys never appear in output or in copied files. |
+| `TestEndpointDetected` | Without `--endpoint`, `init` on the vps (default route on the wan) advertises its public address with port 51820, and `init` on home (private address behind NAT) advertises none. |
 | `TestInviteExpiry` | Expired invites are refused. |
 | `TestFaultsInit` | `init` with `error` and `crash` at every point leaves either nothing or the complete, verified configuration after recovery. |
 | `TestFaultsAllow` | An interrupted `allow` is either fully in effect (config and packets) or not at all; with a failing rollback, safe mode removes the interface, the lockdown table admits no peer, and `start` restores the link without the failed rule. |

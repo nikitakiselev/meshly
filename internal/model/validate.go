@@ -9,6 +9,7 @@ import (
 	"math/bits"
 	"net/netip"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -147,6 +148,74 @@ func ParseEndpoint(s string) (netip.AddrPort, error) {
 	}
 	ap = netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 	return ap, ValidateEndpoint(ap)
+}
+
+// ParseEndpointOrAddr is ParseEndpoint that also accepts a bare address
+// ("203.0.113.10", "2001:db8::1" or "[2001:db8::1]") and gives it the port
+// defPort. An IPv6 endpoint with a port needs the brackets.
+func ParseEndpointOrAddr(s string, defPort uint16) (netip.AddrPort, error) {
+	host := s
+	if len(s) > 2 && s[0] == '[' && s[len(s)-1] == ']' {
+		host = s[1 : len(s)-1]
+	}
+	a, err := netip.ParseAddr(host)
+	if err != nil || (host != s && !a.Is6()) {
+		if _, err := netip.ParseAddrPort(s); err != nil {
+			return netip.AddrPort{}, fmt.Errorf("invalid endpoint %q: expected a numeric IP or IP:PORT (host names are not supported)", truncate(s))
+		}
+		return ParseEndpoint(s)
+	}
+	if a.Zone() != "" {
+		return netip.AddrPort{}, errors.New("endpoint must not contain an IPv6 zone")
+	}
+	ap := netip.AddrPortFrom(a.Unmap(), defPort)
+	return ap, ValidateEndpoint(ap)
+}
+
+// LinkAddr is an address and the interface that carries it.
+type LinkAddr struct {
+	Addr netip.Addr
+	Link string
+}
+
+// sharedSpace is the carrier-grade NAT range (RFC 6598).
+var sharedSpace = netip.MustParsePrefix("100.64.0.0/10")
+
+// IsPublicIPv4 reports whether a is an IPv4 address hosts on the internet
+// can send packets to: not private (RFC 1918), shared (RFC 6598), loopback,
+// link-local, multicast or reserved. The documentation ranges (RFC 5737)
+// count as public: they never appear on real hosts, and the test labs use
+// them as the internet.
+func IsPublicIPv4(a netip.Addr) bool {
+	if !a.Is4() {
+		return false
+	}
+	b := a.As4()
+	switch {
+	case a.IsPrivate(), a.IsLoopback(), a.IsLinkLocalUnicast(), a.IsMulticast(), a.IsUnspecified(),
+		sharedSpace.Contains(a), b[0] == 0, b[0] >= 240:
+		return false
+	}
+	return true
+}
+
+// PublicIPv4 returns the public IPv4 addresses among addrs, sorted and
+// without duplicates.
+func PublicIPv4(addrs []LinkAddr) []LinkAddr {
+	var out []LinkAddr
+	for _, la := range addrs {
+		la.Addr = la.Addr.Unmap()
+		if IsPublicIPv4(la.Addr) && !slices.Contains(out, la) {
+			out = append(out, la)
+		}
+	}
+	slices.SortFunc(out, func(x, y LinkAddr) int {
+		if c := x.Addr.Compare(y.Addr); c != 0 {
+			return c
+		}
+		return strings.Compare(x.Link, y.Link)
+	})
+	return out
 }
 
 // ValidateEndpoint checks a WireGuard transport endpoint.

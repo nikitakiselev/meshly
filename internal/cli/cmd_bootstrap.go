@@ -102,7 +102,7 @@ func (a *App) cmdInvite(ctx context.Context, args []string) error {
 	a.printf("  assigned:     %s for the joining node\n", assigned)
 	a.printf("  fingerprint:  %s   <- the joining admin must see exactly this\n", bootstrap.Fingerprint(cfg.Self.IdentityKey, cfg.Self.WGPublicKey))
 	if !cfg.Self.Endpoint.IsValid() {
-		a.printf("  note: this node has no endpoint; the joining node must have one (join --endpoint)\n")
+		a.printf("  note: this node has no endpoint, so the joining node needs a public address of its own\n")
 	}
 	a.printf("\nThe file is sensitive until it expires: anyone holding it can submit a join request.\n")
 	a.printf("Copy it over a trusted channel, e.g.:  scp %s admin@home:\n", *out)
@@ -126,7 +126,7 @@ func (a *App) cmdJoin(ctx context.Context, args []string) error {
 		return err
 	}
 	if len(pos) != 1 {
-		return errorf(ExitUsage, "usage: meshly join <invite-file> --name <node> [--out FILE]")
+		return errorf(ExitUsage, "usage: meshly join <invite-file> --name <node> [--out FILE] [--endpoint IP[:PORT]|auto]")
 	}
 	if err := model.ValidateName(*name); err != nil {
 		return withCode(ExitUsage, fmt.Errorf("--name: %w", err))
@@ -137,9 +137,17 @@ func (a *App) cmdJoin(ctx context.Context, args []string) error {
 	if err := model.ValidateInterfaceName(*ifname); err != nil {
 		return withCode(ExitUsage, err)
 	}
+	defPort := uint16(model.DefaultListenPort)
+	if *listenPort != 0 {
+		if err := model.ValidatePort(*listenPort); err != nil {
+			return withCode(ExitUsage, fmt.Errorf("--listen-port: %w", err))
+		}
+		defPort = uint16(*listenPort)
+	}
 	var ep netip.AddrPort
+	auto := false
 	if *endpoint != "" {
-		if ep, err = model.ParseEndpoint(*endpoint); err != nil {
+		if ep, auto, err = parseEndpointArg(*endpoint, defPort); err != nil {
 			return withCode(ExitUsage, fmt.Errorf("--endpoint: %w", err))
 		}
 	}
@@ -185,14 +193,27 @@ func (a *App) cmdJoin(ctx context.Context, args []string) error {
 	if *name == inv.Issuer.Name {
 		return errorf(ExitUsage, "--name %q is already used by the inviting node", *name)
 	}
+	// Without --endpoint, a public address is looked for only when the
+	// inviting node has none: a node behind NAT should not advertise one.
+	var found detectedEndpoint
+	if auto || (*endpoint == "" && !inv.Issuer.Endpoint.IsValid()) {
+		found = a.detectEndpoint(defPort)
+		ep = found.ep
+	}
 	if !inv.Issuer.Endpoint.IsValid() && !ep.IsValid() {
-		return errorf(ExitUsage, "the inviting node has no public endpoint, so this node needs one: --endpoint IP:PORT")
+		if found.why == "" {
+			return errorf(ExitUsage, "the inviting node has no public endpoint, so this node needs one: --endpoint IP")
+		}
+		return errorf(ExitUsage, "the inviting node has no public endpoint, so this node needs one, but %s; if the internet reaches it at a public IP, pass --endpoint IP", found.why)
 	}
 	fp := inv.Issuer.Fingerprint()
 	a.printf("Invite from node %q for network %q:\n", inv.Issuer.Name, inv.Network.Name)
 	a.printf("  network:          %s, MTU %d\n", inv.Network.CIDR, inv.Network.MTU)
 	a.printf("  inviter address:  %s, endpoint %s\n", inv.Issuer.Address, endpointOrNone(inv.Issuer.Endpoint))
 	a.printf("  your address:     %s\n", inv.AssignedAddress)
+	if ep.IsValid() && found.link != "" {
+		a.printf("  your endpoint:    %s, detected on %s\n", ep, found.link)
+	}
 	a.printf("  expires:          %s\n", inv.ExpiresAt.Format(time.RFC3339))
 	a.printf("  inviter fingerprint: %s\n", fp)
 	switch {
@@ -208,16 +229,13 @@ func (a *App) cmdJoin(ctx context.Context, args []string) error {
 	default:
 		return errorf(ExitDeclined, "non-interactive join requires --expect-fingerprint <inviter fingerprint>")
 	}
-	lp := uint16(*listenPort)
+	lp := defPort
 	if *listenPort == 0 {
 		if ep.IsValid() {
 			lp = ep.Port()
 		} else {
 			lp = a.Sys.PickListenPort(randUint32)
 		}
-	}
-	if err := model.ValidatePort(int(lp)); err != nil {
-		return withCode(ExitUsage, fmt.Errorf("--listen-port: %w", err))
 	}
 	// Check the environment before generating keys: a conflict must be
 	// reported before anything is created.

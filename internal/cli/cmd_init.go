@@ -18,7 +18,7 @@ import (
 func (a *App) cmdInit(ctx context.Context, args []string) error {
 	fs := a.flagSet("init")
 	name := fs.String("name", "", "")
-	endpoint := fs.String("endpoint", "", "")
+	endpoint := fs.String("endpoint", "auto", "")
 	listenPort := fs.Int("listen-port", 0, "")
 	cidrFlag := fs.String("cidr", model.DefaultCIDR, "")
 	mtu := fs.Int("mtu", model.DefaultMTU, "")
@@ -30,7 +30,7 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 		return err
 	}
 	if len(pos) != 1 {
-		return errorf(ExitUsage, "usage: meshly init <network> --name <node> [--endpoint IP:PORT]")
+		return errorf(ExitUsage, "usage: meshly init <network> --name <node> [--endpoint IP[:PORT]|auto|none]")
 	}
 	netName := pos[0]
 	if err := model.ValidateName(netName); err != nil {
@@ -42,11 +42,19 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 	if err := model.ValidateName(*name); err != nil {
 		return withCode(ExitUsage, fmt.Errorf("--name: %w", err))
 	}
-	var ep netip.AddrPort
-	if *endpoint != "" {
-		if ep, err = model.ParseEndpoint(*endpoint); err != nil {
-			return withCode(ExitUsage, fmt.Errorf("--endpoint: %w", err))
+	lp := uint16(model.DefaultListenPort)
+	if *listenPort != 0 {
+		if err := model.ValidatePort(*listenPort); err != nil {
+			return withCode(ExitUsage, fmt.Errorf("--listen-port: %w", err))
 		}
+		lp = uint16(*listenPort)
+	}
+	ep, auto, err := parseEndpointArg(*endpoint, lp)
+	if err != nil {
+		return withCode(ExitUsage, fmt.Errorf("--endpoint: %w", err))
+	}
+	if *listenPort == 0 && ep.IsValid() {
+		lp = ep.Port()
 	}
 	cidr, err := model.ParseCIDR(*cidrFlag)
 	if err != nil {
@@ -57,16 +65,6 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 	}
 	if err := model.ValidateInterfaceName(*ifname); err != nil {
 		return withCode(ExitUsage, err)
-	}
-	lp := *listenPort
-	if lp == 0 {
-		lp = model.DefaultListenPort
-		if ep.IsValid() {
-			lp = int(ep.Port())
-		}
-	}
-	if err := model.ValidatePort(lp); err != nil {
-		return withCode(ExitUsage, fmt.Errorf("--listen-port: %w", err))
 	}
 
 	s, err := a.begin(ctx)
@@ -104,11 +102,16 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 	if err != nil {
 		return withCode(ExitUsage, err)
 	}
+	var found detectedEndpoint
+	if auto {
+		found = a.detectEndpoint(lp)
+		ep = found.ep
+	}
 	cfg := &model.Config{
 		SchemaVersion: model.ConfigSchemaVersion,
 		AdminState:    model.AdminUp,
 		Network:       model.Network{ID: netID, Name: netName, CIDR: cidr},
-		Self:          model.Self{Name: *name, Address: selfAddr, ListenPort: uint16(lp), Endpoint: ep, WGPublicKey: wgPub, IdentityKey: idPub},
+		Self:          model.Self{Name: *name, Address: selfAddr, ListenPort: lp, Endpoint: ep, WGPublicKey: wgPub, IdentityKey: idPub},
 		Interface:     model.Interface{Name: *ifname, MTU: *mtu},
 		Firewall:      model.Firewall{Mark: model.DefaultFirewallMark},
 		Peers:         []model.Peer{},
@@ -120,8 +123,11 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 	if err := a.preflight(ctx, cfg, pfOpts{conflicts: true, strict: true}); err != nil {
 		return err
 	}
-	op := opFor("init", fmt.Sprintf("network=%s name=%s endpoint=%s cidr=%s", netName, *name, *endpoint, cidr), journal.Backward, nil, cfg)
+	op := opFor("init", fmt.Sprintf("network=%s name=%s endpoint=%s cidr=%s", netName, *name, endpointArg(ep), cidr), journal.Backward, nil, cfg)
 	if _, err := a.apply(ctx, op, *dry); err != nil || *dry {
+		if err == nil {
+			a.printEndpoint(ep, lp, auto, found)
+		}
 		return err
 	}
 	s.end()
@@ -130,11 +136,7 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 	fp := bootstrap.Fingerprint(cfg.Self.IdentityKey, cfg.Self.WGPublicKey)
 	a.printf("\nNetwork %q created.\n", netName)
 	a.printf("  this node:    %s  %s on %s\n", *name, selfAddr, *ifname)
-	if ep.IsValid() {
-		a.printf("  endpoint:     %s (UDP %d must be reachable; cloud firewalls are not managed by meshly)\n", ep, lp)
-	} else {
-		a.printf("  endpoint:     none (the joining node must provide --endpoint)\n")
-	}
+	a.printEndpoint(ep, lp, auto, found)
 	a.printf("  firewall:     profile %s; all inbound VPN traffic is denied until `meshly allow`\n", cfg.Firewall.Profile)
 	a.printf("  fingerprint:  %s\n", fp)
 	a.printf("\nNext: meshly invite --out <peer>.invite\n")
@@ -169,4 +171,30 @@ func (a *App) publicKeys(dry bool) (wgPub, idPub string, err error) {
 
 func opFor(name, args, recovery string, base, target *model.Config) opArgs {
 	return opArgs{Name: name, Args: args, Recovery: recovery, Base: base, Target: target}
+}
+
+// printEndpoint shows the endpoint init chose and how to change it.
+func (a *App) printEndpoint(ep netip.AddrPort, lp uint16, auto bool, found detectedEndpoint) {
+	const pad = "                "
+	switch {
+	case ep.IsValid() && auto:
+		a.printf("  endpoint:     %s, detected on %s (to change: meshly set endpoint IP)\n", ep, found.link)
+		a.printf(pad+"UDP %d must be reachable; cloud firewalls are not managed by meshly\n", lp)
+	case ep.IsValid():
+		a.printf("  endpoint:     %s (UDP %d must be reachable; cloud firewalls are not managed by meshly)\n", ep, lp)
+	case auto:
+		a.printf("  endpoint:     none: %s\n", found.why)
+		a.printf(pad + "if the internet reaches this server at a public IP (e.g. 1:1 NAT in AWS or GCP): meshly set endpoint IP\n")
+		a.printf(pad + "otherwise the joining node needs a public address of its own\n")
+	default:
+		a.printf("  endpoint:     none (the joining node needs a public address of its own)\n")
+	}
+}
+
+// endpointArg formats ep the way the endpoint arguments accept it.
+func endpointArg(ep netip.AddrPort) string {
+	if ep.IsValid() {
+		return ep.String()
+	}
+	return "none"
 }

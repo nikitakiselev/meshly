@@ -140,3 +140,34 @@ func TestInviteExpiry(t *testing.T) {
 		t.Fatalf("expiry not reported: %s", r)
 	}
 }
+
+// Without --endpoint, init finds the public address on the interface with
+// the default route; a node behind NAT advertises none.
+func TestEndpointDetected(t *testing.T) {
+	l := newLab(t, distros[0])
+	vps, home := l.Node("vps"), l.Node("home")
+	endpoint := func(n *Node) string {
+		t.Helper()
+		var s struct {
+			Config struct {
+				Endpoint string `json:"endpoint"`
+			} `json:"config"`
+		}
+		r := n.MustMeshly("status", "--json")
+		if err := json.Unmarshal([]byte(r.Out), &s); err != nil {
+			t.Fatalf("status --json: %v\n%s", err, r.Out)
+		}
+		return s.Config.Endpoint
+	}
+	// The lab's wan is an internal Docker network without a gateway; give
+	// the vps the default route a real server has.
+	vps.MustSh("ip route replace default via 198.51.100.2")
+	r := vps.MustMeshly("init", "homelab", "--name", "vps")
+	if !strings.Contains(r.Out, "198.51.100.10:51820, detected on eth0") || endpoint(vps) != "198.51.100.10:51820" {
+		t.Fatalf("vps endpoint %q, init output:\n%s", endpoint(vps), r.Out)
+	}
+	r = home.MustMeshly("init", "homelab", "--name", "home")
+	if !strings.Contains(r.Out, "no public IPv4 address") || endpoint(home) != "" {
+		t.Fatalf("home endpoint %q, init output:\n%s", endpoint(home), r.Out)
+	}
+}

@@ -82,7 +82,7 @@ func RunDoctor(ctx context.Context, d Deps, sys *preflight.System, probe *Probe)
 		if st.Pending != nil {
 			doc.add("bootstrap", "info", Fact, fmt.Sprintf("join request %s is waiting for an accept file (expires %s)", st.Pending.RequestID, st.Pending.ExpiresAt.Format(time.RFC3339)), "run `meshly activate <file.accept>` after the inviting node approved")
 		} else {
-			doc.add("config", "info", Fact, "meshly is not initialized on this node", "meshly init <network> --name <node> --endpoint IP:PORT   or   meshly join <file.invite> --name <node>")
+			doc.add("config", "info", Fact, "meshly is not initialized on this node", "meshly init <network> --name <node>   or   meshly join <file.invite> --name <node>")
 		}
 		return finish(doc)
 	}
