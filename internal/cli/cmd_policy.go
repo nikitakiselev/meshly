@@ -161,6 +161,6 @@ func (a *App) cmdRevoke(ctx context.Context, args []string) error {
 		return err
 	}
 	a.printf("Peer %q revoked: firewall access closed first, then its WireGuard key and route were removed.\n", name)
-	a.printf("Re-adding it requires a new invite and approval.\n")
+	a.printf("Re-adding it requires a new invite.\n")
 	return nil
 }

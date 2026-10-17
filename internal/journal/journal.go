@@ -28,17 +28,17 @@ const (
 	EventSafeMode   = "safe-mode"
 	EventRecovered  = "recovered"
 	// EventAudit records an operation that changes no kernel state
-	// (invite, join, upgrade); it never opens a transaction.
+	// (upgrade); it never opens a transaction.
 	EventAudit = "audit"
 )
 
 // Recovery direction of an operation if it is interrupted.
 const (
 	// Backward: restore the last committed config (operations that grant
-	// access: init, approve, activate, allow, start, set).
+	// access: init, invite, join, allow, start, set).
 	Backward = "backward"
 	// Forward: finish the operation (operations that remove access: deny,
-	// revoke, stop, reset) so an interruption never re-opens access.
+	// revoke, stop, reset, invite-undo, join-undo) so an interruption never re-opens access.
 	Forward = "forward"
 )
 

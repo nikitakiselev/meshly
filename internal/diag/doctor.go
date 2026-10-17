@@ -91,7 +91,7 @@ func RunDoctor(ctx context.Context, d Deps, sys *preflight.System, probe *Probe)
 			doc.add("keys", "fail", Fact, err.Error(), "keys must be root-owned 0600 files in /etc/meshly/keys (0700)")
 		} else {
 			if keys.WGPublic() != cfg.Self.WGPublicKey {
-				doc.add("keys", "fail", Fact, "key files do not match the public keys in the configuration", "restore the original keys; changing the key requires pairing again (meshly reset, then join again)")
+				doc.add("keys", "fail", Fact, "the key file does not match the public key in the configuration", "restore the original key; changing the key requires pairing again (meshly reset, then join again)")
 			} else {
 				doc.add("keys", "ok", Fact, "key files are private and match the configuration", "")
 			}
@@ -146,7 +146,7 @@ func RunDoctor(ctx context.Context, d Deps, sys *preflight.System, probe *Probe)
 	}
 	checkMTU(doc, cfg)
 	if len(cfg.Peers) == 0 {
-		doc.add("peer", "info", Fact, "no peer yet", "meshly invite --out peer.invite")
+		doc.add("peer", "info", Fact, "no peer yet", "run `sudo meshly invite` on this node and `sudo meshly join` on the other")
 	}
 	for _, p := range st.Peers {
 		peerFindings(doc, cfg, st, p)

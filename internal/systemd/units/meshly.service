@@ -1,4 +1,4 @@
-# Managed by meshly (installed by `meshly init`/`activate`). Do not edit:
+# Managed by meshly (installed by `meshly init`/`join`). Do not edit:
 # meshly rewrites this file on upgrade. Override with `systemctl edit meshly`.
 [Unit]
 Description=Meshly WireGuard link

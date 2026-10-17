@@ -224,7 +224,7 @@ func (a *App) cmdReset(ctx context.Context, args []string) error {
 		if !a.Interactive {
 			return errorf(ExitDeclined, "reset needs --yes when not running interactively")
 		}
-		if !a.confirm("Remove the meshly link, configuration, keys from this node? Type 'yes':") {
+		if !a.confirm("Remove the meshly link, configuration and keys from this node? Type 'yes':") {
 			return errorf(ExitDeclined, "reset cancelled")
 		}
 	}
@@ -251,10 +251,8 @@ func (a *App) cmdReset(ctx context.Context, args []string) error {
 	}
 	var errs []error
 	errs = append(errs, a.Paths.RemoveKeys())
-	for _, f := range []string{a.Paths.RuntimeFile()} {
-		if err := os.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
-			errs = append(errs, err)
-		}
+	if err := os.Remove(a.Paths.RuntimeFile()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errs = append(errs, err)
 	}
 	if entries, err := os.ReadDir(a.Paths.HistoryDir()); err == nil {
 		for _, e := range entries {

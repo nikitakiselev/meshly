@@ -484,7 +484,7 @@ func TestExecuteWithOverlay(t *testing.T) {
 	// The pairing completes: the real peer replaces the temporary one.
 	target := v.config()
 	ov := &Overlay{Allow: armed.Allow}
-	if _, err := v.e.Execute(ctx, v.j, Op{Name: "approve", Recovery: journal.Backward, Base: base, Target: target, Overlay: ov}); err != nil {
+	if _, err := v.e.Execute(ctx, v.j, Op{Name: "invite", Recovery: journal.Backward, Base: base, Target: target, Overlay: ov}); err != nil {
 		t.Fatal(err)
 	}
 	dev := mustObserve(t, v)
