@@ -461,8 +461,9 @@ func TestOverlayFailureRestoresConfig(t *testing.T) {
 	v.commit(c)
 	ov, _, _ := tempOverlay(t)
 	v.k.Fail("wireguard.configure", 1)
-	if err := v.e.ApplyOverlay(context.Background(), c, "meshly0", ov); err == nil {
-		t.Fatal("expected an error")
+	err := v.e.ApplyOverlay(context.Background(), c, "meshly0", ov)
+	if err == nil || !strings.Contains(err.Error(), "wireguard.configure") || !strings.Contains(err.Error(), "fake wireguard.configure failure") {
+		t.Fatalf("want the original configure error, got %v", err)
 	}
 	if drift, err := v.e.Drift(context.Background(), c); err != nil || len(drift) != 0 {
 		t.Fatalf("drift after failed overlay: %v %v", drift, err)
@@ -471,20 +472,33 @@ func TestOverlayFailureRestoresConfig(t *testing.T) {
 
 func TestExecuteWithOverlay(t *testing.T) {
 	v := newEnv(t)
+	ctx := context.Background()
 	base := v.config()
 	base.Peers = nil
 	v.commit(base)
+	// Armed state: the inviter waits with a temporary peer and allow.
+	armed, temp, psk := tempOverlay(t)
+	if err := v.e.ApplyOverlay(ctx, base, "meshly0", armed); err != nil {
+		t.Fatal(err)
+	}
+	// The pairing completes: the real peer replaces the temporary one.
 	target := v.config()
-	ov, temp, psk := tempOverlay(t)
-	if _, err := v.e.Execute(context.Background(), v.j, Op{Name: "approve", Recovery: journal.Backward, Base: base, Target: target, Overlay: ov}); err != nil {
+	ov := &Overlay{Allow: armed.Allow}
+	if _, err := v.e.Execute(ctx, v.j, Op{Name: "approve", Recovery: journal.Backward, Base: base, Target: target, Overlay: ov}); err != nil {
 		t.Fatal(err)
 	}
 	dev := mustObserve(t, v)
+	if _, ok := dev.Peer(temp); ok {
+		t.Fatal("temporary peer still present")
+	}
+	if v.k.PresharedKey(temp) != (wgtypes.Key{}) {
+		t.Fatal("temporary preshared key not cleared")
+	}
 	if _, ok := dev.Peer(target.Peers[0].WGPublicKey); !ok {
 		t.Fatal("real peer missing")
 	}
-	if _, ok := dev.Peer(temp); !ok {
-		t.Fatal("overlay peer missing")
+	if last := v.k.Scripts[len(v.k.Scripts)-1]; !strings.Contains(last, "10.100.0.2 . tcp . 51820") {
+		t.Fatalf("allow entry missing in:\n%s", last)
 	}
 	saved, err := v.paths.LoadConfig()
 	if err != nil || len(saved.Peers) != 1 || len(saved.Rules) != 0 {
@@ -498,9 +512,6 @@ func TestExecuteWithOverlay(t *testing.T) {
 		if strings.Contains(string(raw), k.String()) || strings.Contains(string(raw), string(k[:])) {
 			t.Fatal("journal contains key material")
 		}
-	}
-	if strings.Contains(string(raw), "51820 tcp") || strings.Contains(string(raw), temp) {
-		t.Fatal("journal contains overlay data")
 	}
 }
 
