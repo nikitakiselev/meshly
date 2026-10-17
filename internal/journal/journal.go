@@ -28,7 +28,7 @@ const (
 	EventSafeMode   = "safe-mode"
 	EventRecovered  = "recovered"
 	// EventAudit records an operation that changes no kernel state
-	// (upgrade); it never opens a transaction.
+	// (upgrade, an invite opened or closed); it never opens a transaction.
 	EventAudit = "audit"
 )
 

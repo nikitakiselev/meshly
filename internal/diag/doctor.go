@@ -78,7 +78,7 @@ func RunDoctor(ctx context.Context, d Deps, sys *preflight.System, probe *Probe)
 	}
 	cfg, err := d.Paths.LoadConfig()
 	if errors.Is(err, store.ErrNotInitialized) {
-		doc.add("config", "info", Fact, "meshly is not initialized on this node", "meshly init <network> --name <node>")
+		doc.add("config", "info", Fact, "meshly is not initialized on this node", "meshly init <network> --name <node>   or   sudo meshly join")
 		return finish(doc)
 	}
 	if err != nil {

@@ -18,6 +18,7 @@ import (
 	"github.com/nikitakiselev/meshly/internal/engine"
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/lock"
+	"github.com/nikitakiselev/meshly/internal/pairing"
 	"github.com/nikitakiselev/meshly/internal/preflight"
 	"github.com/nikitakiselev/meshly/internal/store"
 	"github.com/nikitakiselev/meshly/internal/systemd"
@@ -77,6 +78,42 @@ type App struct {
 	Euid        int
 	LockTimeout time.Duration
 	Arch        string
+
+	Pairing      pairing.Network
+	PairTimeouts pairing.Timeouts // zero value: pairing.DefaultTimeouts
+	// WaitContext derives the context that Ctrl+C cancels; only waiting phases use it,
+	// transactions keep the parent context so an interrupt never cuts one in half.
+	WaitContext func(context.Context) (context.Context, context.CancelFunc)
+	After       func(time.Duration) <-chan time.Time // invite expiry timer
+	Hostname    func() (string, error)
+}
+
+func (a *App) pairTimeouts() pairing.Timeouts {
+	if a.PairTimeouts == (pairing.Timeouts{}) {
+		return pairing.DefaultTimeouts
+	}
+	return a.PairTimeouts
+}
+
+func (a *App) waitContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if a.WaitContext == nil {
+		return context.WithCancel(ctx)
+	}
+	return a.WaitContext(ctx)
+}
+
+func (a *App) after(d time.Duration) <-chan time.Time {
+	if a.After == nil {
+		return time.After(d)
+	}
+	return a.After(d)
+}
+
+func (a *App) hostname() (string, error) {
+	if a.Hostname == nil {
+		return os.Hostname()
+	}
+	return a.Hostname()
 }
 
 type command struct {
@@ -89,6 +126,8 @@ type command struct {
 func commands() []command {
 	return []command{
 		{"init", "create a network on this node (usually the server with a public UDP endpoint)", false, (*App).cmdInit},
+		{"invite", "wait for the second node to join with a one-time code", false, (*App).cmdInvite},
+		{"join", "join a network with the code printed by meshly invite", false, (*App).cmdJoin},
 		{"allow", "allow a peer to reach a local service through the VPN", false, (*App).cmdAllow},
 		{"deny", "remove an allow rule (existing connections stop as well)", false, (*App).cmdDeny},
 		{"rules", "list allow rules", false, (*App).cmdRules},
@@ -182,6 +221,8 @@ func codeOf(err error) int {
 		return ExitBusy
 	case errors.Is(err, store.ErrNotInitialized):
 		return ExitNotInit
+	case errors.Is(err, pairing.ErrMalformed), errors.Is(err, pairing.ErrVersion), errors.Is(err, pairing.ErrExpired):
+		return ExitInvalidCode
 	case errors.Is(err, store.ErrInsecure):
 		return ExitPreflight
 	case errors.Is(err, store.ErrExists):

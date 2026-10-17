@@ -28,6 +28,42 @@ Usually run on the server whose UDP port is reachable from the internet.
 Examples:
   meshly init homelab --name vps
   meshly init homelab --name vps --endpoint 203.0.113.10`,
+	"invite": `meshly invite [--ttl DURATION]
+
+Wait for the second node to join this network. Prints a one-time code, then
+waits until a node joins with it, the code expires or Ctrl+C. Run it on the
+node the other one reaches over UDP (it needs a public endpoint). Nothing new
+is reachable from the internet meanwhile: the exchange runs through the
+WireGuard port, over a temporary peer that only the code unlocks.
+
+  --ttl DURATION   how long the code is valid (default 10m, 1m to 1h)
+
+Example:
+  sudo meshly invite`,
+	"join": `meshly join [--name NAME] [--endpoint IP[:PORT]|auto|none] [options]
+
+Join the network of the node where ` + "`meshly invite`" + ` waits: paste the code it
+printed when asked, or pass it on stdin. The code is never accepted as an
+argument: other users could see it in the process list, and it would stay
+in the shell history.
+
+  --name NAME          name of this node (default: the host name, made to fit
+                       a-z, 0-9 and '-')
+  --endpoint ADDR      public IP or IP:PORT the inviting node reaches this node
+                       at (the port defaults to --listen-port). auto = the
+                       public IPv4 address of this host's interface, found
+                       locally. Default none: the inviting node learns it from
+                       authenticated packets
+  --listen-port PORT   local UDP port (default: endpoint port, else 51820 or a
+                       free port)
+  --keepalive SECONDS  persistent keepalive towards the inviting node
+                       (default 25, 0 = off)
+  --interface NAME     interface name (default meshly0)
+  --firewall PROFILE   auto | none | nftables (default auto)
+
+Examples:
+  sudo meshly join
+  sudo meshly join --name home < code.txt`,
 	"allow": `meshly allow <port>/<tcp|udp> from <peer> [--dry-run]
 meshly allow ping from <peer>
 
@@ -79,8 +115,10 @@ func (a *App) usage(w io.Writer) {
 Usage: meshly <command> [arguments]
 
 Typical setup:
-  vps$  meshly init homelab --name vps
-  vps$  meshly allow 22/tcp from home
+  vps$  sudo meshly init homelab --name vps
+  vps$  sudo meshly invite                  # prints a one-time code and waits
+  home$ sudo meshly join                    # asks for the code
+  vps$  sudo meshly allow 22/tcp from home
 
 Commands:
 `)

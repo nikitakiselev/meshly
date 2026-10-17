@@ -128,6 +128,11 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 	a.printEndpoint(ep, lp, auto, found)
 	a.printf("  firewall:     profile %s; all inbound VPN traffic is denied until `meshly allow`\n", cfg.Firewall.Profile)
 	a.printf("  public key:   %s\n", cfg.Self.WGPublicKey)
+	if ep.IsValid() {
+		a.printf("\nNext: run `sudo meshly invite` on this node and `sudo meshly join` on the other.\n")
+	} else {
+		a.printf("\nNext: once this node has a public endpoint (sudo meshly set endpoint IP), run `sudo meshly invite` on it and `sudo meshly join` on the other.\n")
+	}
 	return nil
 }
 

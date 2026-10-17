@@ -3,14 +3,18 @@
 package cli
 
 import (
+	"context"
 	"os"
+	"os/signal"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/nikitakiselev/meshly/internal/engine"
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/netstack"
 	"github.com/nikitakiselev/meshly/internal/nft"
+	"github.com/nikitakiselev/meshly/internal/pairing"
 	"github.com/nikitakiselev/meshly/internal/preflight"
 	"github.com/nikitakiselev/meshly/internal/store"
 	"github.com/nikitakiselev/meshly/internal/systemd"
@@ -36,6 +40,12 @@ func NewApp() *App {
 		Euid:        os.Geteuid(),
 		LockTimeout: 30 * time.Second,
 		Arch:        runtime.GOARCH,
+		Pairing:     pairing.Kernel{},
+		WaitContext: func(c context.Context) (context.Context, context.CancelFunc) {
+			return signal.NotifyContext(c, os.Interrupt, syscall.SIGTERM)
+		},
+		After:    time.After,
+		Hostname: os.Hostname,
 	}
 	a.Engine = &engine.Engine{
 		Links: links, WG: wg.Kernel{}, FW: fw, Paths: paths,
