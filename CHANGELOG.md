@@ -38,6 +38,9 @@ on-disk formats.
 
 ### Fixed
 
+- Reads of interfaces, addresses, routes and policy rules are retried when the kernel reports that they changed
+  during the read (containers or virtual machines starting). `init`, `join`, `status` and the check could fail with
+  `results may be incomplete or inconsistent` before.
 - A verdict map in a foreign nftables chain (`iifname vmap @jumps`, `vmap { … : jump … }`) no longer counts as a rule
   that may drop meshly traffic by itself: meshly follows its jumps as it does a rule's own and finds a drop only
   where there is one. With Docker's nftables firewall backend, `init` stopped with exit 3 over Docker's NAT chains,

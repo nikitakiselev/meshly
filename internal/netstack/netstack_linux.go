@@ -49,7 +49,7 @@ func (n *Netlink) Observe(name string) (Link, error) {
 		MTU:    attrs.MTU,
 		Up:     attrs.Flags&net.FlagUp != 0,
 	}
-	addrs, err := netlink.AddrList(l, netlink.FAMILY_ALL)
+	addrs, err := addrList(l, netlink.FAMILY_ALL)
 	if err != nil {
 		return Link{}, fmt.Errorf("list addresses of %s: %w", name, err)
 	}
@@ -58,7 +58,7 @@ func (n *Netlink) Observe(name string) (Link, error) {
 			out.Addrs = append(out.Addrs, p)
 		}
 	}
-	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{LinkIndex: attrs.Index, Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
+	routes, err := routeList(&netlink.Route{LinkIndex: attrs.Index, Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
 	if err != nil {
 		return Link{}, fmt.Errorf("list routes of %s: %w", name, err)
 	}
@@ -75,6 +75,37 @@ func (n *Netlink) Observe(name string) (Link, error) {
 		out.Routes = append(out.Routes, Route{Dst: dst, Src: src.Unmap()})
 	}
 	return out, nil
+}
+
+// dumpTries is how often a netlink dump is tried while changes interrupt
+// it (netlink.ErrDumpInterrupted): links of containers come and go.
+const dumpTries = 3
+
+// dump runs a netlink dump again while it was interrupted, up to dumpTries
+// times; its result is incomplete then.
+func dump[T any](f func() ([]T, error)) ([]T, error) {
+	var out []T
+	var err error
+	for range dumpTries {
+		if out, err = f(); !errors.Is(err, netlink.ErrDumpInterrupted) {
+			break
+		}
+	}
+	return out, err
+}
+
+func linkList() ([]netlink.Link, error) { return dump(netlink.LinkList) }
+
+func addrList(l netlink.Link, family int) ([]netlink.Addr, error) {
+	return dump(func() ([]netlink.Addr, error) { return netlink.AddrList(l, family) })
+}
+
+func routeList(filter *netlink.Route, mask uint64) ([]netlink.Route, error) {
+	return dump(func() ([]netlink.Route, error) { return netlink.RouteListFiltered(netlink.FAMILY_V4, filter, mask) })
+}
+
+func ruleList() ([]netlink.Rule, error) {
+	return dump(func() ([]netlink.Rule, error) { return netlink.RuleList(netlink.FAMILY_V4) })
 }
 
 func prefixOf(n *net.IPNet) (netip.Prefix, bool) {
@@ -174,7 +205,7 @@ func (n *Netlink) SyncAddrs(name string, want netip.Prefix) error {
 	if err != nil {
 		return err
 	}
-	addrs, err := netlink.AddrList(l, netlink.FAMILY_ALL)
+	addrs, err := addrList(l, netlink.FAMILY_ALL)
 	if err != nil {
 		return err
 	}
@@ -203,7 +234,7 @@ func (n *Netlink) SyncRoutes(name string, want []Route) error {
 		return err
 	}
 	idx := l.Attrs().Index
-	cur, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{LinkIndex: idx, Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
+	cur, err := routeList(&netlink.Route{LinkIndex: idx, Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
 	if err != nil {
 		return err
 	}
@@ -305,7 +336,7 @@ func (n *Netlink) SysctlsOK(name string) []string {
 // UsedPrefixes lists addresses and routes (all tables) that do not belong
 // to the excluded interface, for CIDR conflict detection.
 func (n *Netlink) UsedPrefixes(exclude string) ([]model.UsedPrefix, error) {
-	links, err := netlink.LinkList()
+	links, err := linkList()
 	if err != nil {
 		return nil, err
 	}
@@ -318,7 +349,7 @@ func (n *Netlink) UsedPrefixes(exclude string) ([]model.UsedPrefix, error) {
 		}
 	}
 	var out []model.UsedPrefix
-	addrs, err := netlink.AddrList(nil, netlink.FAMILY_V4)
+	addrs, err := addrList(nil, netlink.FAMILY_V4)
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +361,7 @@ func (n *Netlink) UsedPrefixes(exclude string) ([]model.UsedPrefix, error) {
 			out = append(out, model.UsedPrefix{Prefix: p.Masked(), Source: "address " + p.String() + " on " + names[a.LinkIndex]})
 		}
 	}
-	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: unix.RT_TABLE_UNSPEC}, netlink.RT_FILTER_TABLE)
+	routes, err := routeList(&netlink.Route{Table: unix.RT_TABLE_UNSPEC}, netlink.RT_FILTER_TABLE)
 	if err != nil {
 		return nil, err
 	}
@@ -359,7 +390,7 @@ func (n *Netlink) UsedPrefixes(exclude string) ([]model.UsedPrefix, error) {
 
 // LocalAddrs returns all unicast addresses of the host.
 func (n *Netlink) LocalAddrs() ([]netip.Addr, error) {
-	addrs, err := netlink.AddrList(nil, netlink.FAMILY_ALL)
+	addrs, err := addrList(nil, netlink.FAMILY_ALL)
 	if err != nil {
 		return nil, err
 	}
@@ -375,7 +406,7 @@ func (n *Netlink) LocalAddrs() ([]netip.Addr, error) {
 // DefaultRouteAddrs returns the IPv4 addresses of the interfaces that carry
 // an IPv4 default route in the main table. It only reads the kernel state.
 func (n *Netlink) DefaultRouteAddrs() ([]model.LinkAddr, error) {
-	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_TABLE)
+	routes, err := routeList(&netlink.Route{Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_TABLE)
 	if err != nil {
 		return nil, fmt.Errorf("list routes: %w", err)
 	}
@@ -400,7 +431,7 @@ func (n *Netlink) DefaultRouteAddrs() ([]model.LinkAddr, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read link %d: %w", i, err)
 		}
-		addrs, err := netlink.AddrList(l, netlink.FAMILY_V4)
+		addrs, err := addrList(l, netlink.FAMILY_V4)
 		if err != nil {
 			return nil, fmt.Errorf("list addresses of %s: %w", l.Attrs().Name, err)
 		}
@@ -429,7 +460,7 @@ func (n *Netlink) LinkExists(name string) (exists, owned bool, kind string, err 
 
 // DockerBridges lists Docker bridges with their IPv4 subnets, by name.
 func (n *Netlink) DockerBridges() ([]Bridge, error) {
-	links, err := netlink.LinkList()
+	links, err := linkList()
 	if err != nil {
 		return nil, fmt.Errorf("list links: %w", err)
 	}
@@ -439,7 +470,7 @@ func (n *Netlink) DockerBridges() ([]Bridge, error) {
 		if !IsDockerBridge(attrs.Name, l.Type()) {
 			continue
 		}
-		addrs, err := netlink.AddrList(l, netlink.FAMILY_V4)
+		addrs, err := addrList(l, netlink.FAMILY_V4)
 		if err != nil {
 			return nil, fmt.Errorf("list addresses of %s: %w", attrs.Name, err)
 		}
@@ -486,10 +517,17 @@ func tablePrefix(r netlink.Route) (netip.Prefix, bool) {
 // ObserveDockerRouting reads Meshly's rules (RouteProtocol) and the routes
 // of RouteTable; routes of another protocol are only counted.
 func (n *Netlink) ObserveDockerRouting() (DockerRouting, error) {
+	out, _, err := n.dockerRouting()
+	return out, err
+}
+
+// dockerRouting is ObserveDockerRouting plus the kernel's routes behind
+// out.Routes, index for index.
+func (n *Netlink) dockerRouting() (DockerRouting, []netlink.Route, error) {
 	var out DockerRouting
-	rules, err := netlink.RuleList(netlink.FAMILY_V4)
+	rules, err := ruleList()
 	if err != nil {
-		return out, fmt.Errorf("list rules: %w", err)
+		return out, nil, fmt.Errorf("list rules: %w", err)
 	}
 	for _, r := range rules {
 		if int(r.Protocol) != RouteProtocol {
@@ -497,13 +535,30 @@ func (n *Netlink) ObserveDockerRouting() (DockerRouting, error) {
 		}
 		out.Rules = append(out.Rules, PolicyRule{Iif: r.IifName, Table: r.Table, Priority: r.Priority})
 	}
-	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: RouteTable}, netlink.RT_FILTER_TABLE)
+	routes, err := routeList(&netlink.Route{Table: RouteTable}, netlink.RT_FILTER_TABLE)
 	if err != nil {
-		return out, fmt.Errorf("list routes of table %d: %w", RouteTable, err)
+		return out, nil, fmt.Errorf("list routes of table %d: %w", RouteTable, err)
 	}
+	var raw []netlink.Route
+	out.Routes, raw, out.Foreign = tableRoutes(routes, func(i int) (string, error) {
+		l, err := netlink.LinkByIndex(i)
+		if err != nil {
+			return "", err
+		}
+		return l.Attrs().Name, nil
+	})
+	return out, raw, nil
+}
+
+// tableRoutes converts the routes of RouteTable: Meshly's (RouteProtocol),
+// with raw their kernel routes, and a count of the others. A route of
+// Meshly's whose link went away during the dump has Dev ""; one through no
+// link that is not unreachable is not of a kind Meshly creates and counts
+// as foreign.
+func tableRoutes(routes []netlink.Route, name func(index int) (string, error)) (out []TableRoute, raw []netlink.Route, foreign int) {
 	for _, r := range routes {
 		if int(r.Protocol) != RouteProtocol {
-			out.Foreign++
+			foreign++
 			continue
 		}
 		dst, ok := tablePrefix(r)
@@ -511,22 +566,24 @@ func (n *Netlink) ObserveDockerRouting() (DockerRouting, error) {
 			continue
 		}
 		tr := TableRoute{Dst: dst}
-		if r.Type != unix.RTN_UNREACHABLE {
-			l, err := netlink.LinkByIndex(r.LinkIndex)
-			if err != nil {
-				return out, fmt.Errorf("read link %d: %w", r.LinkIndex, err)
-			}
-			tr.Dev = l.Attrs().Name
+		switch {
+		case r.Type == unix.RTN_UNREACHABLE:
+		case r.LinkIndex <= 0:
+			foreign++
+			continue
+		default:
+			tr.Dev, _ = name(r.LinkIndex)
 		}
-		out.Routes = append(out.Routes, tr)
+		out = append(out, tr)
+		raw = append(raw, r)
 	}
-	return out, nil
+	return out, raw, foreign
 }
 
 // SyncDockerRouting makes want the exact set of Meshly rules and routes
 // of RouteTable. Objects of other protocols are never touched.
 func (n *Netlink) SyncDockerRouting(want DockerRouting) error {
-	have, err := n.ObserveDockerRouting()
+	have, raw, err := n.dockerRouting()
 	if err != nil {
 		return err
 	}
@@ -540,15 +597,12 @@ func (n *Netlink) SyncDockerRouting(want DockerRouting) error {
 			return fmt.Errorf("remove rule iif %s lookup %d: %w", r.Iif, r.Table, err)
 		}
 	}
-	for _, r := range have.Routes {
+	for i, r := range have.Routes {
 		if slices.Contains(want.Routes, r) {
 			continue
 		}
-		nr, err := tableRoute(r)
-		if err != nil {
-			return err
-		}
-		if err := netlink.RouteDel(nr); err != nil {
+		// Gone already: the routes of a removed link go with it.
+		if err := netlink.RouteDel(&raw[i]); err != nil && !errors.Is(err, unix.ESRCH) {
 			return fmt.Errorf("remove route %s from table %d: %w", r.Dst, RouteTable, err)
 		}
 	}
