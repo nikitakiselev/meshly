@@ -92,6 +92,14 @@ type App struct {
 	// Echo sends one ICMP echo request from src to dst and returns the
 	// round-trip time, or ping.ErrNoReply after timeout (meshly ping).
 	Echo func(ctx context.Context, src, dst netip.Addr, seq int, timeout time.Duration) (time.Duration, error)
+	// Changes reports changes of the links and of nftables until ctx ends
+	// (meshly service watch).
+	Changes func(ctx context.Context) (<-chan struct{}, error)
+	// The watch checks once no change came for WatchQuiet, at the latest
+	// WatchMax after the first one, and again every WatchRetry while the
+	// lock is busy. After a failed check it ignores changes for
+	// WatchBackoff: mostly the failed transaction's own.
+	WatchQuiet, WatchMax, WatchRetry, WatchBackoff time.Duration
 }
 
 func (a *App) pairTimeouts() pairing.Timeouts {
@@ -151,7 +159,7 @@ func commands() []command {
 		{"reset", "remove the link, configuration and keys from this node", false, (*App).cmdReset},
 		{"version", "print the version", false, (*App).cmdVersion},
 		{"help", "show help for a command", false, (*App).cmdHelp},
-		{"service", "systemd entry points: start|stop|reload|check|install", true, (*App).cmdService},
+		{"service", "systemd entry points: start|stop|reload|check|install|watch", true, (*App).cmdService},
 		{"recover", "finish or roll back an interrupted operation", true, (*App).cmdRecover},
 	}
 }

@@ -3,6 +3,7 @@
 package netstack
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -12,9 +13,11 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/nikitakiselev/meshly/internal/model"
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
 )
 
@@ -599,4 +602,61 @@ func tableRoute(r TableRoute) (*netlink.Route, error) {
 	nr.LinkIndex = l.Attrs().Index
 	nr.Scope = netlink.SCOPE_LINK
 	return nr, nil
+}
+
+// SubscribeChanges reports changes of the links (RTNLGRP_LINK) and of
+// nftables (NFNLGRP_NFTABLES, which needs CAP_NET_ADMIN). A value on the
+// channel means at least one change since the previous one was received.
+// The channel is closed when ctx ends or a subscription fails.
+func SubscribeChanges(ctx context.Context) (<-chan struct{}, error) {
+	nfts, err := nl.Subscribe(unix.NETLINK_NETFILTER, unix.NFNLGRP_NFTABLES)
+	if err != nil {
+		return nil, fmt.Errorf("subscribe to nftables events: %w", err)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	links := make(chan netlink.LinkUpdate)
+	if err := netlink.LinkSubscribeWithOptions(links, ctx.Done(), netlink.LinkSubscribeOptions{}); err != nil {
+		cancel()
+		nfts.Close()
+		return nil, fmt.Errorf("subscribe to link events: %w", err)
+	}
+	out := make(chan struct{}, 1)
+	notify := func() {
+		select {
+		case out <- struct{}{}:
+		default:
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		defer cancel()
+		// Drained until closed: the sender would block forever otherwise.
+		for range links {
+			notify()
+		}
+	})
+	wg.Go(func() {
+		defer cancel()
+		for {
+			_, _, err := nfts.Receive()
+			switch {
+			case errors.Is(err, unix.ENOBUFS):
+				// The socket overran: the lost events were changes too.
+				notify()
+			case err != nil:
+				return
+			default:
+				notify()
+			}
+		}
+	})
+	go func() {
+		<-ctx.Done()
+		nfts.Close()
+	}()
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out, nil
 }

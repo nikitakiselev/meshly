@@ -46,6 +46,12 @@ func NewApp() *App {
 		After:       time.After,
 		Hostname:    os.Hostname,
 		Echo:        ping.Kernel{}.Echo,
+		Changes:     netstack.SubscribeChanges,
+		WatchQuiet:  time.Second,
+		WatchMax:    5 * time.Second,
+		WatchRetry:  2 * time.Second,
+		// The interval of meshly-check.timer.
+		WatchBackoff: time.Minute,
 	}
 	a.Engine = &engine.Engine{
 		Links: links, WG: wg.Kernel{}, FW: fw, Paths: paths,

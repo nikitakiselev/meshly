@@ -113,7 +113,7 @@ Examples:
 	"reset":   "meshly reset [--yes]\n\nStop the link and remove configuration, keys and units\nfrom this node. The operation journal is kept for audit.",
 	"version": "meshly version [--short] [--json]",
 	"recover": "meshly recover\n\nFinish or roll back an operation interrupted by a crash or power loss (every\ncommand does this first; this command does only that).",
-	"service": "meshly service start|stop|reload|check|install\n\nEntry points used by meshly.service and meshly-check.service; not meant to be\nrun by hand. `install` (re)writes the unit files for the current binary.",
+	"service": "meshly service start|stop|reload|check|install|watch\n\nEntry points used by meshly.service, meshly-check.service and\nmeshly-watch.service; not meant to be run by hand. `install` (re)writes the\nunit files for the current binary.",
 	"help":    "meshly help [command]",
 }
 

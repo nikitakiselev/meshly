@@ -299,7 +299,7 @@ func (a *App) cmdRecover(ctx context.Context, args []string) error {
 // cmdService implements the systemd entry points.
 func (a *App) cmdService(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return errorf(ExitUsage, "usage: meshly service start|stop|reload|check|install")
+		return errorf(ExitUsage, "usage: meshly service start|stop|reload|check|install|watch")
 	}
 	switch args[0] {
 	case "start", "reload":
@@ -308,6 +308,8 @@ func (a *App) cmdService(ctx context.Context, args []string) error {
 		return a.serviceStop(ctx)
 	case "check":
 		return a.serviceCheck(ctx)
+	case "watch":
+		return a.serviceWatch(ctx)
 	case "install":
 		if err := a.requireRoot(); err != nil {
 			return err
@@ -382,44 +384,51 @@ func (a *App) serviceStop(ctx context.Context) error {
 // serviceCheck is run by meshly-check.timer: it repairs drift (above all a
 // removed or modified firewall table). It never waits for a busy lock.
 func (a *App) serviceCheck(ctx context.Context) error {
+	_, err := a.checkOnce(ctx)
+	return err
+}
+
+// checkOnce repairs drift in a journaled check-repair transaction. busy
+// means that another meshly operation holds the lock: nothing was checked.
+func (a *App) checkOnce(ctx context.Context) (busy bool, err error) {
 	if err := a.requireRoot(); err != nil {
-		return err
+		return false, err
 	}
 	if held, _ := lock.Probe(a.Paths.LockFile()); held {
-		return nil
+		return true, nil
 	}
 	prev := a.LockTimeout
 	a.LockTimeout = time.Second
 	s, err := a.begin(ctx)
 	a.LockTimeout = prev
 	if errors.Is(err, lock.ErrBusy) {
-		return nil
+		return true, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer s.end()
 	cfg, err := a.Paths.LoadConfig()
 	if errors.Is(err, store.ErrNotInitialized) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if cfg.AdminState == model.AdminUp {
 		a.Engine.RememberEndpoints(cfg.Interface.Name)
 	}
 	drift, err := a.Engine.Drift(ctx, cfg)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(drift) == 0 {
-		return nil
+		return false, nil
 	}
 	for _, d := range drift {
 		fmt.Fprintf(a.Stderr, "meshly: drift detected, repairing: %s\n", d)
 	}
 	op := opFor("check-repair", fmt.Sprint(drift), journal.Backward, cfg, cfg.Clone())
 	_, err = a.apply(ctx, op, false)
-	return err
+	return false, err
 }
