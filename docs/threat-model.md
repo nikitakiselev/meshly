@@ -155,7 +155,11 @@ peer's configuration does not matter):
   drops the peer's packets, and `guard_post` drops the container's replies.
   *Integration:* `TestDenyStopsEstablishedFlow`,
   `TestDockerPublishedPort/deny-stops-established-flow` (a TCP stream into
-  a container) and `TestDockerPublishedPort/udp` (a UDP flow).
+  a container) and `TestDockerPublishedPort/udp` (a UDP flow) for the
+  peer's packets; `TestDockerPublishedPort/deny-stops-container-replies`
+  for the container's: a container that keeps sending over TCP and UDP on
+  a flow the peer opened reaches the peer no more after `deny`, and the
+  counter of `guard_post` grows.
 - **No source spoofing.** WireGuard cryptokey routing on the attacked node
   accepts only the peer's `/32`, and `from_vpn` requires `ip saddr` in
   `@peers`. *Integration:* `TestCompromisedPeerContained` (a source

@@ -300,6 +300,47 @@ func TestDockerPublishedPort(t *testing.T) {
 				t.Fatal("new connections possible after deny")
 			}
 		})
+
+		// The other direction: the container keeps sending on a flow that
+		// home opened, over TCP and UDP. from_vpn drops only home's
+		// packets; what the container sends after deny is dropped per
+		// packet by guard_post. Without that rule TCP still delivers a
+		// line or two until its retransmissions stall, UDP every line.
+		l.Run("deny-stops-container-replies", func(t *testing.T) {
+			const rule = "replies of denied container ports"
+			for _, c := range []struct {
+				proto      string
+				port, ctrd int
+				recv       string
+			}{{"tcp", 9107, 8080, "-recv"}, {"udp", 9108, 5141, "-recv-udp"}} {
+				name := "push-" + c.proto
+				vps.MustDocker("run", "-d", "--name", name, "-p", fmt.Sprintf("%d:%d/%s", c.port, c.ctrd, c.proto),
+					"-v", "/opt/it:/opt/it:ro", "--entrypoint", "/opt/it/fileserver", "it-busybox",
+					"-"+c.proto, strconv.Itoa(c.ctrd), "-token", fmt.Sprintf("%s-%s-%d", name, c.proto, c.port), "-push")
+				vps.WaitFor(name+" serving", 10*time.Second, func() bool { return vps.Probe(c.proto, "127.0.0.1", c.port) })
+				allow := fmt.Sprintf("%d/%s", c.port, c.proto)
+				vps.MustMeshly("allow", allow, "from", "home")
+				out := "/tmp/" + name
+				home.MustSh(fmt.Sprintf("nohup /opt/it/fileserver %s 10.100.0.1:%d >%s 2>&1 &", c.recv, c.port, out))
+				t.Cleanup(func() { home.Sh("pkill -f 'fileserver " + c.recv + " '") })
+				lines := func() int {
+					n, _ := strconv.Atoi(strings.TrimSpace(home.Sh("wc -l < " + out).Out))
+					return n
+				}
+				home.WaitFor(name+" started", 10*time.Second, func() bool { return lines() >= 5 })
+				dropped := vps.counted("guard_post", rule)
+				vps.MustMeshly("deny", allow, "from", "home")
+				time.Sleep(500 * time.Millisecond) // in-flight packets
+				before := lines()
+				time.Sleep(3 * time.Second)
+				if after := lines(); after != before {
+					t.Fatalf("%s: the container's data reaches home after deny: %d -> %d lines", c.proto, before, after)
+				}
+				if after := vps.counted("guard_post", rule); after <= dropped {
+					t.Fatalf("%s: guard_post did not drop what the container sent: counter %d -> %d", c.proto, dropped, after)
+				}
+			}
+		})
 	})
 }
 
