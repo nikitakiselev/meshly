@@ -12,9 +12,10 @@ import (
 // chains:
 //
 //   - class A: decrypted VPN traffic on the Meshly interface (IPv4 between
-//     the local VPN address and the peers);
+//     the local VPN address and the peers); on the forward hook, between
+//     the Meshly interface and a Docker bridge;
 //   - class B: WireGuard transport (UDP to/from the listen port on any
-//     other interface).
+//     other interface); never forwarded.
 type Context struct {
 	Interface  string
 	LocalVPN   netip.Addr
@@ -30,6 +31,9 @@ type Context struct {
 	Network netip.Prefix
 	// Endpoints are the known public addresses of the peers.
 	Endpoints []netip.Addr
+	// DockerBridges are the names of the node's Docker bridges. The
+	// forward hook is analysed only while there is one.
+	DockerBridges []string
 }
 
 // ChainFinding is the verdict for one foreign base chain.
@@ -93,25 +97,42 @@ type Analysis struct {
 	FirewalldTables bool           `json:"firewalld_tables"`
 	Flowtables      []string       `json:"flowtables_with_interface,omitempty"`
 	NetdevChains    []string       `json:"netdev_chains,omitempty"`
+	// DockerBridges are Context.DockerBridges.
+	DockerBridges []string `json:"docker_bridges,omitempty"`
 }
 
 // NeedsIntegration reports chains that block Meshly until the
-// administrator adds the integration rule.
+// administrator adds the integration rule. Forward chains are not
+// among them (see Forward).
 func (a *Analysis) NeedsIntegration() []ChainFinding {
 	var out []ChainFinding
 	for _, c := range a.Chains {
-		if !c.ByMeshly && (c.Status == "needs-integration" || c.Status == "misplaced-integration") {
+		if c.Hook != "forward" && !c.ByMeshly && (c.Status == "needs-integration" || c.Status == "misplaced-integration") {
 			out = append(out, c)
 		}
 	}
 	return out
 }
 
-// Unsupported reports chains that cannot be integrated.
+// Unsupported reports chains that cannot be integrated, except forward
+// chains (see Forward).
 func (a *Analysis) Unsupported() []ChainFinding {
 	var out []ChainFinding
 	for _, c := range a.Chains {
-		if c.Status == "unsupported" {
+		if c.Hook != "forward" && c.Status == "unsupported" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// Forward reports forward chains, other than those Meshly integrates
+// itself, that may drop the traffic of Docker containers through Meshly.
+// They never block the tunnel between the hosts.
+func (a *Analysis) Forward() []ChainFinding {
+	var out []ChainFinding
+	for _, c := range a.Chains {
+		if c.Hook == "forward" && !c.ByMeshly && c.Status != "compatible" && c.Status != "integrated" {
 			out = append(out, c)
 		}
 	}
@@ -130,10 +151,11 @@ func (a *Analysis) ByMeshly() []ChainFinding {
 	return out
 }
 
-// HasFirewall reports whether any foreign chain can drop Meshly traffic.
+// HasFirewall reports whether any foreign chain but a forward one can drop
+// Meshly traffic.
 func (a *Analysis) HasFirewall() bool {
 	for _, c := range a.Chains {
-		if c.Status != "compatible" {
+		if c.Hook != "forward" && c.Status != "compatible" {
 			return true
 		}
 	}
@@ -158,7 +180,7 @@ func isIptablesTable(rs *Ruleset, family, table string) bool {
 
 // Analyze inspects a ruleset in the given context.
 func Analyze(rs *Ruleset, ctx Context) *Analysis {
-	a := &Analysis{}
+	a := &Analysis{DockerBridges: ctx.DockerBridges}
 	if t := rs.Table(TableFamily, TableName); t != nil {
 		a.OurTablePresent = true
 		a.MarkerNetwork, a.MarkerHash, a.OurTableOwned = t.Marker()
@@ -208,7 +230,8 @@ func Analyze(rs *Ruleset, ctx Context) *Analysis {
 
 	an := &analyzer{rs: rs, ctx: ctx, memo: map[string]classes{}}
 	for _, c := range rs.Chains {
-		if !c.IsBase() || !relevantHooks[c.Hook] || (c.Family == TableFamily && c.Table == TableName) {
+		relevant := relevantHooks[c.Hook] || c.Hook == "forward" && len(ctx.DockerBridges) > 0
+		if !c.IsBase() || !relevant || (c.Family == TableFamily && c.Table == TableName) {
 			continue
 		}
 		if c.Family != "ip" && c.Family != "ip6" && c.Family != "inet" {
@@ -223,6 +246,12 @@ func Analyze(rs *Ruleset, ctx Context) *Analysis {
 type classes struct{ A, B bool }
 
 func (c classes) any() bool { return c.A || c.B }
+
+// reaching are the classes a chain of family on hook may see: no IPv6
+// inside the VPN, and no WireGuard transport forwarded.
+func reaching(family, hook string) classes {
+	return classes{A: family != "ip6", B: hook != "forward"}
+}
 
 type analyzer struct {
 	rs    *Ruleset
@@ -282,7 +311,7 @@ func (an *analyzer) chain(c Chain) ChainFinding {
 			}
 		}
 	}
-	policyDrop := f.Policy == "drop"
+	policyDrop := f.Policy == "drop" && reaching(c.Family, c.Hook).any()
 	if len(f.Interfering) == 0 && !policyDrop {
 		f.Status = "compatible"
 		return f
@@ -295,12 +324,21 @@ func (an *analyzer) chain(c Chain) ChainFinding {
 		}
 	}
 	switch {
+	case f.IptablesManaged && !f.ByMeshly && c.Hook == "forward":
+		f.Status = "unsupported"
+		f.Detail = reason + "; meshly integrates only the FORWARD chain of the iptables filter table"
 	case f.IptablesManaged && !f.ByMeshly:
 		f.Status = "unsupported"
 		f.Detail = reason + "; meshly integrates only the INPUT and OUTPUT chains of the iptables filter table"
+		if len(an.ctx.DockerBridges) > 0 {
+			f.Detail = reason + "; meshly integrates only the INPUT, OUTPUT and FORWARD chains of the iptables filter table"
+		}
 	case (c.Hook == "prerouting" || c.Hook == "output") && f.Priority <= PolicyPriority:
 		f.Status = "unsupported"
 		f.Detail = fmt.Sprintf("%s; chain priority %d runs before meshly (%d), integration is impossible", reason, f.Priority, PolicyPriority)
+	case c.Hook == "forward" && f.Priority <= ForwardPriority:
+		f.Status = "unsupported"
+		f.Detail = fmt.Sprintf("%s; chain priority %d runs before meshly (%d), integration is impossible", reason, f.Priority, ForwardPriority)
 	case integrationIdx < 0:
 		f.Status = "needs-integration"
 		f.Detail = reason
@@ -357,7 +395,7 @@ func (an *analyzer) isIntegration(r Rule) bool {
 // address against a ban list, it drops only the listed addresses: ban
 // describes them.
 func (an *analyzer) rule(r Rule, family, hook string) (_ classes, ban *banMatch) {
-	reach := classes{A: family != "ip6", B: true}
+	reach := reaching(family, hook)
 	var effect classes
 	an.family, an.table = r.Family, r.Table
 	for _, e := range r.Expr {
@@ -472,11 +510,15 @@ func (an *analyzer) excludes(e json.RawMessage, hook string) classes {
 		return classes{}
 	}
 	in := inbound(hook)
+	fwd := hook == "forward"
 	values := an.values(m.Match.Right)
 	switch {
 	case left.Meta != nil:
 		switch left.Meta.Key {
 		case "iifname", "iif", "oifname", "oif":
+			if fwd {
+				return an.forwardIface(op, values)
+			}
 			isIn := strings.HasPrefix(left.Meta.Key, "i")
 			if isIn != in {
 				return classes{}
@@ -497,6 +539,10 @@ func (an *analyzer) excludes(e json.RawMessage, hook string) classes {
 	case left.Payload != nil:
 		p := left.Payload
 		switch {
+		case fwd && p.Protocol == "ip6":
+			return classes{A: true} // no IPv6 inside the VPN
+		case fwd && p.Protocol == "ip" && (p.Field == "saddr" || p.Field == "daddr"):
+			return classes{} // peers' and containers' addresses
 		case (p.Protocol == "ip" || p.Protocol == "ip6") && (p.Field == "saddr" && in || p.Field == "daddr" && !in):
 			return an.remote(p.Protocol, op, m.Match.Right, values)
 		case p.Protocol == "ip6":
@@ -533,6 +579,24 @@ func (an *analyzer) excludes(e json.RawMessage, hook string) classes {
 		}
 	}
 	return classes{}
+}
+
+// forwardIface decides an interface match on the forward hook: class A
+// goes between the Meshly interface and a Docker bridge, in either
+// direction. A trailing "*" matches by prefix, as in nft.
+func (an *analyzer) forwardIface(op string, v valueSet) classes {
+	if op != "==" || !v.known() || len(v.numbers) > 0 || len(v.prefixes) > 0 || len(v.ranges) > 0 {
+		return classes{}
+	}
+	names := append([]string{an.ctx.Interface}, an.ctx.DockerBridges...)
+	for _, s := range v.strings {
+		for _, name := range names {
+			if p, wild := strings.CutSuffix(s, "*"); s == name || wild && strings.HasPrefix(name, p) {
+				return classes{}
+			}
+		}
+	}
+	return classes{A: true}
 }
 
 // remote decides a match on the remote address: the source of inbound and

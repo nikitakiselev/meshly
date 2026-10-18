@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/nikitakiselev/meshly/internal/model"
+	"github.com/nikitakiselev/meshly/internal/netstack"
 	"github.com/nikitakiselev/meshly/internal/nft"
 	"golang.org/x/sys/unix"
 )
@@ -93,6 +94,7 @@ type Links interface {
 	LocalAddrs() ([]netip.Addr, error)
 	DefaultRouteAddrs() ([]model.LinkAddr, error)
 	LinkExists(name string) (exists, owned bool, kind string, err error)
+	DockerBridges() ([]netstack.Bridge, error)
 }
 
 // System gives access to the host; replaceable in tests.
@@ -202,7 +204,11 @@ func (s *System) Managers(ctx context.Context, r *Report, a *nft.Analysis) {
 		r.add("fail2ban", Info, "fail2ban is active: the addresses it bans stay banned for traffic through meshly", "")
 	}
 	if a != nil && a.UFWChains || s.UFWEnabled() {
-		r.add("ufw", Info, "UFW is enabled: meshly keeps its rule at the top of the iptables INPUT and OUTPUT chains, and UFW decides all other traffic", "")
+		chains := "INPUT and OUTPUT"
+		if a != nil && len(a.DockerBridges) > 0 {
+			chains = "INPUT, OUTPUT and FORWARD"
+		}
+		r.add("ufw", Info, "UFW is enabled: meshly keeps its rule at the top of the iptables "+chains+" chains, and UFW decides all other traffic", "")
 	}
 	for _, f := range []string{"/proc/net/ip_tables_names", "/proc/net/ip6_tables_names"} {
 		b, err := os.ReadFile(s.path(f))
@@ -291,6 +297,10 @@ func (s *System) AnalysisContext(c *model.Config) nft.Context {
 	}
 	if s.Links != nil {
 		ctx.LocalAddrs, _ = s.Links.LocalAddrs()
+		bridges, _ := s.Links.DockerBridges()
+		for _, b := range bridges {
+			ctx.DockerBridges = append(ctx.DockerBridges, b.Name)
+		}
 	}
 	return ctx
 }
@@ -369,9 +379,23 @@ func EvaluateFirewall(r *Report, a *nft.Analysis, profile string, mark uint32, s
 				"add to that chain in /etc/nftables.conf, before any drop/reject rule, then reload nftables:\n      "+rule)
 		}
 	}
+	// Forward chains never fail: they carry only the traffic of Docker
+	// containers, not the tunnel between the hosts.
+	for _, c := range a.Forward() {
+		detail := fmt.Sprintf("chain %s %s %s (hook forward, policy %s) may drop the traffic of Docker containers through meshly: %s", c.Family, c.Table, c.Chain, c.Policy, c.Detail)
+		fix := "add to that chain, before any drop/reject rule:\n      " + rule
+		if c.Status == "unsupported" {
+			detail += "; containers cannot use the VPN through this chain"
+			fix = "see docs/firewall.md#docker"
+		}
+		if strings.HasPrefix(c.Table, "docker") {
+			fix = `Docker's nftables firewall backend is not supported for containers through meshly: set "firewall-backend": "iptables" in /etc/docker/daemon.json and restart Docker`
+		}
+		r.add("firewall-forward", Warn, detail, fix)
+	}
 	integrated := 0
 	for _, c := range a.Chains {
-		if c.Status == "integrated" && !c.ByMeshly {
+		if c.Status == "integrated" && !c.ByMeshly && c.Hook != "forward" {
 			integrated++
 		}
 	}
@@ -392,18 +416,22 @@ func EvaluateFirewall(r *Report, a *nft.Analysis, profile string, mark uint32, s
 			r.add("firewall-profile", OK, "no native nftables chain affects meshly traffic (profile none)", "")
 		}
 	}
-	if a.DockerDetected {
-		r.add("docker", Info, fmt.Sprintf("Docker rules detected (%d DNAT rules): published container ports are NOT reachable through the VPN; forwarding and DNAT from the VPN are blocked", a.DNATRules), "")
+	switch {
+	case len(a.DockerBridges) > 0:
+		r.add("docker", Info, "Docker networks "+strings.Join(a.DockerBridges, ", ")+": published container ports are reachable through the VPN after meshly allow <port>; containers reach the other node like programs on this host", "")
+	case a.DockerDetected:
+		r.add("docker", Warn, "Docker rules found but no Docker bridge network (docker0, br-<id>): containers on networks with custom bridge names cannot use the VPN", "")
 	}
 	for _, c := range a.NetdevChains {
 		r.add("netdev", Warn, c+" exists; netdev hooks run before meshly and may drop WireGuard transport", "")
 	}
 }
 
-// AutoProfile chooses a profile from an analysis.
+// AutoProfile chooses a profile from an analysis; forward chains do not
+// count.
 func AutoProfile(a *nft.Analysis) string {
 	for _, c := range a.Chains {
-		if !c.ByMeshly && (c.Status == "integrated" || c.Status == "needs-integration" || c.Status == "misplaced-integration") {
+		if c.Hook != "forward" && !c.ByMeshly && (c.Status == "integrated" || c.Status == "needs-integration" || c.Status == "misplaced-integration") {
 			return model.ProfileNftables
 		}
 	}

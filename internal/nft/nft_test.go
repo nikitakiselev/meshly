@@ -553,8 +553,14 @@ func TestIptablesOtherChainsUnsupported(t *testing.T) {
 		t.Fatal("mangle chain taken for integration")
 	}
 	a := Analyze(rs, testContext())
-	if len(a.Chains) != 1 || a.Chains[0].Status != "unsupported" || a.Chains[0].ByMeshly {
+	if len(a.Chains) != 1 || a.Chains[0].Status != "unsupported" || a.Chains[0].ByMeshly ||
+		a.Chains[0].Detail != "policy drop; meshly integrates only the INPUT and OUTPUT chains of the iptables filter table" {
 		t.Fatalf("mangle INPUT with policy drop: %+v", a.Chains)
+	}
+	// With Docker networks meshly integrates FORWARD too.
+	a = Analyze(rs, dockerContext("docker0"))
+	if len(a.Chains) != 1 || a.Chains[0].Detail != "policy drop; meshly integrates only the INPUT, OUTPUT and FORWARD chains of the iptables filter table" {
+		t.Fatalf("mangle INPUT with Docker networks: %+v", a.Chains)
 	}
 }
 
@@ -589,6 +595,7 @@ func FuzzParseRuleset(f *testing.F) {
 		}
 		// Analysis of any parsable ruleset must not panic.
 		_ = Analyze(rs, testContext())
+		_ = Analyze(rs, dockerContext("br-3f1c2a9b7d01", "docker0"))
 		if tab := rs.Table(TableFamily, TableName); tab != nil {
 			_, _, _ = tab.Marker()
 			_ = tab.ContentHash()
@@ -724,5 +731,182 @@ func TestIptablesForwardChain(t *testing.T) {
 	}
 	if on = rs.IptablesChains(mark, true); !on[0].OK() || IptablesScript(on, mark) != "" {
 		t.Fatalf("first rule disturbed: %+v", on)
+	}
+}
+
+// dockerContext is testContext on a node with Docker networks.
+func dockerContext(bridges ...string) Context {
+	c := testContext()
+	c.DockerBridges = bridges
+	return c
+}
+
+func forwardChains(a *Analysis) map[string]ChainFinding {
+	out := map[string]ChainFinding{}
+	for _, c := range a.Chains {
+		if c.Hook == "forward" {
+			out[c.Family+" "+c.Table+" "+c.Chain] = c
+		}
+	}
+	return out
+}
+
+// The forward hook is analysed only while the node has Docker networks;
+// Docker's and UFW's ip filter FORWARD get meshly's rule from meshly, and
+// ip6 chains never see the VPN's IPv4 traffic.
+func TestAnalyzeForwardHook(t *testing.T) {
+	for _, v := range nftVersions {
+		rs := loadFixture(t, v, "docker")
+		if fwd := forwardChains(Analyze(rs, testContext())); len(fwd) != 0 {
+			t.Fatalf("%s: forward hook analysed without Docker networks: %+v", v, fwd)
+		}
+		a := Analyze(rs, dockerContext("docker0"))
+		fwd := forwardChains(a)
+		if c, ok := fwd["ip filter FORWARD"]; len(fwd) != 1 || !ok || !c.ByMeshly || c.Status != "needs-integration" {
+			t.Fatalf("%s: forward chains %+v", v, fwd)
+		}
+		if len(a.Forward()) != 0 || len(a.NeedsIntegration()) != 0 || len(a.Unsupported()) != 0 {
+			t.Fatalf("%s: forward %+v, needs integration %+v, unsupported %+v", v, a.Forward(), a.NeedsIntegration(), a.Unsupported())
+		}
+		if !slices.Equal(a.DockerBridges, []string{"docker0"}) {
+			t.Fatalf("%s: Docker bridges %v", v, a.DockerBridges)
+		}
+	}
+	for _, v := range allVersions {
+		a := Analyze(loadFixture(t, v, "ufw"), dockerContext("docker0"))
+		fwd := forwardChains(a)
+		if c := fwd["ip filter FORWARD"]; len(fwd) != 2 || !c.ByMeshly || c.Status != "needs-integration" {
+			t.Fatalf("%s: forward chains %+v", v, fwd)
+		}
+		if c := fwd["ip6 filter FORWARD"]; c.ByMeshly || c.Status != "compatible" {
+			t.Fatalf("%s: ip6 filter FORWARD %+v", v, c)
+		}
+		if len(a.Forward()) != 0 {
+			t.Fatalf("%s: forward %+v", v, a.Forward())
+		}
+	}
+}
+
+// onlyChain is the one chain of an analysis.
+func onlyChain(t *testing.T, a *Analysis) ChainFinding {
+	t.Helper()
+	if len(a.Chains) != 1 {
+		t.Fatalf("chains %+v, want one", a.Chains)
+	}
+	return a.Chains[0]
+}
+
+// forwardRuleset is a ruleset with one forward chain and the given rules
+// (expression lists) with handles 10, 11, ...
+func forwardRuleset(t *testing.T, family, table, chain string, prio int, policy string, rules ...string) *Ruleset {
+	t.Helper()
+	js := fmt.Sprintf(`{"nftables":[{"metainfo":{"json_schema_version":1}},{"table":{"family":%q,"name":%q,"handle":1}},`+
+		`{"chain":{"family":%q,"table":%q,"name":%q,"handle":2,"type":"filter","hook":"forward","prio":%d,"policy":%q}}`,
+		family, table, family, table, chain, prio, policy)
+	for i, r := range rules {
+		js += fmt.Sprintf(`,{"rule":{"family":%q,"table":%q,"chain":%q,"handle":%d,"expr":%s}}`, family, table, chain, 10+i, r)
+	}
+	rs, err := ParseRuleset([]byte(js + "]}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rs
+}
+
+func metaMatch(op, key, right string) string {
+	return `{"match":{"op":"` + op + `","left":{"meta":{"key":"` + key + `"}},"right":` + right + `}}`
+}
+
+const forwardIntegration = `[{"match":{"op":"==","left":{"&":[{"meta":{"key":"mark"}},268435456]},"right":268435456}},{"accept":null}]`
+
+// A native forward chain may drop container traffic: only rules that can
+// see the traffic between the interface and a Docker bridge interfere.
+func TestAnalyzeForwardNative(t *testing.T) {
+	rules := []string{
+		`[` + metaMatch("==", "iifname", `"eth0"`) + `,` + metaMatch("==", "oifname", `"eth1"`) + `,{"drop":null}]`,
+		`[` + metaMatch("==", "oifname", `"br-*"`) + `,{"drop":null}]`,
+		`[` + metaMatch("==", "iifname", `"docker0"`) + `,{"drop":null}]`,
+		`[{"match":{"op":"==","left":{"payload":{"protocol":"ip6","field":"saddr"}},"right":{"prefix":{"addr":"::","len":0}}}},{"drop":null}]`,
+	}
+	ctx := dockerContext("br-3f1c2a9b7d01", "docker0")
+	a := Analyze(forwardRuleset(t, "inet", "filter", "forward", 0, "drop", rules...), ctx)
+	c := onlyChain(t, a)
+	if c.Status != "needs-integration" || !slices.Equal(c.Interfering, []int{11, 12}) || c.ByMeshly {
+		t.Fatalf("forward chain %+v", c)
+	}
+	if len(a.NeedsIntegration()) != 0 || len(a.Unsupported()) != 0 || a.HasFirewall() {
+		t.Fatalf("forward chain counted for the profile: %+v", a)
+	}
+	if f := a.Forward(); len(f) != 1 || f[0].Chain != "forward" {
+		t.Fatalf("Forward() = %+v", f)
+	}
+	a = Analyze(forwardRuleset(t, "inet", "filter", "forward", 0, "drop", append([]string{forwardIntegration}, rules...)...), ctx)
+	if c := onlyChain(t, a); c.Status != "integrated" || len(a.Forward()) != 0 {
+		t.Fatalf("integrated forward chain %+v, Forward() %+v", c, a.Forward())
+	}
+	// Without a matching bridge the pattern does not reach containers.
+	if c := onlyChain(t, Analyze(forwardRuleset(t, "inet", "filter", "forward", 0, "accept", rules[1]), dockerContext("docker0"))); c.Status != "compatible" {
+		t.Fatalf("br-* without a br- bridge: %+v", c)
+	}
+
+	for name, tc := range map[string]struct {
+		rule   string
+		status string
+	}{
+		"other interfaces":    {`[` + metaMatch("==", "oifname", `{"set":["eth0","eth1"]}`) + `,{"drop":null}]`, "compatible"},
+		"the vpn interface":   {`[` + metaMatch("==", "iifname", `"meshly0"`) + `,{"drop":null}]`, "needs-integration"},
+		"not equal":           {`[` + metaMatch("!=", "iifname", `"eth0"`) + `,{"drop":null}]`, "needs-integration"},
+		"source address":      {`[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"192.0.2.1"}},{"drop":null}]`, "needs-integration"},
+		"destination address": {`[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"daddr"}},"right":"10.100.0.2"}},{"drop":null}]`, "needs-integration"},
+		"invalid state":       {`[{"match":{"op":"in","left":{"ct":{"key":"state"}},"right":["invalid","untracked"]}},{"drop":null}]`, "compatible"},
+		"the listen port":     {`[{"match":{"op":"==","left":{"payload":{"protocol":"udp","field":"dport"}},"right":51820}},{"drop":null}]`, "needs-integration"},
+		"ipv6 only":           {`[{"match":{"op":"==","left":{"meta":{"key":"nfproto"}},"right":"ipv6"}},{"drop":null}]`, "compatible"},
+	} {
+		c := onlyChain(t, Analyze(forwardRuleset(t, "inet", "filter", "forward", 0, "accept", tc.rule), ctx))
+		if c.Status != tc.status || len(c.Bans) != 0 {
+			t.Errorf("%s: %+v, want %s", name, c, tc.status)
+		}
+	}
+
+	// A ban list is checked as any address match: the peers' traffic
+	// to containers carries their VPN addresses.
+	js := `{"nftables":[{"metainfo":{"json_schema_version":1}},{"table":{"family":"inet","name":"filter","handle":1}},` +
+		`{"set":{"family":"inet","name":"blocked","table":"filter","type":"ipv4_addr","handle":2,"elem":["198.51.100.7"]}},` +
+		`{"chain":{"family":"inet","table":"filter","name":"forward","handle":3,"type":"filter","hook":"forward","prio":0,"policy":"accept"}},` +
+		`{"rule":{"family":"inet","table":"filter","chain":"forward","handle":4,"expr":[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"@blocked"}},{"drop":null}]}}]}`
+	rs, err := ParseRuleset([]byte(js))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := onlyChain(t, Analyze(rs, ctx)); c.Status != "needs-integration" || len(c.Bans) != 0 {
+		t.Fatalf("ban list on the forward hook: %+v", c)
+	}
+
+	// ip6 chains never see the VPN's IPv4 traffic.
+	if c := onlyChain(t, Analyze(forwardRuleset(t, "ip6", "filter", "forward", 0, "drop", rules...), ctx)); c.Status != "compatible" {
+		t.Fatalf("ip6 forward chain %+v", c)
+	}
+	// Before meshly's forward guard the mark is not set yet.
+	a = Analyze(forwardRuleset(t, "inet", "filter", "forward", ForwardPriority, "drop", forwardIntegration), ctx)
+	if c := onlyChain(t, a); c.Status != "unsupported" || !strings.Contains(c.Detail, "runs before meshly (-300)") || len(a.Forward()) != 1 || len(a.Unsupported()) != 0 {
+		t.Fatalf("forward chain at priority %d: %+v", ForwardPriority, c)
+	}
+}
+
+// Chains of other iptables tables on the forward hook cannot be
+// integrated: they are reported, but only as forward findings.
+func TestAnalyzeForwardOtherIptablesTable(t *testing.T) {
+	rs := forwardRuleset(t, "ip", "mangle", "FORWARD", -150, "accept", `[{"counter":{"packets":0,"bytes":0}},{"drop":null}]`)
+	a := Analyze(rs, dockerContext("docker0"))
+	c := onlyChain(t, a)
+	if c.Status != "unsupported" || c.ByMeshly || !c.IptablesManaged ||
+		c.Detail != "rules [10] may drop meshly traffic; meshly integrates only the FORWARD chain of the iptables filter table" {
+		t.Fatalf("ip mangle FORWARD: %+v", a.Chains)
+	}
+	if len(a.Forward()) != 1 || len(a.Unsupported()) != 0 {
+		t.Fatalf("Forward() %+v, Unsupported() %+v", a.Forward(), a.Unsupported())
+	}
+	if len(Analyze(rs, testContext()).Chains) != 0 {
+		t.Fatal("forward hook analysed without Docker networks")
 	}
 }

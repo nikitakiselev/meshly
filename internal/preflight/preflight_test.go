@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/nikitakiselev/meshly/internal/model"
+	"github.com/nikitakiselev/meshly/internal/netstack"
 	"github.com/nikitakiselev/meshly/internal/nft"
 )
 
@@ -184,6 +185,7 @@ type fakeLinks struct {
 	kind     string
 	linkErr  error
 	excluded string
+	bridges  []netstack.Bridge
 }
 
 func (f *fakeLinks) UsedPrefixes(exclude string) ([]model.UsedPrefix, error) {
@@ -194,6 +196,7 @@ func (f *fakeLinks) LocalAddrs() ([]netip.Addr, error) {
 	return []netip.Addr{netip.MustParseAddr("203.0.113.10")}, nil
 }
 func (f *fakeLinks) DefaultRouteAddrs() ([]model.LinkAddr, error) { return nil, nil }
+func (f *fakeLinks) DockerBridges() ([]netstack.Bridge, error)    { return f.bridges, nil }
 func (f *fakeLinks) LinkExists(string) (bool, bool, string, error) {
 	return f.exists, f.owned, f.kind, f.linkErr
 }
@@ -327,6 +330,9 @@ func TestAutoProfile(t *testing.T) {
 		// iptables chains get meshly's rule from meshly itself.
 		{[]nft.ChainFinding{{Family: "ip", Table: "filter", Chain: "INPUT", Status: "needs-integration", ByMeshly: true}}, model.ProfileNone},
 		{[]nft.ChainFinding{{Family: "ip", Table: "filter", Chain: "INPUT", Status: "integrated", ByMeshly: true}, chain("needs-integration")}, model.ProfileNftables},
+		// Forward chains only matter for Docker networks, not for the profile.
+		{[]nft.ChainFinding{{Family: "inet", Table: "filter", Chain: "forward", Hook: "forward", Status: "integrated"}}, model.ProfileNone},
+		{[]nft.ChainFinding{{Family: "inet", Table: "filter", Chain: "forward", Hook: "forward", Status: "needs-integration"}}, model.ProfileNone},
 	}
 	for _, tt := range tests {
 		if got := AutoProfile(&nft.Analysis{Chains: tt.chains}); got != tt.want {
@@ -398,8 +404,6 @@ func TestEvaluateFirewall(t *testing.T) {
 			want: []want{{"flowtable", Fail, "inet filter ft"}}},
 		{name: "flowtable, lenient", a: nft.Analysis{Flowtables: []string{"inet filter ft"}}, profile: model.ProfileNone, strict: false,
 			want: []want{{"flowtable", Warn, ""}}},
-		{name: "docker", a: nft.Analysis{DockerDetected: true, DNATRules: 3}, profile: model.ProfileNone, strict: true,
-			want: []want{{"docker", Info, "3 DNAT rules"}}},
 		{name: "netdev", a: nft.Analysis{NetdevChains: []string{"netdev filter ingress"}}, profile: model.ProfileNone, strict: true,
 			want: []want{{"netdev", Warn, "netdev filter ingress"}}},
 	}
@@ -446,6 +450,8 @@ func TestManagers(t *testing.T) {
 		{name: "nothing", want: map[string]Status{"firewall-manager": OK}},
 		{name: "ufw enabled in config", files: map[string]string{"etc/ufw/ufw.conf": "ENABLED=yes\n"},
 			want: map[string]Status{"firewall-manager": OK, "ufw": Info}, texts: []string{"UFW is enabled", "top of the iptables INPUT and OUTPUT chains"}},
+		{name: "ufw with Docker networks", a: &nft.Analysis{UFWChains: true, DockerBridges: []string{"docker0"}},
+			want: map[string]Status{"firewall-manager": OK, "ufw": Info}, texts: []string{"top of the iptables INPUT, OUTPUT and FORWARD chains, and UFW decides"}},
 		{name: "ufw disabled in config", files: map[string]string{"etc/ufw/ufw.conf": "ENABLED=no\n"},
 			want: map[string]Status{"firewall-manager": OK}, absent: []string{"ufw"}},
 		{name: "fail2ban table in ruleset", a: &nft.Analysis{Fail2ban: true},
@@ -536,13 +542,17 @@ func TestAnalysisContext(t *testing.T) {
 		Peers: []model.Peer{{Address: netip.MustParseAddr("10.100.0.2"), Endpoint: netip.MustParseAddrPort("203.0.113.20:51820")},
 			{Address: netip.MustParseAddr("10.100.0.3")}},
 	}
-	got := (&System{Links: &fakeLinks{}}).AnalysisContext(c)
+	links := &fakeLinks{bridges: []netstack.Bridge{{Name: "docker0", Prefixes: []netip.Prefix{netip.MustParsePrefix("172.17.0.0/16")}}}}
+	got := (&System{Links: links}).AnalysisContext(c)
 	if got.Interface != "meshly0" || got.LocalVPN != c.Self.Address || got.ListenPort != 51820 || got.Mark != model.DefaultFirewallMark ||
 		got.Network != c.Network.CIDR || len(got.Peers) != 2 || got.Peers[0] != c.Peers[0].Address || len(got.LocalAddrs) != 1 ||
-		len(got.Endpoints) != 1 || got.Endpoints[0] != netip.MustParseAddr("203.0.113.20") {
+		len(got.Endpoints) != 1 || got.Endpoints[0] != netip.MustParseAddr("203.0.113.20") || !slices.Equal(got.DockerBridges, []string{"docker0"}) {
 		t.Errorf("AnalysisContext = %+v", got)
 	}
-	if got := (&System{}).AnalysisContext(c); got.LocalAddrs != nil {
+	if got := (&System{Links: &fakeLinks{}}).AnalysisContext(c); got.DockerBridges != nil {
+		t.Errorf("AnalysisContext without Docker networks = %+v", got)
+	}
+	if got := (&System{}).AnalysisContext(c); got.LocalAddrs != nil || got.DockerBridges != nil {
 		t.Errorf("AnalysisContext without Links = %+v", got)
 	}
 }
@@ -575,5 +585,98 @@ func TestBans(t *testing.T) {
 	}
 	if r.Error() != nil {
 		t.Fatal("a ban failed the preflight")
+	}
+}
+
+// Whatever may drop container traffic on the forward hook is a warning
+// with the exact fix, never a failure, strict or not.
+func TestEvaluateFirewallForward(t *testing.T) {
+	const mark = model.DefaultFirewallMark
+	rule := nft.IntegrationRule(mark)
+	native := nft.ChainFinding{Family: "inet", Table: "filter", Chain: "forward", Hook: "forward", Policy: "drop",
+		Status: "needs-integration", Detail: "rules [11 12] may drop meshly traffic and policy is drop"}
+	other := nft.ChainFinding{Family: "ip", Table: "mangle", Chain: "FORWARD", Hook: "forward", Policy: "accept", IptablesManaged: true,
+		Status: "unsupported", Detail: "rules [10] may drop meshly traffic; meshly integrates only the FORWARD chain of the iptables filter table"}
+	backend := nft.ChainFinding{Family: "ip", Table: "docker-bridges", Chain: "filter-FORWARD", Hook: "forward", Policy: "accept",
+		Status: "needs-integration", Detail: "rules [7] may drop meshly traffic"}
+	ours := nft.ChainFinding{Family: "ip", Table: "filter", Chain: "FORWARD", Hook: "forward", Policy: "drop", IptablesManaged: true, ByMeshly: true,
+		Status: "needs-integration", Detail: "policy drop"}
+	integrated := nft.ChainFinding{Family: "inet", Table: "filter", Chain: "forward", Hook: "forward", Policy: "drop", Status: "integrated"}
+	want := []Check{
+		{ID: "firewall-forward", Status: Warn,
+			Detail: "chain inet filter forward (hook forward, policy drop) may drop the traffic of Docker containers through meshly: rules [11 12] may drop meshly traffic and policy is drop",
+			Fix:    "add to that chain, before any drop/reject rule:\n      " + rule},
+		{ID: "firewall-forward", Status: Warn,
+			Detail: "chain ip mangle FORWARD (hook forward, policy accept) may drop the traffic of Docker containers through meshly: rules [10] may drop meshly traffic; meshly integrates only the FORWARD chain of the iptables filter table; containers cannot use the VPN through this chain",
+			Fix:    "see docs/firewall.md#docker"},
+		{ID: "firewall-forward", Status: Warn,
+			Detail: "chain ip docker-bridges filter-FORWARD (hook forward, policy accept) may drop the traffic of Docker containers through meshly: rules [7] may drop meshly traffic",
+			Fix:    `Docker's nftables firewall backend is not supported for containers through meshly: set "firewall-backend": "iptables" in /etc/docker/daemon.json and restart Docker`},
+	}
+	for _, profile := range []string{model.ProfileNone, model.ProfileNftables} {
+		for _, strict := range []bool{true, false} {
+			r := &Report{}
+			a := &nft.Analysis{DockerBridges: []string{"docker0"}, Chains: []nft.ChainFinding{native, other, backend, ours, integrated}}
+			EvaluateFirewall(r, a, profile, mark, strict)
+			if err := r.Error(); err != nil {
+				t.Fatalf("%s, strict %v: %v", profile, strict, err)
+			}
+			var got []Check
+			for _, c := range r.Checks {
+				if c.ID == "firewall-forward" {
+					got = append(got, c)
+				}
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("%s, strict %v: forward checks\n%+v\nwant\n%+v", profile, strict, got, want)
+			}
+			for _, id := range []string{"firewall-integration", "firewall-chain"} {
+				if c, ok := checkByID(r, id); ok {
+					t.Fatalf("%s, strict %v: forward chain reported as %+v", profile, strict, c)
+				}
+			}
+			if c, ok := checkByID(r, "firewall-iptables"); !ok || !strings.Contains(c.Detail, "ip filter FORWARD") {
+				t.Fatalf("%s, strict %v: iptables check %+v", profile, strict, c)
+			}
+			// The integrated forward chain does not make the profile nftables.
+			if c, _ := checkByID(r, "firewall-profile"); profile == model.ProfileNftables && c.Status != Warn {
+				t.Fatalf("strict %v: profile check %+v", strict, c)
+			}
+		}
+	}
+}
+
+func TestEvaluateFirewallDockerMessages(t *testing.T) {
+	const networks = "Docker networks docker0, br-3f1c2a9b7d01: published container ports are reachable through the VPN after meshly allow <port>; containers reach the other node like programs on this host"
+	const noBridge = "Docker rules found but no Docker bridge network (docker0, br-<id>): containers on networks with custom bridge names cannot use the VPN"
+	tests := []struct {
+		name string
+		a    nft.Analysis
+		want []Check
+	}{
+		{"no Docker", nft.Analysis{}, nil},
+		{"Docker networks", nft.Analysis{DockerDetected: true, DNATRules: 3, DockerBridges: []string{"docker0", "br-3f1c2a9b7d01"}},
+			[]Check{{ID: "docker", Status: Info, Detail: networks}}},
+		{"Docker rules without a bridge", nft.Analysis{DockerDetected: true, DNATRules: 3},
+			[]Check{{ID: "docker", Status: Warn, Detail: noBridge}}},
+	}
+	for _, tt := range tests {
+		for _, strict := range []bool{true, false} {
+			r := &Report{}
+			a := tt.a
+			EvaluateFirewall(r, &a, model.ProfileNone, model.DefaultFirewallMark, strict)
+			var got []Check
+			for _, c := range r.Checks {
+				if c.ID == "docker" {
+					got = append(got, c)
+				}
+				if strings.Contains(c.Detail, "NOT reachable") {
+					t.Errorf("%s: old Docker text: %+v", tt.name, c)
+				}
+			}
+			if !slices.Equal(got, tt.want) || r.Error() != nil {
+				t.Errorf("%s, strict %v: docker checks %+v (error %v), want %+v", tt.name, strict, got, r.Error(), tt.want)
+			}
+		}
 	}
 }
