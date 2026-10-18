@@ -53,14 +53,13 @@ type Route struct {
 }
 
 // Sysctls are the per-interface (never global) settings Meshly applies:
-// no forwarding of packets received on the interface, strict reverse path
-// filtering, no redirects or source routing, IPv6 disabled on the
-// interface only.
+// strict reverse path filtering, no redirects or source routing, IPv6
+// disabled on the interface only. Forwarding (ForwardingSysctl) is set
+// apart: on only while the node has Docker networks.
 var Sysctls = []struct {
 	Path  string // relative to /proc/sys, with %s for the interface
 	Value string
 }{
-	{"net/ipv4/conf/%s/forwarding", "0"},
 	{"net/ipv4/conf/%s/rp_filter", "1"},
 	{"net/ipv4/conf/%s/accept_redirects", "0"},
 	{"net/ipv4/conf/%s/send_redirects", "0"},

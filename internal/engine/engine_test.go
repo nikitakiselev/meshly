@@ -80,17 +80,33 @@ func names(steps []Step) []string {
 	return n
 }
 
-func (v *env) plan(c *model.Config) []string {
+// desired derives the desired state of c on the fake node.
+func (v *env) desired(c *model.Config) *Desired {
 	v.t.Helper()
-	d, err := DesiredFrom(c, "meshly0")
+	env, err := v.e.Env()
 	if err != nil {
 		v.t.Fatal(err)
 	}
+	d, err := DesiredFrom(c, "meshly0", env)
+	if err != nil {
+		v.t.Fatal(err)
+	}
+	return d
+}
+
+func (v *env) planSteps(c *model.Config) ([]Step, error) {
+	v.t.Helper()
+	d := v.desired(c)
 	o, err := v.e.Observe(context.Background(), "meshly0")
 	if err != nil {
 		v.t.Fatal(err)
 	}
-	steps, err := v.e.Plan(d, o)
+	return v.e.Plan(d, o)
+}
+
+func (v *env) plan(c *model.Config) []string {
+	v.t.Helper()
+	steps, err := v.planSteps(c)
 	if err != nil {
 		v.t.Fatal(err)
 	}
@@ -102,6 +118,29 @@ func (v *env) commit(c *model.Config) {
 	if _, err := v.e.Execute(context.Background(), v.j, Op{Name: "init", Recovery: journal.Backward, Target: c}); err != nil {
 		v.t.Fatal(err)
 	}
+}
+
+// repair runs what the check timer runs for the saved configuration.
+func (v *env) repair() (*Result, error) {
+	v.t.Helper()
+	saved, err := v.paths.LoadConfig()
+	if err != nil {
+		v.t.Fatal(err)
+	}
+	return v.e.Execute(context.Background(), v.j, Op{Name: "check-repair", Recovery: journal.Backward, Base: saved, Target: saved.Clone()})
+}
+
+func (v *env) drift() string {
+	v.t.Helper()
+	saved, err := v.paths.LoadConfig()
+	if err != nil {
+		v.t.Fatal(err)
+	}
+	drift, err := v.e.Drift(context.Background(), saved)
+	if err != nil {
+		v.t.Fatal(err)
+	}
+	return strings.Join(drift, "\n")
 }
 
 // ---- tests ----
@@ -428,8 +467,7 @@ func TestRecoverDirections(t *testing.T) {
 		target.Revision = saved.Revision + 1
 		_ = v.j.Append(journal.Record{OpID: "op1", Event: journal.EventBegin, Op: "allow", Recovery: journal.Backward, Target: target, Interface: "meshly0", BaseRevision: saved.Revision})
 		// The firewall already has the new rule (crash after apply).
-		d, _ := DesiredFrom(target, "meshly0")
-		_ = v.e.applyFirewall(ctx, d.Firewall)
+		_ = v.e.applyFirewall(ctx, v.desired(target).Firewall)
 		rec, err := v.e.Recover(ctx, v.j)
 		if err != nil || rec.Mode != "rolled-back" {
 			t.Fatalf("%+v %v", rec, err)
@@ -477,7 +515,7 @@ func TestDriftDetected(t *testing.T) {
 	saved, _ := v.paths.LoadConfig()
 	v.k.Links["meshly0"].MTU = 1500
 	v.k.Tamper = true
-	v.k.Sysctl["meshly0"] = []string{"forwarding"}
+	v.k.Sysctl["meshly0"] = []string{"rp_filter"}
 	drift, err := v.e.Drift(context.Background(), saved)
 	if err != nil {
 		t.Fatal(err)
@@ -578,11 +616,7 @@ func TestOverlayPeerAndAllow(t *testing.T) {
 	if last := v.k.Scripts[len(v.k.Scripts)-1]; strings.Contains(last, "tcp . 51820") || strings.Contains(last, "tcp dport 51820") {
 		t.Fatalf("allow entry or its exclusive rule still present in:\n%s", last)
 	}
-	plain, err := DesiredFrom(c, "meshly0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if last := v.k.Scripts[len(v.k.Scripts)-1]; last != plain.Firewall.ApplyScript() {
+	if last := v.k.Scripts[len(v.k.Scripts)-1]; last != v.desired(c).Firewall.ApplyScript() {
 		t.Fatalf("the table without the overlay differs from the saved configuration's:\n%s", last)
 	}
 }
@@ -698,5 +732,251 @@ func TestInPlaceUpdateClearsPresharedKey(t *testing.T) {
 	}
 	if v.k.PresharedKey(p) != (wgtypes.Key{}) {
 		t.Fatal("preshared key survived an in-place update")
+	}
+}
+
+// ---- Docker ----
+
+var docker0 = netstack.Bridge{Name: "docker0", Prefixes: []netip.Prefix{netip.MustParsePrefix("172.17.0.0/16")}}
+
+// With Docker networks the routing to them is in place before the
+// interface exists; link.sysctl turns forwarding on after it.
+func TestDockerBringUpOrder(t *testing.T) {
+	v := newEnv(t)
+	v.k.Docker = []netstack.Bridge{docker0}
+	got := v.plan(v.config())
+	want := []string{"firewall.apply", "docker.routing", "link.create", "link.sysctl", "link.address", "wireguard.configure", "link.up", "routes.sync"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("plan %v, want %v", got, want)
+	}
+	v.commit(v.config())
+	if !v.k.Forward["meshly0"] || !v.k.Routing.Equal(netstack.WantDockerRouting("meshly0", v.k.Docker)) {
+		t.Fatalf("forwarding %v, routing %+v", v.k.Forward["meshly0"], v.k.Routing)
+	}
+	if s := v.k.Scripts[0]; !strings.Contains(s, "set docker_ifs") || !strings.Contains(s, `"docker0"`) {
+		t.Fatalf("firewall without the Docker network:\n%s", s)
+	}
+}
+
+// A Docker network that appears is drift that names it; the repair turns
+// forwarding on.
+func TestDockerNetworkAppearsIsDrift(t *testing.T) {
+	v := newEnv(t)
+	v.commit(v.config())
+	v.k.Docker = []netstack.Bridge{docker0}
+	drift := v.drift()
+	for _, want := range []string{
+		"Docker networks changed: +docker0",
+		"replace firewall table inet meshly atomically (Docker networks: docker0)",
+		"route traffic from meshly0 only to Docker networks: docker0 172.17.0.0/16",
+		"set per-interface sysctls (forwarding for Docker networks,",
+	} {
+		if !strings.Contains(drift, want) {
+			t.Fatalf("drift %q misses %q", drift, want)
+		}
+	}
+	if _, err := v.repair(); err != nil {
+		t.Fatal(err)
+	}
+	if drift := v.drift(); drift != "" {
+		t.Fatalf("drift after repair: %q", drift)
+	}
+	if !v.k.Forward["meshly0"] {
+		t.Fatal("forwarding off")
+	}
+}
+
+// When the last Docker network goes away, forwarding goes off first and the
+// routing goes last: invariant 7 holds again.
+func TestDockerLastNetworkGone(t *testing.T) {
+	v := newEnv(t)
+	v.k.Docker = []netstack.Bridge{docker0}
+	c := v.config()
+	v.commit(c)
+	v.k.Docker = nil
+	want := []string{"firewall.apply", "link.sysctl", "docker.routing"}
+	if got := v.plan(c); !slices.Equal(got, want) {
+		t.Fatalf("plan %v, want %v", got, want)
+	}
+	drift := v.drift()
+	for _, want := range []string{"Docker networks changed: -docker0", "(no forwarding,", "remove the Docker routing rule of meshly0"} {
+		if !strings.Contains(drift, want) {
+			t.Fatalf("drift %q misses %q", drift, want)
+		}
+	}
+	if _, err := v.repair(); err != nil {
+		t.Fatal(err)
+	}
+	if v.k.Forward["meshly0"] || !v.k.Routing.Empty() {
+		t.Fatalf("forwarding %v, routing %+v", v.k.Forward["meshly0"], v.k.Routing)
+	}
+	if last := v.k.Scripts[len(v.k.Scripts)-1]; strings.Contains(last, "docker_ifs") {
+		t.Fatalf("firewall still has Docker networks:\n%s", last)
+	}
+}
+
+func TestDockerTeardown(t *testing.T) {
+	v := newEnv(t)
+	v.k.Docker = []netstack.Bridge{docker0}
+	c := v.config()
+	v.commit(c)
+	down := c.Clone()
+	down.AdminState = model.AdminDown
+	want := []string{"link.down", "link.delete", "docker.routing", "firewall.remove"}
+	if got := v.plan(down); !slices.Equal(got, want) {
+		t.Fatalf("plan %v, want %v", got, want)
+	}
+	if _, err := v.e.Reconcile(context.Background(), down, "meshly0", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := v.k.Forward["meshly0"]; ok || !v.k.Routing.Empty() || v.k.Table != "" {
+		t.Fatalf("left after tear-down: forwarding %v, routing %+v, table %q", v.k.Forward, v.k.Routing, v.k.Table)
+	}
+}
+
+// Routes of another program in table 109 block Docker support, and only
+// it: without Docker networks meshly does not use the table.
+func TestDockerRoutingForeignConflict(t *testing.T) {
+	v := newEnv(t)
+	v.k.Routing.Foreign = 1
+	c := v.config()
+	if _, err := v.planSteps(c); err != nil {
+		t.Fatalf("without Docker: %v", err)
+	}
+	v.k.Docker = []netstack.Bridge{docker0}
+	if _, err := v.planSteps(c); !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "routing table 109") {
+		t.Fatalf("with Docker: %v", err)
+	}
+}
+
+// guardedLinks records every link operation after which forwarding is on
+// while the routing rule is missing.
+type guardedLinks struct {
+	LinkOps
+	bad []string
+}
+
+func (g *guardedLinks) ApplySysctls(name string, forwarding bool) error {
+	defer g.check("link.sysctl")
+	return g.LinkOps.ApplySysctls(name, forwarding)
+}
+
+func (g *guardedLinks) SyncDockerRouting(want netstack.DockerRouting) error {
+	defer g.check("docker.routing")
+	return g.LinkOps.SyncDockerRouting(want)
+}
+
+func (g *guardedLinks) check(op string) {
+	on, _ := g.LinkOps.Forwarding("meshly0")
+	r, _ := g.LinkOps.ObserveDockerRouting()
+	if on && !slices.Contains(r.Rules, netstack.PolicyRule{Iif: "meshly0", Table: netstack.RouteTable, Priority: netstack.RulePriority}) {
+		g.bad = append(g.bad, op)
+	}
+}
+
+// Forwarding is never on without the routing rule: not on the way up or
+// down, not when a step fails and the transaction rolls back or enters
+// safe mode.
+func TestForwardingNeverWithoutRouting(t *testing.T) {
+	v := newEnv(t)
+	g := &guardedLinks{LinkOps: v.e.Links}
+	v.e.Links = g
+	c := v.config()
+	v.commit(c)
+	v.k.Docker = []netstack.Bridge{docker0}
+	v.k.Fail("docker.routing", 2) // the repair and its rollback
+	_, err := v.repair()
+	var ae *ApplyError
+	if !errors.As(err, &ae) {
+		t.Fatalf("err = %v", err)
+	}
+	if v.k.Forward["meshly0"] && v.k.Routing.Empty() {
+		t.Fatal("forwarding on without the routing rule")
+	}
+
+	// Up again, then the last network goes while forwarding cannot be
+	// turned off once: rolled back, then repaired.
+	if _, err := v.repair(); err != nil {
+		t.Fatal(err)
+	}
+	v.k.Docker = nil
+	v.k.Fail("link.sysctl", 1)
+	if _, err := v.repair(); !errors.As(err, &ae) || !ae.RolledBack {
+		t.Fatalf("err = %v", err)
+	}
+	if v.k.Forward["meshly0"] || !v.k.Routing.Empty() {
+		t.Fatalf("after rollback: forwarding %v, routing %+v", v.k.Forward["meshly0"], v.k.Routing)
+	}
+
+	// Back, then stopped with a delete that fails once (the retry completes
+	// the stop).
+	v.k.Docker = []netstack.Bridge{docker0}
+	if _, err := v.repair(); err != nil {
+		t.Fatal(err)
+	}
+	saved, _ := v.paths.LoadConfig()
+	down := saved.Clone()
+	down.AdminState = model.AdminDown
+	v.k.Fail("link.delete", 1)
+	if _, err := v.e.Execute(context.Background(), v.j, Op{Name: "stop", Recovery: journal.Forward, Base: saved, Target: down}); err != nil {
+		t.Fatal(err)
+	}
+	if !v.k.Routing.Empty() {
+		t.Fatalf("routing after stop: %+v", v.k.Routing)
+	}
+	if len(g.bad) > 0 {
+		t.Fatalf("forwarding on without the routing rule after %v", g.bad)
+	}
+}
+
+// Without Docker networks forwarding stays off: turned on outside meshly,
+// it is drift, and the repair turns it off.
+func TestForwardingDriftWithoutDocker(t *testing.T) {
+	v := newEnv(t)
+	c := v.config()
+	v.commit(c)
+	if v.k.Forward["meshly0"] || !v.k.Routing.Empty() {
+		t.Fatalf("forwarding %v, routing %+v", v.k.Forward["meshly0"], v.k.Routing)
+	}
+	v.k.Forward["meshly0"] = true
+	if got := v.plan(c); !slices.Equal(got, []string{"link.sysctl"}) {
+		t.Fatalf("plan %v", got)
+	}
+	if _, err := v.repair(); err != nil {
+		t.Fatal(err)
+	}
+	if v.k.Forward["meshly0"] {
+		t.Fatal("forwarding still on")
+	}
+}
+
+// With Docker networks the meshly rule also goes first into ip filter
+// FORWARD, and out of it with the last network.
+func TestDockerIptablesForward(t *testing.T) {
+	v := newEnv(t)
+	ufwHost(v.k)
+	v.k.AddIptables("ip", "FORWARD", "drop", 2)
+	v.k.Docker = []netstack.Bridge{docker0}
+	c := v.config()
+	want := []string{"firewall.apply", "iptables.integrate", "docker.routing", "link.create", "link.sysctl", "link.address", "wireguard.configure", "link.up", "routes.sync"}
+	if got := v.plan(c); !slices.Equal(got, want) {
+		t.Fatalf("plan %v, want %v", got, want)
+	}
+	v.commit(c)
+	if rs := v.k.IptablesRules("ip", "FORWARD"); !slices.Equal(ours(rs), []int{0}) || rs[0].Mark != model.DefaultFirewallMark || len(rs) != 3 {
+		t.Fatalf("ip filter FORWARD: %+v", rs)
+	}
+	v.k.Docker = nil
+	if drift := v.drift(); !strings.Contains(drift, "remove the meshly rule from iptables chain(s) ip filter FORWARD") {
+		t.Fatalf("drift %q", drift)
+	}
+	if _, err := v.repair(); err != nil {
+		t.Fatal(err)
+	}
+	if rs := v.k.IptablesRules("ip", "FORWARD"); len(ours(rs)) != 0 || len(rs) != 2 {
+		t.Fatalf("ip filter FORWARD without Docker: %+v", rs)
+	}
+	if got := ours(v.k.IptablesRules("ip", "INPUT")); !slices.Equal(got, []int{0}) {
+		t.Fatalf("ip filter INPUT: %v", got)
 	}
 }

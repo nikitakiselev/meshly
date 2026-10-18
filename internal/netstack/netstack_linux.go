@@ -253,11 +253,20 @@ func ipnet(p netip.Prefix) *net.IPNet {
 	return &net.IPNet{IP: p.Addr().AsSlice(), Mask: net.CIDRMask(p.Bits(), p.Addr().BitLen())}
 }
 
-// ApplySysctls writes the per-interface sysctls. IPv6 keys are skipped
-// when IPv6 is not available.
-func (n *Netlink) ApplySysctls(name string) error {
+// ApplySysctls writes forwarding (on only while the node has Docker
+// networks) and the per-interface sysctls. IPv6 keys are skipped when IPv6
+// is not available.
+func (n *Netlink) ApplySysctls(name string, forwarding bool) error {
 	if err := model.ValidateInterfaceName(name); err != nil {
 		return err
+	}
+	fwd := "0"
+	if forwarding {
+		fwd = "1"
+	}
+	p := filepath.Join(n.ProcSys, fmt.Sprintf(ForwardingSysctl, name))
+	if err := os.WriteFile(p, []byte(fwd), 0o644); err != nil {
+		return fmt.Errorf("sysctl %s: %w", p, err)
 	}
 	for _, s := range Sysctls {
 		p := filepath.Join(n.ProcSys, fmt.Sprintf(s.Path, name))
@@ -273,7 +282,8 @@ func (n *Netlink) ApplySysctls(name string) error {
 	return nil
 }
 
-// SysctlsOK reports per-interface sysctls that differ from Meshly's values.
+// SysctlsOK reports per-interface sysctls that differ from Meshly's values
+// (forwarding aside: see Forwarding).
 func (n *Netlink) SysctlsOK(name string) []string {
 	var bad []string
 	for _, s := range Sysctls {

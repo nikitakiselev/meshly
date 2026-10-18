@@ -1,25 +1,30 @@
 // Package engine turns a desired configuration into kernel state.
 //
-// It observes the OS (interface, WireGuard, routes, nftables), builds an
-// ordered plan, applies it inside a journaled transaction, verifies the
-// result and either commits, rolls back or enters safe mode. Ordering
-// invariants:
+// It observes the OS (interface, WireGuard, routes, nftables, Docker
+// bridges, policy routing), builds an ordered plan, applies it inside a
+// journaled transaction, verifies the result and either commits, rolls
+// back or enters safe mode. Ordering invariants:
 //
 //   - bring-up: firewall first (the table, then Meshly's rule in the
-//     iptables chains), then interface, addresses, WireGuard peers, link
-//     up, routes — protection exists before any traffic path;
+//     iptables chains), then the routing to Docker networks, interface,
+//     sysctls (forwarding), addresses, WireGuard peers, link up, routes —
+//     protection exists before any traffic path;
 //   - tear-down: traffic path first (interface with its peers and routes),
-//     then Meshly's rule in the iptables chains, protective firewall table
-//     last.
+//     then Meshly's rule in the iptables chains, the routing to Docker
+//     networks, protective firewall table last;
+//   - forwarding is on only after the routing rule exists and goes off
+//     before it is removed.
 package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"net/netip"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/nikitakiselev/meshly/internal/model"
@@ -41,8 +46,12 @@ type LinkOps interface {
 	SetAlias(name, alias string) error
 	SyncAddrs(name string, want netip.Prefix) error
 	SyncRoutes(name string, want []netstack.Route) error
-	ApplySysctls(name string) error
+	ApplySysctls(name string, forwarding bool) error
 	SysctlsOK(name string) []string
+	Forwarding(name string) (bool, error)
+	DockerBridges() ([]netstack.Bridge, error)
+	ObserveDockerRouting() (netstack.DockerRouting, error)
+	SyncDockerRouting(want netstack.DockerRouting) error
 }
 
 // WGOps manages WireGuard (implemented by wg.Kernel).
@@ -78,6 +87,17 @@ type Desired struct {
 	Firewall   nft.Rendered
 	// PrivateKey replaces the key file when set (overlay only).
 	PrivateKey *wgtypes.Key
+	// Docker are the node's Docker bridges. While the interface may exist,
+	// they turn Forwarding on and need Routing.
+	Docker     []netstack.Bridge
+	Forwarding bool
+	Routing    netstack.DockerRouting
+}
+
+// Env is the part of the desired state taken from the node, not from the
+// config.
+type Env struct {
+	Docker []netstack.Bridge
 }
 
 // Overlay is temporary kernel state applied on top of a config. It is
@@ -91,27 +111,29 @@ type Overlay struct {
 	PrivateKey *wgtypes.Key // replaces the key file (nil: use it)
 }
 
-// DesiredFrom derives desired state; a nil config or admin state "down"
-// means nothing may exist. ifname names the interface to tear down when
-// the config is nil.
-func DesiredFrom(cfg *model.Config, ifname string) (*Desired, error) {
-	return DesiredWith(cfg, ifname, nil)
+// DesiredFrom derives desired state from cfg and the node's env; a nil
+// config or admin state "down" means nothing may exist. ifname names the
+// interface to tear down when the config is nil.
+func DesiredFrom(cfg *model.Config, ifname string, env Env) (*Desired, error) {
+	return DesiredWith(cfg, ifname, nil, env)
 }
 
 // DesiredWith derives desired state with a temporary overlay on top of cfg
 // (nil: none). The overlay is ignored when nothing may exist.
-func DesiredWith(cfg *model.Config, ifname string, ov *Overlay) (*Desired, error) {
+func DesiredWith(cfg *model.Config, ifname string, ov *Overlay, env Env) (*Desired, error) {
 	if cfg == nil {
 		if ifname == "" {
 			ifname = model.DefaultInterface
 		}
-		return &Desired{Interface: ifname}, nil
+		return &Desired{Interface: ifname, Docker: env.Docker}, nil
 	}
-	d := &Desired{Config: cfg, Interface: cfg.Interface.Name}
+	d := &Desired{Config: cfg, Interface: cfg.Interface.Name, Docker: env.Docker}
 	if cfg.AdminState != model.AdminUp {
 		return d, nil
 	}
 	d.Present = true
+	d.Forwarding = len(d.Docker) > 0
+	d.Routing = netstack.WantDockerRouting(d.Interface, d.Docker)
 	d.Alias = netstack.Alias(cfg.Network.ID)
 	d.MTU = cfg.Interface.MTU
 	d.Address = netip.PrefixFrom(cfg.Self.Address, 32)
@@ -127,6 +149,9 @@ func DesiredWith(cfg *model.Config, ifname string, ov *Overlay) (*Desired, error
 		d.Routes = append(d.Routes, netstack.Route{Dst: netip.PrefixFrom(p.Address, 32), Src: cfg.Self.Address})
 	}
 	in := nft.InputFromConfig(cfg, false)
+	for _, b := range d.Docker {
+		in.Docker = append(in.Docker, b.Name)
+	}
 	if ov != nil {
 		if ov.Peer != nil {
 			d.Peers = append(d.Peers, *ov.Peer)
@@ -156,12 +181,16 @@ type Observed struct {
 	Link         netstack.Link
 	WG           *wg.Device
 	SysctlIssues []string
+	Forwarding   bool
+	Routing      netstack.DockerRouting
 	Ruleset      *nft.Ruleset
 	TablePresent bool
 	TableOwned   bool
 	MarkerHash   string
 	LiveHash     string
 	RecordedHash string
+	// TableDocker are the Docker networks of the live table.
+	TableDocker []string
 }
 
 // Engine executes plans.
@@ -182,6 +211,24 @@ func (e *Engine) progress(format string, a ...any) {
 	}
 }
 
+// Env reads the node's part of the desired state.
+func (e *Engine) Env() (Env, error) {
+	b, err := e.Links.DockerBridges()
+	if err != nil {
+		return Env{}, fmt.Errorf("find Docker networks: %w", err)
+	}
+	return Env{Docker: b}, nil
+}
+
+// desired derives the desired state of cfg plus ov on this node.
+func (e *Engine) desired(cfg *model.Config, ifname string, ov *Overlay) (*Desired, error) {
+	env, err := e.Env()
+	if err != nil {
+		return nil, err
+	}
+	return DesiredWith(cfg, ifname, ov, env)
+}
+
 // Observe reads the kernel state relevant for interface ifname.
 func (e *Engine) Observe(ctx context.Context, ifname string) (*Observed, error) {
 	o := &Observed{}
@@ -195,6 +242,12 @@ func (e *Engine) Observe(ctx context.Context, ifname string) (*Observed, error) 
 			return nil, err
 		}
 		o.SysctlIssues = e.Links.SysctlsOK(ifname)
+		if o.Forwarding, err = e.Links.Forwarding(ifname); err != nil {
+			return nil, err
+		}
+	}
+	if o.Routing, err = e.Links.ObserveDockerRouting(); err != nil {
+		return nil, err
 	}
 	rs, err := e.FW.ListRuleset(ctx)
 	if err != nil {
@@ -205,11 +258,29 @@ func (e *Engine) Observe(ctx context.Context, ifname string) (*Observed, error) 
 		o.TablePresent = true
 		_, o.MarkerHash, o.TableOwned = t.Marker()
 		o.LiveHash = t.ContentHash()
+		o.TableDocker = dockerIfs(t)
 	}
 	if rt, err := e.Paths.LoadRuntime(); err == nil {
 		o.RecordedHash = rt.FirewallLiveHash
 	}
 	return o, nil
+}
+
+// dockerIfs returns the elements of set docker_ifs of the meshly table.
+func dockerIfs(t *nft.Ruleset) []string {
+	var out []string
+	for _, s := range t.Sets {
+		if s.Name != "docker_ifs" {
+			continue
+		}
+		for _, raw := range s.Elem {
+			var n string
+			if json.Unmarshal(raw, &n) == nil {
+				out = append(out, n)
+			}
+		}
+	}
+	return out
 }
 
 // Step is one plan item.
@@ -230,6 +301,10 @@ func (e *Engine) Plan(d *Desired, o *Observed) ([]Step, error) {
 	if o.TablePresent && !o.TableOwned {
 		return nil, fmt.Errorf("%w: nftables table inet %s exists but has no meshly ownership marker; rename or remove it", ErrConflict, nft.TableName)
 	}
+	docker := len(d.Docker) > 0
+	if o.Routing.Foreign > 0 && docker {
+		return nil, fmt.Errorf("%w: routing table %d has routes that meshly did not create; meshly needs this table for Docker networks", ErrConflict, netstack.RouteTable)
+	}
 	var steps []Step
 	name := d.Interface
 	fwStale := !o.TablePresent || o.MarkerHash != d.Firewall.Hash || o.LiveHash != o.RecordedHash
@@ -241,14 +316,23 @@ func (e *Engine) Plan(d *Desired, o *Observed) ([]Step, error) {
 		case o.TablePresent:
 			desc = "replace firewall table inet meshly atomically"
 		}
+		if docker {
+			desc += " (Docker networks: " + bridgeNames(d.Docker) + ")"
+		}
 		fw := d.Firewall
 		steps = append(steps, Step{Name: "firewall.apply", Desc: desc, run: func(ctx context.Context) error { return e.applyFirewall(ctx, fw) }})
 	}
-	if ipt := pendingIptables(o, d.Config.Firewall.Mark); len(ipt) > 0 {
+	if ipt := pendingIptables(o, d.Config.Firewall.Mark, docker); len(ipt) > 0 {
 		mark := d.Config.Firewall.Mark
-		steps = append(steps, Step{Name: "iptables.integrate", Desc: "put the meshly rule at the top of iptables chain(s) " + nft.IptablesNames(ipt), run: func(ctx context.Context) error {
-			return e.integrateIptables(ctx, mark)
+		steps = append(steps, Step{Name: "iptables.integrate", Desc: iptablesDesc(ipt), run: func(ctx context.Context) error {
+			return e.integrateIptables(ctx, mark, docker)
 		}})
+	}
+	// The routing rule exists before forwarding goes on (link.sysctl) and
+	// goes after forwarding is off: the last step.
+	routing := !o.Routing.Equal(d.Routing)
+	if routing && !d.Routing.Empty() {
+		steps = append(steps, e.routingStep(name, d.Routing, d.Docker))
 	}
 	created := !o.Link.Exists
 	if created {
@@ -263,8 +347,14 @@ func (e *Engine) Plan(d *Desired, o *Observed) ([]Step, error) {
 			steps = append(steps, Step{Name: "link.mtu", Desc: fmt.Sprintf("set mtu of %s to %d", name, d.MTU), run: func(context.Context) error { return e.Links.SetMTU(name, d.MTU) }})
 		}
 	}
-	if created || len(o.SysctlIssues) > 0 {
-		steps = append(steps, Step{Name: "link.sysctl", Desc: "set per-interface sysctls (no forwarding, strict rp_filter, no IPv6)", run: func(context.Context) error { return e.Links.ApplySysctls(name) }})
+	if created || len(o.SysctlIssues) > 0 || o.Forwarding != d.Forwarding {
+		fwd := "no forwarding"
+		if d.Forwarding {
+			fwd = "forwarding for Docker networks"
+		}
+		steps = append(steps, Step{Name: "link.sysctl", Desc: "set per-interface sysctls (" + fwd + ", strict rp_filter, no IPv6)", run: func(context.Context) error {
+			return e.Links.ApplySysctls(name, d.Forwarding)
+		}})
 	}
 	if created || !slices.Equal(o.Link.Addrs, []netip.Prefix{d.Address}) {
 		steps = append(steps, Step{Name: "link.address", Desc: fmt.Sprintf("set address %s on %s", d.Address, name), run: func(context.Context) error { return e.Links.SyncAddrs(name, d.Address) }})
@@ -278,7 +368,62 @@ func (e *Engine) Plan(d *Desired, o *Observed) ([]Step, error) {
 	if (created && len(d.Routes) > 0) || (!created && !sameRoutes(o.Link.Routes, d.Routes)) {
 		steps = append(steps, Step{Name: "routes.sync", Desc: routesDesc(name, d.Routes), run: func(context.Context) error { return e.Links.SyncRoutes(name, d.Routes) }})
 	}
+	if routing && d.Routing.Empty() {
+		steps = append(steps, e.routingStep(name, d.Routing, nil))
+	}
 	return steps, nil
+}
+
+// routingStep makes want the policy routing for the Docker bridges.
+func (e *Engine) routingStep(name string, want netstack.DockerRouting, docker []netstack.Bridge) Step {
+	desc := "remove the Docker routing rule of " + name
+	if !want.Empty() {
+		var nets []string
+		for _, b := range docker {
+			nets = append(nets, strings.Join(append([]string{b.Name}, prefixStrings(b.Prefixes)...), " "))
+		}
+		desc = "route traffic from " + name + " only to Docker networks: " + strings.Join(nets, ", ")
+	}
+	return Step{Name: "docker.routing", Desc: desc, run: func(context.Context) error { return e.Links.SyncDockerRouting(want) }}
+}
+
+func prefixStrings(ps []netip.Prefix) []string {
+	var out []string
+	for _, p := range ps {
+		out = append(out, p.String())
+	}
+	return out
+}
+
+func bridgeNames(bs []netstack.Bridge) string {
+	var out []string
+	for _, b := range bs {
+		out = append(out, b.Name)
+	}
+	return strings.Join(out, ", ")
+}
+
+// dockerChange names the Docker networks that appeared (+) and went away
+// (-) since the live table was applied, or returns "".
+func dockerChange(d *Desired, o *Observed) string {
+	if !d.Present || !o.TablePresent || !o.TableOwned {
+		return ""
+	}
+	var ch []string
+	for _, b := range d.Docker {
+		if !slices.Contains(o.TableDocker, b.Name) {
+			ch = append(ch, "+"+b.Name)
+		}
+	}
+	for _, n := range o.TableDocker {
+		if !slices.ContainsFunc(d.Docker, func(b netstack.Bridge) bool { return b.Name == n }) {
+			ch = append(ch, "-"+n)
+		}
+	}
+	if len(ch) == 0 {
+		return ""
+	}
+	return "Docker networks changed: " + strings.Join(ch, ", ")
 }
 
 func (e *Engine) planTeardown(d *Desired, o *Observed) []Step {
@@ -302,6 +447,9 @@ func (e *Engine) planTeardown(d *Desired, o *Observed) []Step {
 			}
 			return nil
 		}})
+	}
+	if !o.Routing.Empty() {
+		steps = append(steps, e.routingStep(name, netstack.DockerRouting{}, nil))
 	}
 	if o.TablePresent && o.TableOwned {
 		steps = append(steps, Step{Name: "firewall.remove", Desc: "remove firewall table inet meshly", run: func(ctx context.Context) error {
@@ -347,18 +495,40 @@ func (e *Engine) applyFirewall(ctx context.Context, fw nft.Rendered) error {
 }
 
 // pendingIptables lists the iptables chains whose meshly rule is missing,
-// misplaced or duplicated.
-func pendingIptables(o *Observed, mark uint32) []nft.IptablesChain {
+// misplaced, duplicated or left over; docker tells whether the node has
+// Docker networks.
+func pendingIptables(o *Observed, mark uint32, docker bool) []nft.IptablesChain {
 	if o.Ruleset == nil {
 		return nil
 	}
 	var out []nft.IptablesChain
-	for _, c := range o.Ruleset.IptablesChains(mark, false) {
+	for _, c := range o.Ruleset.IptablesChains(mark, docker) {
 		if !c.OK() {
 			out = append(out, c)
 		}
 	}
 	return out
+}
+
+// iptablesDesc describes the repair of pending chains: the rule goes to
+// the top of the chains that need it and out of the others.
+func iptablesDesc(chains []nft.IptablesChain) string {
+	var put, drop []nft.IptablesChain
+	for _, c := range chains {
+		if c.Needed {
+			put = append(put, c)
+		} else {
+			drop = append(drop, c)
+		}
+	}
+	var s []string
+	if len(put) > 0 {
+		s = append(s, "put the meshly rule at the top of iptables chain(s) "+nft.IptablesNames(put))
+	}
+	if len(drop) > 0 {
+		s = append(s, "remove the meshly rule from iptables chain(s) "+nft.IptablesNames(drop))
+	}
+	return strings.Join(s, "; ")
 }
 
 // iptablesWithOurs lists the iptables chains that contain a meshly rule.
@@ -375,15 +545,15 @@ func iptablesWithOurs(o *Observed) []nft.IptablesChain {
 	return out
 }
 
-// integrateIptables puts the meshly rule first in the iptables chains. The
-// ruleset is read again here: iptables or UFW may have changed the chains
-// since the plan was made.
-func (e *Engine) integrateIptables(ctx context.Context, mark uint32) error {
+// integrateIptables puts the meshly rule first in the iptables chains that
+// need it. The ruleset is read again here: iptables, UFW or Docker may have
+// changed the chains since the plan was made.
+func (e *Engine) integrateIptables(ctx context.Context, mark uint32, docker bool) error {
 	rs, err := e.FW.ListRuleset(ctx)
 	if err != nil {
 		return err
 	}
-	script := nft.IptablesScript(rs.IptablesChains(mark, false), mark)
+	script := nft.IptablesScript(rs.IptablesChains(mark, docker), mark)
 	if script == "" {
 		return nil
 	}
@@ -527,7 +697,7 @@ func (e *Engine) run(ctx context.Context, steps []Step, hook func(Step) error) e
 // Reconcile applies cfg without journaling (used inside transactions and
 // recovery) and verifies the result.
 func (e *Engine) Reconcile(ctx context.Context, cfg *model.Config, ifname string, hook func(Step) error) ([]Step, error) {
-	d, err := DesiredFrom(cfg, ifname)
+	d, err := e.desired(cfg, ifname, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -553,7 +723,7 @@ func (e *Engine) reconcileTo(ctx context.Context, d *Desired, hook func(Step) er
 // it. On failure it restores cfg without the overlay and returns the
 // original error. Removing the overlay is a plain Reconcile(cfg).
 func (e *Engine) ApplyOverlay(ctx context.Context, cfg *model.Config, ifname string, ov *Overlay) error {
-	d, err := DesiredWith(cfg, ifname, ov)
+	d, err := e.desired(cfg, ifname, ov)
 	if err == nil {
 		_, err = e.reconcileTo(ctx, d, nil)
 	}
@@ -585,9 +755,10 @@ func (e *Engine) Verify(ctx context.Context, d *Desired) error {
 	return nil
 }
 
-// Drift describes differences between desired and observed state.
+// Drift describes differences between desired and observed state, first
+// the Docker networks that appeared or went away.
 func (e *Engine) Drift(ctx context.Context, cfg *model.Config) ([]string, error) {
-	d, err := DesiredFrom(cfg, "")
+	d, err := e.desired(cfg, "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -600,6 +771,9 @@ func (e *Engine) Drift(ctx context.Context, cfg *model.Config) ([]string, error)
 		return []string{err.Error()}, nil
 	}
 	var out []string
+	if ch := dockerChange(d, o); ch != "" && len(steps) > 0 {
+		out = append(out, ch)
+	}
 	for _, s := range steps {
 		out = append(out, s.Desc)
 	}

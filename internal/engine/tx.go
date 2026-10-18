@@ -87,7 +87,7 @@ func SameConfig(a, b *model.Config) bool {
 
 // Preview computes the plan of op without changing anything.
 func (e *Engine) Preview(ctx context.Context, op Op) (*Desired, []Step, error) {
-	d, err := DesiredWith(op.Target, ifnameOf(op.Target, op.Base), op.Overlay)
+	d, err := e.desired(op.Target, ifnameOf(op.Target, op.Base), op.Overlay)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -120,7 +120,7 @@ func (e *Engine) Execute(ctx context.Context, j *journal.Journal, op Op) (*Resul
 			return nil, fmt.Errorf("invalid target configuration: %w", err)
 		}
 	}
-	d, err := DesiredWith(op.Target, ifname, op.Overlay)
+	d, err := e.desired(op.Target, ifname, op.Overlay)
 	if err != nil {
 		return nil, err
 	}

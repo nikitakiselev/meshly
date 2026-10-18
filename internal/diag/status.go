@@ -9,12 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/nikitakiselev/meshly/internal/engine"
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/lock"
 	"github.com/nikitakiselev/meshly/internal/model"
+	"github.com/nikitakiselev/meshly/internal/netstack"
 	"github.com/nikitakiselev/meshly/internal/nft"
 	"github.com/nikitakiselev/meshly/internal/store"
 	"github.com/nikitakiselev/meshly/internal/systemd"
@@ -230,14 +232,25 @@ func Collect(ctx context.Context, d Deps) *Status {
 		st.Errors = append(st.Errors, "observe: "+err.Error())
 		return st
 	}
-	desired, err := engine.DesiredFrom(cfg, "")
+	env, err := d.Engine.Env()
+	if err != nil {
+		st.Errors = append(st.Errors, err.Error())
+	}
+	desired, err := engine.DesiredFrom(cfg, "", env)
 	if err != nil {
 		st.Errors = append(st.Errors, err.Error())
 		return st
 	}
 	st.Interface = &InterfaceInfo{
 		Name: cfg.Interface.Name, Exists: obs.Link.Exists, Owned: obs.Link.Owned(), Up: obs.Link.Up, MTU: obs.Link.MTU,
-		Addresses: []string{}, ForeignRoutes: obs.Link.ForeignRoutes, SysctlDeviation: obs.SysctlIssues,
+		Addresses: []string{}, ForeignRoutes: obs.Link.ForeignRoutes, SysctlDeviation: slices.Clone(obs.SysctlIssues),
+	}
+	if obs.Link.Owned() && obs.Forwarding != desired.Forwarding {
+		v := "0"
+		if obs.Forwarding {
+			v = "1"
+		}
+		st.Interface.SysctlDeviation = append(st.Interface.SysctlDeviation, fmt.Sprintf(netstack.ForwardingSysctl, cfg.Interface.Name)+"="+v)
 	}
 	for _, a := range obs.Link.Addrs {
 		st.Interface.Addresses = append(st.Interface.Addresses, a.String())
@@ -262,7 +275,7 @@ func Collect(ctx context.Context, d Deps) *Status {
 			fw.DeniedPkts = &n
 		}
 	}
-	for _, c := range obs.Ruleset.IptablesChains(cfg.Firewall.Mark, false) {
+	for _, c := range obs.Ruleset.IptablesChains(cfg.Firewall.Mark, len(desired.Docker) > 0) {
 		// A stopped link has no rule on purpose; a leftover shows as drift.
 		if c.Needed && desired.Present {
 			fw.Iptables = append(fw.Iptables, IptablesInfo{Chain: c.String(), RulePresent: len(c.Ours) > 0, RuleFirst: c.First})

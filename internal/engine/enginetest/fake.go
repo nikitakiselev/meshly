@@ -1,9 +1,11 @@
 // Package enginetest provides an in-memory kernel (links, WireGuard,
-// nftables) for unit tests of the engine and the CLI.
+// nftables, Docker bridges and policy routing) for unit tests of the
+// engine and the CLI.
 package enginetest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -47,6 +49,14 @@ type Kernel struct {
 	// Iptables are built-in chains of iptables-nft filter tables.
 	Iptables []*IptablesChain
 	handle   int
+	// Docker are the Docker bridges of the node.
+	Docker []netstack.Bridge
+	// Forward is the forwarding sysctl per interface.
+	Forward map[string]bool
+	// Routing is meshly's policy routing; Foreign is kept by a sync.
+	Routing netstack.DockerRouting
+	// dockerIfs are the elements of set docker_ifs of the meshly table.
+	dockerIfs []string
 }
 
 // IptablesChain is a built-in chain of table "ip filter" or "ip6 filter"
@@ -111,14 +121,15 @@ func (k *Kernel) iptablesChain(family, chain string) *IptablesChain {
 func New() *Kernel {
 	return &Kernel{
 		Links: map[string]*netstack.Link{}, Sysctl: map[string][]string{}, Devs: map[string]*wg.Device{}, psks: map[string]wgtypes.Key{},
-		failOn: map[string]int{}, after: map[string]int{}, cascade: map[string]string{}, Version: "nftables v1.0.6 (Lester Gooch #5)",
+		Forward: map[string]bool{}, failOn: map[string]int{}, after: map[string]int{}, cascade: map[string]string{}, Version: "nftables v1.0.6 (Lester Gooch #5)",
 	}
 }
 
 // Fail makes the next n calls of op fail (n < 0: always). Ops are
 // link.create, link.delete, link.up, link.down, link.mtu, link.alias,
-// link.address, routes.sync, link.sysctl, wireguard.configure, nft.check,
-// nft.apply, iptables.check, iptables.apply.
+// link.address, routes.sync, link.sysctl, docker.routing,
+// wireguard.configure, nft.check, nft.apply, iptables.check,
+// iptables.apply.
 func (k *Kernel) Fail(op string, n int) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -180,7 +191,7 @@ func (f *Links) Create(name string, mtu int, alias string) error {
 		return err
 	}
 	f.k.Links[name] = &netstack.Link{Exists: true, Type: "wireguard", Alias: alias, MTU: mtu}
-	f.k.Sysctl[name] = []string{"forwarding"}
+	f.k.Sysctl[name] = []string{"rp_filter"}
 	f.k.Devs[name] = &wg.Device{}
 	return nil
 }
@@ -192,6 +203,7 @@ func (f *Links) Delete(name string) error {
 		return err
 	}
 	delete(f.k.Links, name)
+	delete(f.k.Forward, name)
 	if d := f.k.Devs[name]; d != nil {
 		for _, p := range d.Peers {
 			delete(f.k.psks, p.PublicKey)
@@ -240,13 +252,47 @@ func (f *Links) SyncRoutes(n string, r []netstack.Route) error {
 	return f.set("routes.sync", n, func(l *netstack.Link) { l.Routes = slices.Clone(r) })
 }
 
-func (f *Links) ApplySysctls(n string) error {
+func (f *Links) ApplySysctls(n string, forwarding bool) error {
 	f.k.mu.Lock()
 	defer f.k.mu.Unlock()
 	if err := f.k.call("link.sysctl"); err != nil {
 		return err
 	}
 	f.k.Sysctl[n] = nil
+	f.k.Forward[n] = forwarding
+	return nil
+}
+
+func (f *Links) Forwarding(n string) (bool, error) {
+	f.k.mu.Lock()
+	defer f.k.mu.Unlock()
+	return f.k.Forward[n], nil
+}
+
+func (f *Links) DockerBridges() ([]netstack.Bridge, error) {
+	f.k.mu.Lock()
+	defer f.k.mu.Unlock()
+	var out []netstack.Bridge
+	for _, b := range f.k.Docker {
+		out = append(out, netstack.Bridge{Name: b.Name, Prefixes: slices.Clone(b.Prefixes)})
+	}
+	return out, nil
+}
+
+func (f *Links) ObserveDockerRouting() (netstack.DockerRouting, error) {
+	f.k.mu.Lock()
+	defer f.k.mu.Unlock()
+	r := f.k.Routing
+	return netstack.DockerRouting{Rules: slices.Clone(r.Rules), Routes: slices.Clone(r.Routes), Foreign: r.Foreign}, nil
+}
+
+func (f *Links) SyncDockerRouting(want netstack.DockerRouting) error {
+	f.k.mu.Lock()
+	defer f.k.mu.Unlock()
+	if err := f.k.call("docker.routing"); err != nil {
+		return err
+	}
+	f.k.Routing = netstack.DockerRouting{Rules: slices.Clone(want.Rules), Routes: slices.Clone(want.Routes), Foreign: f.k.Routing.Foreign}
 	return nil
 }
 
@@ -372,7 +418,10 @@ func (k *Kernel) NFT() nft.Client { return nft.Client{R: runner{k}} }
 
 type runner struct{ k *Kernel }
 
-var markerRe = regexp.MustCompile(`meshly:v1 net=[0-9a-f]+ hash=[0-9a-f]+`)
+var (
+	markerRe    = regexp.MustCompile(`meshly:v1 net=[0-9a-f]+ hash=[0-9a-f]+`)
+	dockerIfsRe = regexp.MustCompile(`set docker_ifs \{\s*type ifname\s*elements = \{ ([^}]*) \}`)
+)
 
 func (r runner) Run(_ context.Context, stdin string, args ...string) ([]byte, error) {
 	k := r.k
@@ -407,11 +456,17 @@ func (r runner) Run(_ context.Context, stdin string, args ...string) ([]byte, er
 			return nil, err
 		}
 		k.Scripts = append(k.Scripts, stdin)
+		k.dockerIfs = nil
 		if stdin == nft.DeleteScript {
 			k.Table, k.Tamper = "", false
 			return nil, nil
 		}
 		k.Table, k.Tamper = markerRe.FindString(stdin), false
+		if m := dockerIfsRe.FindStringSubmatch(stdin); m != nil {
+			for _, e := range strings.Split(m[1], ", ") {
+				k.dockerIfs = append(k.dockerIfs, strings.Trim(e, `"`))
+			}
+		}
 		return nil, nil
 	case "-j list ruleset":
 		return []byte(k.rulesetJSON()), nil
@@ -502,6 +557,10 @@ func (k *Kernel) rulesetJSON() string {
 	}
 	if k.Table != "" {
 		objs = append(objs, fmt.Sprintf(`{"rule":{"family":"inet","table":"meshly","chain":"guard_pre","handle":3,"comment":%q,"expr":[{"accept":null}]}}`, k.Table))
+	}
+	if k.Table != "" && len(k.dockerIfs) > 0 {
+		elem, _ := json.Marshal(k.dockerIfs)
+		objs = append(objs, fmt.Sprintf(`{"set":{"family":"inet","table":"meshly","name":"docker_ifs","handle":4,"type":"ifname","elem":%s}}`, elem))
 	}
 	if k.Tamper {
 		objs = append(objs, `{"rule":{"family":"inet","table":"meshly","chain":"guard_pre","handle":9,"expr":[{"accept":null}]}}`)
