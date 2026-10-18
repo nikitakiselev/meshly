@@ -11,6 +11,7 @@ package netstack
 
 import (
 	"net/netip"
+	"slices"
 	"strings"
 )
 
@@ -65,4 +66,101 @@ var Sysctls = []struct {
 	{"net/ipv4/conf/%s/send_redirects", "0"},
 	{"net/ipv4/conf/%s/accept_source_route", "0"},
 	{"net/ipv6/conf/%s/disable_ipv6", "1"},
+}
+
+// ForwardingSysctl is the per-interface forwarding switch (%s: interface).
+const ForwardingSysctl = "net/ipv4/conf/%s/forwarding"
+
+// RouteTable and RulePriority identify Meshly's policy routing: packets
+// entering from the tunnel look up RouteTable, which only knows Docker
+// bridge subnets and an unreachable default.
+const (
+	RouteTable   = 109
+	RulePriority = 109
+)
+
+// Bridge is a Docker bridge with its masked IPv4 subnets (sorted, unique).
+type Bridge struct {
+	Name     string
+	Prefixes []netip.Prefix
+}
+
+// IsDockerBridge reports whether an interface of the given kind is
+// docker0 or a user-defined Docker network bridge (br-<12 hex digits>).
+func IsDockerBridge(name, kind string) bool {
+	if kind != "bridge" {
+		return false
+	}
+	if name == "docker0" {
+		return true
+	}
+	id, ok := strings.CutPrefix(name, "br-")
+	if !ok || len(id) != 12 {
+		return false
+	}
+	for _, c := range id {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// PolicyRule is "iif <Iif> lookup <Table>" at Priority.
+type PolicyRule struct {
+	Iif             string
+	Table, Priority int
+}
+
+// TableRoute is a route in RouteTable. An empty Dev means unreachable.
+type TableRoute struct {
+	Dst netip.Prefix
+	Dev string
+}
+
+// DockerRouting is the policy routing state: rules and RouteTable routes.
+type DockerRouting struct {
+	Rules  []PolicyRule
+	Routes []TableRoute
+	// Foreign counts RouteTable routes of another protocol (observed only).
+	Foreign int
+}
+
+// WantDockerRouting returns the routing for the bridges: nothing without
+// bridges, otherwise a rule for ifname, a route per subnet and an
+// unreachable default.
+func WantDockerRouting(ifname string, bridges []Bridge) DockerRouting {
+	if len(bridges) == 0 {
+		return DockerRouting{}
+	}
+	w := DockerRouting{Rules: []PolicyRule{{Iif: ifname, Table: RouteTable, Priority: RulePriority}}}
+	for _, b := range bridges {
+		for _, p := range b.Prefixes {
+			w.Routes = append(w.Routes, TableRoute{Dst: p, Dev: b.Name})
+		}
+	}
+	w.Routes = append(w.Routes, TableRoute{Dst: netip.PrefixFrom(netip.IPv4Unspecified(), 0)})
+	return w
+}
+
+// Equal compares rules and routes as sets; Foreign is ignored.
+func (r DockerRouting) Equal(o DockerRouting) bool {
+	return sameSet(r.Rules, o.Rules) && sameSet(r.Routes, o.Routes)
+}
+
+// Empty reports whether there are no rules and no routes.
+func (r DockerRouting) Empty() bool { return len(r.Rules) == 0 && len(r.Routes) == 0 }
+
+func sameSet[T comparable](a, b []T) bool {
+	for _, x := range a {
+		if !slices.Contains(b, x) {
+			return false
+		}
+	}
+	for _, x := range b {
+		if !slices.Contains(a, x) {
+			return false
+		}
+	}
+	return true
 }

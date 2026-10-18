@@ -9,6 +9,8 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 
 	"github.com/nikitakiselev/meshly/internal/model"
@@ -410,4 +412,181 @@ func (n *Netlink) LinkExists(name string) (exists, owned bool, kind string, err 
 		return false, false, "", err
 	}
 	return true, l.Type() == "wireguard" && IsOwnedAlias(l.Attrs().Alias), l.Type(), nil
+}
+
+// DockerBridges lists Docker bridges with their IPv4 subnets, by name.
+func (n *Netlink) DockerBridges() ([]Bridge, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return nil, fmt.Errorf("list links: %w", err)
+	}
+	var out []Bridge
+	for _, l := range links {
+		attrs := l.Attrs()
+		if !IsDockerBridge(attrs.Name, l.Type()) {
+			continue
+		}
+		addrs, err := netlink.AddrList(l, netlink.FAMILY_V4)
+		if err != nil {
+			return nil, fmt.Errorf("list addresses of %s: %w", attrs.Name, err)
+		}
+		b := Bridge{Name: attrs.Name}
+		for _, a := range addrs {
+			if p, ok := prefixOf(a.IPNet); ok && p.Addr().Is4() {
+				b.Prefixes = append(b.Prefixes, p.Masked())
+			}
+		}
+		sort.Slice(b.Prefixes, func(i, j int) bool {
+			return b.Prefixes[i].Addr().Less(b.Prefixes[j].Addr()) ||
+				b.Prefixes[i].Addr() == b.Prefixes[j].Addr() && b.Prefixes[i].Bits() < b.Prefixes[j].Bits()
+		})
+		b.Prefixes = slices.Compact(b.Prefixes)
+		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// Forwarding reads the per-interface forwarding sysctl. A missing file
+// (interface or IPv4 absent) counts as off.
+func (n *Netlink) Forwarding(name string) (bool, error) {
+	if err := model.ValidateInterfaceName(name); err != nil {
+		return false, err
+	}
+	b, err := os.ReadFile(filepath.Join(n.ProcSys, fmt.Sprintf(ForwardingSysctl, name)))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read forwarding of %s: %w", name, err)
+	}
+	return strings.TrimSpace(string(b)) == "1", nil
+}
+
+func tablePrefix(r netlink.Route) (netip.Prefix, bool) {
+	if r.Dst == nil {
+		return netip.PrefixFrom(netip.IPv4Unspecified(), 0), true
+	}
+	return prefixOf(r.Dst)
+}
+
+// ObserveDockerRouting reads Meshly's rules (RouteProtocol) and the routes
+// of RouteTable; routes of another protocol are only counted.
+func (n *Netlink) ObserveDockerRouting() (DockerRouting, error) {
+	var out DockerRouting
+	rules, err := netlink.RuleList(netlink.FAMILY_V4)
+	if err != nil {
+		return out, fmt.Errorf("list rules: %w", err)
+	}
+	for _, r := range rules {
+		if int(r.Protocol) != RouteProtocol {
+			continue
+		}
+		out.Rules = append(out.Rules, PolicyRule{Iif: r.IifName, Table: r.Table, Priority: r.Priority})
+	}
+	routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: RouteTable}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return out, fmt.Errorf("list routes of table %d: %w", RouteTable, err)
+	}
+	for _, r := range routes {
+		if int(r.Protocol) != RouteProtocol {
+			out.Foreign++
+			continue
+		}
+		dst, ok := tablePrefix(r)
+		if !ok {
+			continue
+		}
+		tr := TableRoute{Dst: dst}
+		if r.Type != unix.RTN_UNREACHABLE {
+			l, err := netlink.LinkByIndex(r.LinkIndex)
+			if err != nil {
+				return out, fmt.Errorf("read link %d: %w", r.LinkIndex, err)
+			}
+			tr.Dev = l.Attrs().Name
+		}
+		out.Routes = append(out.Routes, tr)
+	}
+	return out, nil
+}
+
+// SyncDockerRouting makes want the exact set of Meshly rules and routes
+// of RouteTable. Objects of other protocols are never touched.
+func (n *Netlink) SyncDockerRouting(want DockerRouting) error {
+	have, err := n.ObserveDockerRouting()
+	if err != nil {
+		return err
+	}
+	// Rules go before routes on removal and after them on addition, so the
+	// rule never selects a half-built table.
+	for _, r := range have.Rules {
+		if slices.Contains(want.Rules, r) {
+			continue
+		}
+		if err := netlink.RuleDel(policyRule(r)); err != nil {
+			return fmt.Errorf("remove rule iif %s lookup %d: %w", r.Iif, r.Table, err)
+		}
+	}
+	for _, r := range have.Routes {
+		if slices.Contains(want.Routes, r) {
+			continue
+		}
+		nr, err := tableRoute(r)
+		if err != nil {
+			return err
+		}
+		if err := netlink.RouteDel(nr); err != nil {
+			return fmt.Errorf("remove route %s from table %d: %w", r.Dst, RouteTable, err)
+		}
+	}
+	for _, r := range want.Routes {
+		if slices.Contains(have.Routes, r) {
+			continue
+		}
+		nr, err := tableRoute(r)
+		if err != nil {
+			return err
+		}
+		if err := netlink.RouteAdd(nr); err != nil {
+			return fmt.Errorf("add route %s to table %d: %w", r.Dst, RouteTable, err)
+		}
+	}
+	for _, r := range want.Rules {
+		if slices.Contains(have.Rules, r) {
+			continue
+		}
+		if err := netlink.RuleAdd(policyRule(r)); err != nil {
+			return fmt.Errorf("add rule iif %s lookup %d: %w", r.Iif, r.Table, err)
+		}
+	}
+	return nil
+}
+
+func policyRule(r PolicyRule) *netlink.Rule {
+	nr := netlink.NewRule()
+	nr.Family = netlink.FAMILY_V4
+	nr.IifName = r.Iif
+	nr.Table = r.Table
+	nr.Priority = r.Priority
+	nr.Protocol = RouteProtocol
+	return nr
+}
+
+func tableRoute(r TableRoute) (*netlink.Route, error) {
+	nr := &netlink.Route{
+		Dst:      ipnet(r.Dst),
+		Protocol: netlink.RouteProtocol(RouteProtocol),
+		Table:    RouteTable,
+	}
+	if r.Dev == "" {
+		nr.Type = unix.RTN_UNREACHABLE
+		return nr, nil
+	}
+	l, err := netlink.LinkByName(r.Dev)
+	if err != nil {
+		return nil, fmt.Errorf("link %s: %w", r.Dev, err)
+	}
+	nr.LinkIndex = l.Attrs().Index
+	nr.Scope = netlink.SCOPE_LINK
+	return nr, nil
 }
