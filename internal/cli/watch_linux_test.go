@@ -46,7 +46,10 @@ func startWatch(t *testing.T, n *testNode) *watchRun {
 	t.Helper()
 	w := &watchRun{t: t, events: make(chan struct{}, 1), cancels: make(chan context.CancelFunc, 1), done: make(chan struct{})}
 	w.subscribedAt.Store(-1)
-	n.app.WatchQuiet, n.app.WatchMax, n.app.WatchRetry = 20*time.Millisecond, 100*time.Millisecond, 30*time.Millisecond
+	if n.app.WatchQuiet == 0 {
+		n.app.WatchQuiet, n.app.WatchMax = 20*time.Millisecond, 100*time.Millisecond
+	}
+	n.app.WatchRetry = 30 * time.Millisecond
 	if n.app.WatchBackoff == 0 {
 		n.app.WatchBackoff = time.Hour
 	}
@@ -190,6 +193,9 @@ func TestServiceWatchAppliesDockerNetwork(t *testing.T) {
 func TestServiceWatchDebounce(t *testing.T) {
 	vps, _ := pair(t)
 	vps.k.AddIptables("ip", "FORWARD", "drop", 1)
+	// The burst takes some 50 ms; scheduling under -race on CI must not
+	// stretch a pause in it past the quiet time.
+	vps.app.WatchQuiet, vps.app.WatchMax = 200*time.Millisecond, 2*time.Second
 	w := startWatch(t, vps)
 	vps.k.SetDocker(docker0)
 	for i := range 20 {
@@ -204,10 +210,10 @@ func TestServiceWatchDebounce(t *testing.T) {
 		rs := vps.k.IptablesRules("ip", "FORWARD")
 		return len(rs) > 0 && rs[0].Comment == nft.IptablesComment
 	}
-	if !within(time.Second, func() bool { return dockerApplied(vps) && ours() }) {
+	if !within(2*vps.app.WatchMax, func() bool { return dockerApplied(vps) && ours() }) {
 		t.Fatalf("not applied: FORWARD %+v", vps.k.IptablesRules("ip", "FORWARD"))
 	}
-	time.Sleep(2 * vps.app.WatchMax)
+	time.Sleep(2 * vps.app.WatchQuiet)
 	if n := checkRepairs(t, vps, journal.EventBegin); n != 1 {
 		_, out := w.stop()
 		t.Fatalf("%d check-repair transactions, want 1\n%s", n, out)
