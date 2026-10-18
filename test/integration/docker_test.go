@@ -228,6 +228,34 @@ func TestDockerPublishedPort(t *testing.T) {
 			}
 		})
 
+		// Published on the VPN address only, as docs/firewall.md suggests:
+		// closed until allow, then open. Docker binds that address when the
+		// container starts, so while the link is stopped it cannot start.
+		// Docker 29 also disconnects a container whose start failed from its
+		// network, and starting it again runs it without one: it is created
+		// again, as the docs say.
+		l.Run("vpn-address", func(t *testing.T) {
+			const vpnURL = "http://10.100.0.1:9106/"
+			vps.ServeHTTP("vpn", "10.100.0.1:9106:8080")
+			if home.Connects("10.100.0.1", 9106) {
+				t.Fatal("a port published on the VPN address is reachable without allow")
+			}
+			vps.MustMeshly("allow", "9106/tcp", "from", "home")
+			if !home.FetchOK(vpnURL) {
+				t.Fatalf("allowed port published on the VPN address unreachable:\n%s", home.Sh("curl -m 3 -sS "+vpnURL))
+			}
+
+			vps.MustMeshly("stop")
+			r := vps.Docker("restart", "-t", "0", "vpn")
+			vps.MustMeshly("start")
+			if r.Code == 0 || !strings.Contains(r.Out+r.Err, "cannot assign requested address") {
+				t.Fatalf("restart of a container published on the VPN address with the link stopped: %s", r)
+			}
+			vps.MustDocker("rm", "-f", "vpn")
+			vps.ServeHTTP("vpn", "10.100.0.1:9106:8080")
+			home.WaitFor("port published on the VPN address after meshly start", 30*time.Second, func() bool { return home.FetchOK(vpnURL) })
+		})
+
 		// UDP like TCP. The flow from a fixed source port stays the same
 		// conntrack entry: deny stops it as well as new flows.
 		l.Run("udp", func(t *testing.T) {
