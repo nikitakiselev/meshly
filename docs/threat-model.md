@@ -446,8 +446,12 @@ an admin's `nft flush ruleset` can interfere with meshly's table.
   with `meshly allow`, and closes with `deny`; a container connects to the
   peer like a program on the node, to what the peer allows the node. The
   LAN, container addresses and ports without `allow` stay closed (see 2
-  and 3). All of this is verified with a real Docker daemon on Debian 12
-  and Ubuntu 24.04. *Integration:* `TestDockerPublishedPort`,
+  and 3). The tests run a real Docker daemon on Debian 12 and Ubuntu 24.04:
+  a port published on all addresses is closed until `allow`, open after
+  it, and closed again by `deny`, for an established TCP stream and a UDP
+  flow too; a port published on the VPN address is closed until `allow` and
+  open after it; a port published on `127.0.0.1` stays closed.
+  *Integration:* `TestDockerPublishedPort`,
   `TestDockerClient`, `TestDockerHostContained`, and with Docker's own
   firewall rules changing: `TestDockerNetworkLifecycle` (a new network works
   within seconds, a removed one is gone, and with the last one forwarding
@@ -523,11 +527,14 @@ an admin's `nft flush ruleset` can interfere with meshly's table.
   `meshly-watch.service` usually re-applies the table within seconds of the
   change. The window is not measured by the tests; only the restoration is.
   See [firewall.md](firewall.md).
-- **Docker's first start, before meshly follows it.** On its first start
-  Docker writes `net.ipv4.ip_forward=1`, which turns `forwarding` on for
-  every interface, the meshly interface included. Until
-  `meshly-watch.service` applies the new Docker network (about 1 to 5
-  seconds), there is no routing rule yet, so the second layer is missing.
+- **Docker turning on forwarding, before meshly follows it.** Docker
+  writes `net.ipv4.ip_forward=1` whenever it turns forwarding on: at its
+  first start after each boot, unless forwarding is already on (on a host
+  that does not set it at boot, that is every boot). The write turns
+  `forwarding` on for every interface, the meshly interface included, which
+  already exists then. Until the drop-in for `docker.service` or
+  `meshly-watch.service` applies the new Docker networks (about 1 to 5
+  seconds), there is no routing rule, so the second layer is missing.
   `guard_fwd` in table `inet meshly` keeps dropping all forwarding from and
   into the interface meanwhile, since the table has no Docker network yet.
   The window is not measured by the tests.

@@ -352,8 +352,8 @@ removes the meshly table.
 Until the table is back, the VPN is open to the peer without filtering with
 profile `none`, and closed with profile `nftables` (fail-closed; see
 [firewall.md](firewall.md)). On a node with Docker networks, ports that
-Docker publishes on all addresses are open to the peer meanwhile in either
-profile; the LAN stays closed
+Docker publishes on all addresses or on the VPN address are open to the
+peer meanwhile in either profile; the LAN stays closed
 ([firewall.md](firewall.md#when-the-table-disappears)). To avoid the window,
 replace `flush ruleset` in your own configuration with deleting only your
 own tables, for example `table inet filter` followed by

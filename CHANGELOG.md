@@ -25,8 +25,8 @@ on-disk formats.
     node's VPN address.
   - The LAN behind the node, container addresses and ports without `meshly allow` stay closed. The LAN stays closed
     also while the meshly table is missing: policy routing sends everything forwarded from the tunnel to a table that
-    knows only the Docker networks. Ports that Docker publishes on all addresses are open to the peer meanwhile, as
-    they are to the internet (see the [threat model](docs/threat-model.md)).
+    knows only the Docker networks. Ports that Docker publishes on all addresses or on the VPN address are open to
+    the peer meanwhile, as the former are to the internet (see the [threat model](docs/threat-model.md)).
   - meshly's rule also goes to the top of the iptables `FORWARD` chain. A forward chain of the host firewall that may
     drop container traffic is a warning in `doctor` with the fix, never a reason to refuse.
   - On a node without Docker networks nothing changes. See [docs/firewall.md](docs/firewall.md#docker).

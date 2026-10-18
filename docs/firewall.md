@@ -245,8 +245,9 @@ meshly sets these on `meshly0` only. It changes no global sysctl.
 | `net.ipv6.conf.meshly0.disable_ipv6` | `1` | No IPv6 inside the VPN (skipped when the host has no IPv6) |
 
 meshly turns `forwarding` on only after its routing rule exists, and off before it removes the rule. Writing the
-global `net.ipv4.ip_forward` sets `forwarding` on every interface, `meshly0` included; Docker does that on its first
-start (see [Docker](#docker)). Without Docker networks, meshly sees `forwarding=1` as drift and sets `0` again.
+global `net.ipv4.ip_forward` sets `forwarding` on every interface, `meshly0` included. Docker writes it whenever it
+turns forwarding on: at its first start after each boot, unless forwarding is already on (see the
+[threat model](threat-model.md)). Without Docker networks, meshly sees `forwarding=1` as drift and sets `0` again.
 
 ## Profiles
 
@@ -494,11 +495,13 @@ and meshly does not change that. To publish a port only to the VPN, bind it to t
 docker run -d -p 10.100.0.1:9104:9104 prom/mysqld-exporter
 ```
 
-In compose, that is `ports: ["10.100.0.1:9104:9104"]`. With Docker's default userland proxy, Docker binds this
-address when it starts the container, so the address must exist at that moment. While `meshly0` is down (after
-`meshly stop`, or in safe mode), a container that starts or restarts fails with `cannot assign requested address`;
-start it again once the link is up. At boot this is not a problem: `meshly.service` comes up before
-`network-online.target`, and `docker.service` starts after it.
+In compose, that is `ports: ["10.100.0.1:9104:9104"]`. Docker binds this address when it starts the container, so
+the address must exist at that moment. While the meshly interface does not exist (after `meshly stop`, or in safe
+mode), a container that starts or restarts fails with `cannot assign requested address`. Docker 29.9.1 then also
+disconnects the container from its network, and starting it again runs it without one. So once the link is up,
+create the container again: `docker rm -f` and `docker run`, or `docker compose up -d --force-recreate`. At boot this
+is not a problem while the link is meant to run: `meshly.service` comes up before `network-online.target`, and
+`docker.service` starts after it.
 
 ### Packet path through the tunnel
 

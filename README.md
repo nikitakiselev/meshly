@@ -304,8 +304,9 @@ container addresses and ports without `meshly allow` stay closed.
 
 Note that `-p 9104:9104` also opens the port to the internet, because Docker bypasses UFW. To publish it only to the
 VPN, bind it to this node's VPN address, which `meshly status` shows: `-p 10.100.0.1:9104:9104`. Such a container
-does not start while the meshly link is stopped (Docker reports `cannot assign requested address`); start it again
-once the link is up. The [firewall docs](docs/firewall.md#docker) explain the details.
+does not start while the meshly link is stopped (Docker reports `cannot assign requested address`); once the link is
+up, create it again, for example with `docker compose up -d --force-recreate`. The
+[firewall docs](docs/firewall.md#docker) explain the details.
 
 **What happens if the VPS reboots?** The home node re-handshakes as soon as the VPS is back. Both sides send
 keepalives, and meshly remembers the last authenticated endpoint.

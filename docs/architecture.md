@@ -588,8 +588,9 @@ project owner.
   allowed, never by container address. The LAN behind the node stays
   unreachable from the tunnel, also while the table is missing, and a host
   on the LAN cannot route through the node into the tunnel. While the table
-  is missing, ports that Docker publishes on all addresses are open to the
-  peer, as they are to the internet. Containers cannot reach
+  is missing, ports that Docker publishes on all addresses or on the VPN
+  address are open to the peer, as the former are to the internet.
+  Containers cannot reach
   their own node's VPN address (`guard_pre`): letting them would open every
   host port to them past UFW. Bridges with custom names, macvlan, ipvlan and
   overlay networks, Podman and VM bridges are not covered. A host without
