@@ -186,11 +186,18 @@ table ip dockerlike {
 EOF`)
 	home.MustMeshly("allow", "8888/tcp", "from", "vps")
 	home.MustMeshly("allow", "8889/tcp", "from", "vps")
-	if vps.Probe("tcp", "10.100.0.2", 8888) {
+	// Connects, not Probe: the servers behind 8888 and 8889 answer with
+	// the tokens of ports 80 and 22.
+	if vps.Connects("10.100.0.2", 8888) {
 		t.Fatal("DNAT through the VPN reaches a LAN host")
 	}
-	if vps.Probe("tcp", "10.100.0.2", 8889) {
+	const redirected = "dnat from the vpn is not supported"
+	dropped := home.counted("guard_in", redirected)
+	if vps.Connects("10.100.0.2", 8889) {
 		t.Fatal("local redirect through the VPN reaches a port without a rule")
+	}
+	if after := home.counted("guard_in", redirected); after <= dropped {
+		t.Fatalf("guard_in did not drop the redirect: counter %d -> %d", dropped, after)
 	}
 
 	compromise(t, vps)
@@ -214,7 +221,7 @@ EOF`)
 	}
 	// Forwarding is blocked even if the sysctl drifts.
 	home.MustSh("sysctl -qw net.ipv4.conf.meshly0.forwarding=1")
-	if vps.Probe("tcp", "192.168.77.20", 80) || vps.Probe("tcp", "10.100.0.2", 8888) {
+	if vps.Probe("tcp", "192.168.77.20", 80) || vps.Connects("10.100.0.2", 8888) {
 		t.Fatal("forwarding from the VPN possible after sysctl drift")
 	}
 	if hits := lanhost.Sh("cat /tmp/hits-tcp-80 2>/dev/null").Out; hits != "" {
