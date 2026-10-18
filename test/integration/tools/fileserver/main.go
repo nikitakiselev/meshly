@@ -1,6 +1,7 @@
 // Command fileserver is the integration-test helper that runs inside the
-// test containers: TCP/UDP token servers, probes, a streaming client and a
-// static HTTP server for release downloads. It is not part of meshly.
+// test containers: TCP/UDP token servers, probes, a connect check, a
+// streaming client and a static HTTP server for release downloads. It is not
+// part of meshly.
 package main
 
 import (
@@ -18,6 +19,7 @@ func main() {
 	udp := flag.Int("udp", 0, "serve UDP on this port")
 	token := flag.String("token", "ok", "reply token")
 	probe := flag.Bool("probe", false, "probe mode")
+	connect := flag.Bool("connect", false, "exit 0 once a TCP connection to -tcp-dial is established (no token needed)")
 	tcpDial := flag.String("tcp-dial", "", "probe a TCP server")
 	udpDial := flag.String("udp-dial", "", "probe a UDP server")
 	timeout := flag.Duration("timeout", 2*time.Second, "probe timeout")
@@ -28,6 +30,10 @@ func main() {
 	switch {
 	case *dir != "":
 		fail(http.ListenAndServe(*listen, http.FileServer(http.Dir(*dir))))
+	case *connect && *tcpDial != "":
+		c, err := net.DialTimeout("tcp", *tcpDial, *timeout)
+		fail(err)
+		_ = c.Close()
 	case *probe && *tcpDial != "":
 		c, err := net.DialTimeout("tcp", *tcpDial, *timeout)
 		fail(err)

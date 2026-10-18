@@ -273,7 +273,9 @@ func TestInstallUpgradeUninstall(t *testing.T) {
 		// Downgrade needs --force; a forged release is refused.
 		vps.ExpectCode(5, env, "upgrade", "--version", "0.0.1", "--yes")
 		vps.MustSh("cd /srv/releases/download/v0.0.1 && sed -i 's/^./0/' SHA256SUMS")
-		vps.ExpectCode(4, env, "upgrade", "--version", "0.0.1", "--force", "--yes")
+		if r := vps.ExpectCode(1, env, "upgrade", "--version", "0.0.1", "--force", "--yes"); !strings.Contains(r.Err, "verification failed") {
+			t.Fatalf("forged release not reported as such: %s", r)
+		}
 		if v := strings.TrimSpace(vps.MustSh("meshly version --short")); v != "0.0.2" {
 			t.Fatalf("refused upgrade changed the binary: %s", v)
 		}

@@ -298,25 +298,14 @@ func TestNATAndIdle(t *testing.T) {
 // Scenario 13: repeating commands creates no duplicates.
 func TestIdempotency(t *testing.T) {
 	l := newLab(t, distros[0])
-	vps, home := l.Node("vps"), l.Node("home")
+	vps := l.Node("vps")
 	vps.MustMeshly("init", "homelab", "--name", "vps", "--endpoint", "198.51.100.10:51820")
 	snap := vps.KernelSnapshot()
 	r := vps.MustMeshly("init", "homelab", "--name", "vps", "--endpoint", "198.51.100.10:51820")
 	if !strings.Contains(r.Out, "already") || vps.KernelSnapshot() != snap {
 		t.Fatalf("second init not idempotent:\n%s", r)
 	}
-	inv1 := vps.MustMeshly("invite", "--out", "/root/a.invite")
-	inv2 := vps.MustMeshly("invite", "--out", "/root/a.invite")
-	if string(vps.ReadFile("/root/a.invite")) == "" || !strings.Contains(inv2.Out+inv2.Err, "already") {
-		t.Fatalf("second invite is not the same invite:\n%s\n%s", inv1, inv2)
-	}
-	vps.MustMeshly("invite", "--out", "/root/b.invite")
-	if string(vps.ReadFile("/root/a.invite")) != string(vps.ReadFile("/root/b.invite")) {
-		t.Fatal("repeated invite produced a different invite")
-	}
-	vps2, home2 := l.Pair2("/root/a.invite")
-	_ = vps2
-	home2.MustMeshly("activate", "/root/home.accept") // repeated activate
+	vps, home := l.Pair()
 	vps.MustMeshly("allow", "8080/tcp", "from", "home")
 	snap = vps.KernelSnapshot()
 	for i := 0; i < 3; i++ {
@@ -341,44 +330,6 @@ func TestIdempotency(t *testing.T) {
 	if !strings.Contains(r.Out, "nothing to remove") {
 		t.Fatalf("repeated deny:\n%s", r)
 	}
-}
-
-// Pair2 completes the pairing with an already created invite file.
-func (l *Lab) Pair2(invite string) (vps, home *Node) {
-	t := l.t
-	t.Helper()
-	vps, home = l.Node("vps"), l.Node("home")
-	home.MustSh("rm -f /root/home.request /root/home.accept")
-	vps.MustSh("rm -f /root/home.request /root/home.accept")
-	st := vps.MustMeshly("status")
-	vpsFP := fingerprint(t, st.Out)
-	Transfer(vps, invite, home, "/root/home.invite")
-	r := home.MustMeshly("join", "/root/home.invite", "--name", "home", "--expect-fingerprint", vpsFP, "--out", "/root/home.request")
-	again := home.MustMeshly("join", "/root/home.invite", "--name", "home", "--expect-fingerprint", vpsFP, "--out", "/root/home.request")
-	if !strings.Contains(again.Out+again.Err, "already") {
-		t.Fatalf("repeated join is not idempotent:\n%s", again)
-	}
-	homeFP := fpOf(t, r.Out, "your fingerprint: ")
-	Transfer(home, "/root/home.request", vps, "/root/home.request")
-	vps.MustMeshly("approve", "/root/home.request", "--expect-fingerprint", homeFP, "--out", "/root/home.accept")
-	again = vps.MustMeshly("approve", "/root/home.request", "--expect-fingerprint", homeFP, "--out", "/root/home.accept")
-	if !strings.Contains(again.Out+again.Err, "already") {
-		t.Fatalf("repeated approve is not idempotent:\n%s", again)
-	}
-	Transfer(vps, "/root/home.accept", home, "/root/home.accept")
-	home.MustMeshly("activate", "/root/home.accept")
-	l.WaitHandshake(home, 20*time.Second)
-	return vps, home
-}
-
-func fpOf(t *testing.T, out, prefix string) string {
-	t.Helper()
-	i := strings.Index(out, prefix)
-	if i < 0 {
-		t.Fatalf("no %q in:\n%s", prefix, out)
-	}
-	f := strings.Fields(out[i+len(prefix):])
-	return f[0]
 }
 
 // Scenario 14: concurrent operations are serialised.

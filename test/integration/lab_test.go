@@ -31,8 +31,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -471,11 +471,6 @@ func (n *Node) WriteFile(path string, data []byte) {
 	}
 }
 
-// Transfer copies a file between nodes (the "trusted channel", e.g. scp).
-func Transfer(from *Node, path string, to *Node, dst string) {
-	to.WriteFile(dst, from.ReadFile(path))
-}
-
 // Listen starts a TCP or UDP server on port that answers with a token and
 // logs every connection to /tmp/hits-<proto>-<port>. It binds 0.0.0.0, so
 // an accidentally opened public path would be detected too.
@@ -504,36 +499,73 @@ func (n *Node) Ping(addr string) bool {
 
 // ---------------------------------------------------------------- meshly helpers
 
-var fpRe = regexp.MustCompile(`fingerprint:?\s+([A-Z2-7]{4}(?:-[A-Z2-7]{4}){7})`)
-
-func fingerprint(t *testing.T, out string) string {
+// Invite starts `meshly invite args...` in the background on n (stdout
+// /root/invite.out, stderr /root/invite.err, exit status /root/invite.exit)
+// and returns the code within 10s. The wrapper's own command line does not
+// contain "meshly invite", so `pkill -f 'meshly invite'` hits meshly only.
+func (n *Node) Invite(args ...string) string {
+	t := n.lab.t
 	t.Helper()
-	m := fpRe.FindStringSubmatch(out)
-	if m == nil {
-		t.Fatalf("no fingerprint in output:\n%s", out)
+	n.WriteFile("/root/invite.sh", []byte(`meshly invite "$@" </dev/null >/root/invite.out 2>/root/invite.err; echo $? >/root/invite.exit`+"\n"))
+	n.MustSh("rm -f /root/invite.out /root/invite.err /root/invite.exit && nohup sh /root/invite.sh " + strings.Join(args, " ") + " </dev/null >/dev/null 2>&1 &")
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if line, _, ok := strings.Cut(n.Sh("cat /root/invite.out 2>/dev/null").Out, "\n"); ok {
+			return strings.TrimSpace(line)
+		}
+		if n.Sh("test -e /root/invite.exit").Code == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	return m[1]
+	t.Fatalf("%s: meshly invite %s printed no code:\n%s", n.Name, strings.Join(args, " "), n.Sh("cat /root/invite.exit /root/invite.out /root/invite.err 2>&1").Out)
+	return ""
 }
 
-// Pair runs the documented two-server setup and returns once the
-// WireGuard handshake is established.
+// InviteExit waits for the background invite and returns its exit status
+// and stderr.
+func (n *Node) InviteExit(timeout time.Duration) (int, string) {
+	t := n.lab.t
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if r := n.Sh("cat /root/invite.exit 2>/dev/null"); r.Code == 0 && strings.HasSuffix(r.Out, "\n") {
+			code, err := strconv.Atoi(strings.TrimSpace(r.Out))
+			if err != nil {
+				t.Fatalf("%s: invite exit status %q", n.Name, r.Out)
+			}
+			return code, n.Sh("cat /root/invite.err").Out
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: meshly invite still running after %s:\n%s", n.Name, timeout, n.Sh("cat /root/invite.out /root/invite.err").Out)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// Join runs `meshly join args...` with code+"\n" on stdin.
+func (n *Node) Join(code string, args ...string) Result { return n.JoinEnv(nil, code, args...) }
+
+// JoinEnv is Join with KEY=VALUE environment entries, e.g. MESHLY_FAULT.
+func (n *Node) JoinEnv(env []string, code string, args ...string) Result {
+	return n.exec(env, code+"\n", append([]string{"meshly", "join"}, args...)...)
+}
+
+// Pair runs the documented two-server setup (init, invite, join) and
+// returns once the WireGuard handshake is established. The code stays in
+// the vps's /root/invite.out.
 func (l *Lab) Pair() (vps, home *Node) {
 	t := l.t
 	t.Helper()
 	vps, home = l.Node("vps"), l.Node("home")
-	r := vps.MustMeshly("init", "homelab", "--name", "vps", "--endpoint", "198.51.100.10:51820")
-	vpsFP := fingerprint(t, r.Out)
-	vps.MustMeshly("invite", "--out", "/root/home.invite")
-	Transfer(vps, "/root/home.invite", home, "/root/home.invite")
-	r = home.MustMeshly("join", "/root/home.invite", "--name", "home", "--expect-fingerprint", vpsFP, "--out", "/root/home.request")
-	homeFP := regexp.MustCompile(`your fingerprint: (\S+)`).FindStringSubmatch(r.Out)
-	if homeFP == nil {
-		t.Fatalf("no join fingerprint:\n%s", r)
+	vps.MustMeshly("init", "homelab", "--name", "vps", "--endpoint", "198.51.100.10:51820")
+	code := vps.Invite()
+	if r := home.Join(code, "--name", "home"); r.Code != 0 {
+		t.Fatalf("home: meshly join: %s\ninvite stderr so far:\n%s", r, vps.Sh("cat /root/invite.err").Out)
 	}
-	Transfer(home, "/root/home.request", vps, "/root/home.request")
-	vps.MustMeshly("approve", "/root/home.request", "--expect-fingerprint", homeFP[1], "--out", "/root/home.accept")
-	Transfer(vps, "/root/home.accept", home, "/root/home.accept")
-	home.MustMeshly("activate", "/root/home.accept")
+	if c, inv := vps.InviteExit(30 * time.Second); c != 0 {
+		t.Fatalf("vps: meshly invite: exit %d\n%s", c, inv)
+	}
 	l.WaitHandshake(home, 20*time.Second)
 	return vps, home
 }
