@@ -7,8 +7,16 @@ on-disk formats.
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-10-18
+
 ### Fixed
 
+- fail2ban (with its nftables actions, the default on Ubuntu 24.04) no longer stops `init`, `invite` and `join`
+  with exit 3 and an impossible fix for `/etc/nftables.conf`. A rule that drops addresses listed in a named set
+  (fail2ban, sshguard, CrowdSec, your own blocklists) is a ban list: it needs no integration, and its bans apply to
+  traffic through meshly too. Until a peer is known, rules on the peer's address are checked against the VPN
+  network. A ban that hits a peer's address or endpoint is a warning with the command that lifts it
+  (`fail2ban-client unban`), never a refusal, so it cannot keep meshly from starting.
 - `install.sh` names `invite` and `join` with a code in its next steps, not an invite file.
 - Release builds no longer depend on untracked files in the checkout (`-buildvcs=false`), and the release check
   downloads the release outside the checkout.
@@ -45,5 +53,6 @@ First public release.
 - Signed self-upgrade from GitHub releases (`upgrade`), `install.sh` with signature verification, reproducible
   release builds for linux/amd64 and linux/arm64.
 
-[Unreleased]: https://github.com/nikitakiselev/meshly/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/nikitakiselev/meshly/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/nikitakiselev/meshly/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/nikitakiselev/meshly/releases/tag/v0.0.1

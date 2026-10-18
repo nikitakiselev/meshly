@@ -448,6 +448,8 @@ func TestManagers(t *testing.T) {
 			want: map[string]Status{"firewall-manager": OK, "ufw": Info}, texts: []string{"UFW is enabled", "top of the iptables INPUT and OUTPUT chains"}},
 		{name: "ufw disabled in config", files: map[string]string{"etc/ufw/ufw.conf": "ENABLED=no\n"},
 			want: map[string]Status{"firewall-manager": OK}, absent: []string{"ufw"}},
+		{name: "fail2ban table in ruleset", a: &nft.Analysis{Fail2ban: true},
+			want: map[string]Status{"firewall-manager": OK, "fail2ban": Info}, texts: []string{"stay banned for traffic through meshly"}},
 		{name: "ufw chains in ruleset", a: &nft.Analysis{UFWChains: true},
 			want: map[string]Status{"firewall-manager": OK, "ufw": Info}, texts: []string{"UFW"}},
 		{name: "firewalld pid file", files: map[string]string{"run/firewalld/firewalld.pid": "123\n"},
@@ -527,17 +529,51 @@ func TestManagers(t *testing.T) {
 
 func TestAnalysisContext(t *testing.T) {
 	c := &model.Config{
+		Network:   model.Network{CIDR: netip.MustParsePrefix("10.100.0.0/24")},
 		Interface: model.Interface{Name: "meshly0"},
 		Self:      model.Self{Address: netip.MustParseAddr("10.100.0.1"), ListenPort: 51820},
 		Firewall:  model.Firewall{Mark: model.DefaultFirewallMark},
-		Peers:     []model.Peer{{Address: netip.MustParseAddr("10.100.0.2")}},
+		Peers: []model.Peer{{Address: netip.MustParseAddr("10.100.0.2"), Endpoint: netip.MustParseAddrPort("203.0.113.20:51820")},
+			{Address: netip.MustParseAddr("10.100.0.3")}},
 	}
 	got := (&System{Links: &fakeLinks{}}).AnalysisContext(c)
 	if got.Interface != "meshly0" || got.LocalVPN != c.Self.Address || got.ListenPort != 51820 || got.Mark != model.DefaultFirewallMark ||
-		len(got.Peers) != 1 || got.Peers[0] != c.Peers[0].Address || len(got.LocalAddrs) != 1 {
+		got.Network != c.Network.CIDR || len(got.Peers) != 2 || got.Peers[0] != c.Peers[0].Address || len(got.LocalAddrs) != 1 ||
+		len(got.Endpoints) != 1 || got.Endpoints[0] != netip.MustParseAddr("203.0.113.20") {
 		t.Errorf("AnalysisContext = %+v", got)
 	}
 	if got := (&System{}).AnalysisContext(c); got.LocalAddrs != nil {
 		t.Errorf("AnalysisContext without Links = %+v", got)
+	}
+}
+
+// A banned peer is a warning that says how to lift the ban, never a
+// failure: the ban drops its traffic on purpose.
+func TestBans(t *testing.T) {
+	c := &model.Config{
+		Network: model.Network{CIDR: netip.MustParsePrefix("10.100.0.0/24")},
+		Peers:   []model.Peer{{Name: "home", Address: netip.MustParseAddr("10.100.0.2"), Endpoint: netip.MustParseAddrPort("203.0.113.20:51820")}},
+	}
+	a := &nft.Analysis{Chains: []nft.ChainFinding{
+		{Family: "inet", Table: "f2b-table", Chain: "f2b-chain", Status: "compatible",
+			Bans: []nft.Ban{{Rule: 3, Set: "addr-set-sshd", Addrs: []netip.Addr{netip.MustParseAddr("10.100.0.2")}}}},
+		{Family: "inet", Table: "filter", Chain: "input", Status: "compatible",
+			Bans: []nft.Ban{{Rule: 4, Set: "blocked", Addrs: []netip.Addr{netip.MustParseAddr("203.0.113.20"), netip.MustParseAddr("10.100.0.9")}}}},
+	}}
+	r := &Report{}
+	Bans(r, a, c)
+	want := []Check{
+		{ID: "firewall-ban", Status: Warn, Detail: "fail2ban has banned 10.100.0.2 (peer home) in set addr-set-sshd of table inet f2b-table: its traffic through meshly is dropped until the ban ends",
+			Fix: "sudo fail2ban-client unban 10.100.0.2   (to never ban it, add it to ignoreip in /etc/fail2ban/jail.local)"},
+		{ID: "firewall-ban", Status: Warn, Detail: "set blocked in table inet filter lists 203.0.113.20 (endpoint of peer home): chain input drops its traffic through meshly",
+			Fix: "sudo nft delete element inet filter blocked { 203.0.113.20 }"},
+		{ID: "firewall-ban", Status: Warn, Detail: "set blocked in table inet filter lists 10.100.0.9 (an address of the VPN network): chain input drops its traffic through meshly",
+			Fix: "sudo nft delete element inet filter blocked { 10.100.0.9 }"},
+	}
+	if !slices.Equal(r.Checks, want) {
+		t.Fatalf("checks:\n%+v\nwant\n%+v", r.Checks, want)
+	}
+	if r.Error() != nil {
+		t.Fatal("a ban failed the preflight")
 	}
 }

@@ -148,6 +148,110 @@ func TestNativeNftablesProfile(t *testing.T) {
 // pairing and allowed services work without any UFW rule for meshly, UFW
 // still closes everything else, UFW's own commands keep meshly's rule, and
 // the rule comes back after iptables-restore removes it.
+// StartFail2ban runs fail2ban with its nftables actions (the default on
+// Ubuntu 24.04) and the sshd jail, and bans an outside address so that its
+// table exists.
+func (n *Node) StartFail2ban() { n.startFail2ban("nftables", "inet f2b-table") }
+
+func (n *Node) startFail2ban(action, check string) {
+	n.MustSh(`touch /var/log/auth.log
+printf '[DEFAULT]\nbanaction = ` + action + `\nbackend = polling\n[sshd]\nenabled = true\nlogpath = /var/log/auth.log\n' > /etc/fail2ban/jail.d/zz-test.local
+mkdir -p /run/fail2ban && fail2ban-server -b >/dev/null
+for i in $(seq 50); do fail2ban-client ping >/dev/null 2>&1 && break; sleep 0.2; done
+fail2ban-client set sshd banip 192.0.2.66 >/dev/null
+nft list table ` + check + ` >/dev/null`)
+}
+
+// With fail2ban's iptables actions (the default on Debian 12) its jump is in
+// the iptables INPUT chain, where meshly keeps its rule first: pairing
+// works, and fail2ban's bans do not reach traffic meshly accepted.
+func TestFail2banIptables(t *testing.T) {
+	l := newLab(t, distros[0])
+	vps, home := l.Node("vps"), l.Node("home")
+	vps.startFail2ban("iptables-multiport", "ip filter")
+	vps.Listen("tcp", 22)
+	vps.MustMeshly("init", "homelab", "--name", "vps", "--endpoint", "198.51.100.10:51820")
+	code := vps.Invite()
+	if r := home.Join(code, "--name", "home"); r.Code != 0 {
+		t.Fatalf("join: %s\n%s", r, vps.Sh("cat /root/invite.err").Out)
+	}
+	if c, inv := vps.InviteExit(30 * time.Second); c != 0 {
+		t.Fatalf("invite: exit %d\n%s", c, inv)
+	}
+	l.WaitHandshake(home, 20*time.Second)
+	vps.MustMeshly("allow", "22/tcp", "from", "home")
+	if !vps.IptablesFirst4() || !home.Probe("tcp", "10.100.0.1", 22) {
+		t.Fatalf("SSH through the VPN with fail2ban's iptables actions:\n%s", vps.Sh("iptables -S INPUT").Out)
+	}
+	vps.MustSh("fail2ban-client set sshd banip 10.100.0.2")
+	if !home.Probe("tcp", "10.100.0.1", 22) {
+		t.Fatal("fail2ban's iptables ban reached traffic meshly accepted")
+	}
+}
+
+// fail2ban's bans hold also for traffic through meshly; a banned peer is a
+// warning, never a reason to refuse an operation.
+func TestFail2ban(t *testing.T) {
+	forDistros(t, func(t *testing.T, distro string) {
+		l := newLab(t, distro)
+		vps, home := l.Node("vps"), l.Node("home")
+		vps.StartFail2ban()
+		home.StartFail2ban()
+		vps.Listen("tcp", 22)
+		vps.Listen("tcp", 8080)
+
+		r := vps.MustMeshly("init", "homelab", "--name", "vps", "--endpoint", "198.51.100.10:51820")
+		if strings.Contains(r.Err, "firewall") {
+			t.Fatalf("init with fail2ban warns:\n%s", r)
+		}
+		code := vps.Invite()
+		if r := home.Join(code, "--name", "home"); r.Code != 0 {
+			t.Fatalf("join with fail2ban: %s\n%s", r, vps.Sh("cat /root/invite.err").Out)
+		}
+		if c, inv := vps.InviteExit(30 * time.Second); c != 0 {
+			t.Fatalf("invite: exit %d\n%s", c, inv)
+		}
+		l.WaitHandshake(home, 20*time.Second)
+		vps.MustMeshly("allow", "22/tcp", "from", "home")
+		vps.MustMeshly("allow", "8080/tcp", "from", "home")
+		if !home.Probe("tcp", "10.100.0.1", 22) || !home.Probe("tcp", "10.100.0.1", 8080) {
+			t.Fatal("allowed services unreachable with fail2ban")
+		}
+		before := vps.Foreign()
+
+		// fail2ban bans the peer: SSH through the VPN is rejected, other
+		// allowed ports stay open, and meshly only warns.
+		vps.MustSh("fail2ban-client set sshd banip 10.100.0.2")
+		if home.Probe("tcp", "10.100.0.1", 22) {
+			t.Fatal("fail2ban's ban does not hold for traffic through meshly")
+		}
+		if !home.Probe("tcp", "10.100.0.1", 8080) {
+			t.Fatal("a ban of SSH closed another allowed port")
+		}
+		r = vps.MustMeshly("allow", "9090/tcp", "from", "home")
+		if !strings.Contains(r.Err, "fail2ban has banned 10.100.0.2 (peer home)") || !strings.Contains(r.Err, "sudo fail2ban-client unban 10.100.0.2") {
+			t.Fatalf("allow does not warn about the banned peer:\n%s", r)
+		}
+		vps.MustMeshly("restart")
+		l.WaitHandshake(home, 20*time.Second)
+		if r := vps.Meshly("doctor"); !strings.Contains(r.Out+r.Err, "fail2ban has banned 10.100.0.2") {
+			t.Fatalf("doctor does not show the ban:\n%s", r)
+		}
+
+		vps.MustSh("fail2ban-client unban 10.100.0.2")
+		if !home.Probe("tcp", "10.100.0.1", 22) {
+			t.Fatal("SSH through the VPN still closed after unban")
+		}
+		if r := vps.MustMeshly("deny", "9090/tcp", "from", "home"); strings.Contains(r.Err, "banned") {
+			t.Fatalf("warning after unban:\n%s", r)
+		}
+		vps.MustMeshly("reset", "--yes")
+		if after := vps.Foreign(); after != before {
+			t.Fatalf("fail2ban's table changed:\n%s\n---\n%s", before, after)
+		}
+	})
+}
+
 func TestUFW(t *testing.T) {
 	forDistros(t, func(t *testing.T, distro string) {
 		l := newLab(t, distro)

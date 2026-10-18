@@ -24,6 +24,12 @@ type Context struct {
 	// LocalAddrs are all addresses configured on the host (WireGuard
 	// listens on every address).
 	LocalAddrs []netip.Addr
+	// Network is the VPN network. While no peer is known (init, invite,
+	// join), a match on the remote address is checked against all of it:
+	// the peers get their addresses from it.
+	Network netip.Prefix
+	// Endpoints are the known public addresses of the peers.
+	Endpoints []netip.Addr
 }
 
 // ChainFinding is the verdict for one foreign base chain.
@@ -42,6 +48,9 @@ type ChainFinding struct {
 	// Interfering lists handles of rules that may drop Meshly traffic
 	// (directly or through jumps). Policy drop is reported separately.
 	Interfering []int `json:"interfering_rules,omitempty"`
+	// Bans lists rules that drop Meshly traffic only from peers listed in
+	// a ban list (see Ban). They need no integration.
+	Bans []Ban `json:"bans,omitempty"`
 	// IntegrationHandle is the handle of the integration rule (0: none).
 	IntegrationHandle int `json:"integration_rule,omitempty"`
 	// Status: "compatible", "integrated", "needs-integration",
@@ -49,6 +58,25 @@ type ChainFinding struct {
 	Status string `json:"status"`
 	Detail string `json:"detail,omitempty"`
 }
+
+// Ban is a rule that drops the traffic of addresses listed in a named set
+// with no range of VPN addresses: a ban list, as fail2ban, sshguard and
+// CrowdSec keep. Bans hold also for Meshly traffic, so such a rule needs
+// no integration; Addrs are the listed peer addresses (or, while no peer
+// is known, VPN addresses) and peer endpoints whose traffic it drops.
+type Ban struct {
+	Rule  int          `json:"rule"`
+	Set   string       `json:"set"`
+	Addrs []netip.Addr `json:"addresses"`
+}
+
+// Fail2ban reports whether the set is one of fail2ban's.
+func (b Ban) Fail2ban(table string) bool {
+	return table == Fail2banTable || strings.HasPrefix(b.Set, "addr-set-") || strings.HasPrefix(b.Set, "addr6-set-")
+}
+
+// Fail2banTable is the table of fail2ban's nftables actions.
+const Fail2banTable = "f2b-table"
 
 // Analysis summarises a ruleset.
 type Analysis struct {
@@ -61,6 +89,7 @@ type Analysis struct {
 	DNATRules       int            `json:"dnat_rules"`
 	IptablesTables  []string       `json:"iptables_nft_tables,omitempty"`
 	UFWChains       bool           `json:"ufw_chains"`
+	Fail2ban        bool           `json:"fail2ban"`
 	FirewalldTables bool           `json:"firewalld_tables"`
 	Flowtables      []string       `json:"flowtables_with_interface,omitempty"`
 	NetdevChains    []string       `json:"netdev_chains,omitempty"`
@@ -143,6 +172,9 @@ func Analyze(rs *Ruleset, ctx Context) *Analysis {
 		if t.Name == "firewalld" {
 			a.FirewalldTables = true
 		}
+		if t.Name == Fail2banTable {
+			a.Fail2ban = true
+		}
 		if strings.HasPrefix(t.Name, "docker") {
 			a.DockerDetected = true
 		}
@@ -199,6 +231,15 @@ type analyzer struct {
 	stack map[string]bool
 	// family/table of the rule being evaluated (named sets are per table)
 	family, table string
+	// ban is set by excludes for a match on a ban list.
+	ban *banMatch
+}
+
+// banMatch is a match of the remote address against a ban list, with the
+// listed addresses of Meshly's traffic classes.
+type banMatch struct {
+	set  string
+	a, b []netip.Addr
 }
 
 func inbound(hook string) bool { return hook == "prerouting" || hook == "input" }
@@ -222,7 +263,19 @@ func (an *analyzer) chain(c Chain) ChainFinding {
 			f.IntegrationHandle = r.Handle
 			continue
 		}
-		if an.rule(r, c.Family, c.Hook).any() {
+		cl, ban := an.rule(r, c.Family, c.Hook)
+		if cl.any() && ban != nil {
+			b := Ban{Rule: r.Handle, Set: ban.set}
+			if cl.A {
+				b.Addrs = append(b.Addrs, ban.a...)
+			}
+			if cl.B {
+				b.Addrs = append(b.Addrs, ban.b...)
+			}
+			f.Bans = append(f.Bans, b)
+			continue
+		}
+		if cl.any() {
 			f.Interfering = append(f.Interfering, r.Handle)
 			if firstInterfering < 0 {
 				firstInterfering = i
@@ -300,14 +353,20 @@ func (an *analyzer) isIntegration(r Rule) bool {
 	return sawMatch && sawAccept
 }
 
-// rule returns which classes a rule may drop.
-func (an *analyzer) rule(r Rule, family, hook string) classes {
+// rule returns which classes a rule may drop. If it matches the remote
+// address against a ban list, it drops only the listed addresses: ban
+// describes them.
+func (an *analyzer) rule(r Rule, family, hook string) (_ classes, ban *banMatch) {
 	reach := classes{A: family != "ip6", B: true}
 	var effect classes
 	an.family, an.table = r.Family, r.Table
 	for _, e := range r.Expr {
 		if hasKey(e, "match") {
+			an.ban = nil
 			ex := an.excludes(e, hook)
+			if an.ban != nil && ban == nil {
+				ban = an.ban
+			}
 			if ex.A {
 				reach.A = false
 			}
@@ -329,7 +388,7 @@ func (an *analyzer) rule(r Rule, family, hook string) classes {
 			}
 		}
 	}
-	return classes{A: reach.A && effect.A, B: reach.B && effect.B}
+	return classes{A: reach.A && effect.A, B: reach.B && effect.B}, ban
 }
 
 var harmlessXT = map[string]bool{
@@ -370,7 +429,7 @@ func (an *analyzer) target(e json.RawMessage, family, table, hook string) classe
 	defer delete(an.stack, key)
 	var out classes
 	for _, r := range an.rs.ChainRules(family, table, name) {
-		c := an.rule(r, family, hook)
+		c, _ := an.rule(r, family, hook)
 		out.A = out.A || c.A
 		out.B = out.B || c.B
 	}
@@ -438,6 +497,8 @@ func (an *analyzer) excludes(e json.RawMessage, hook string) classes {
 	case left.Payload != nil:
 		p := left.Payload
 		switch {
+		case (p.Protocol == "ip" || p.Protocol == "ip6") && (p.Field == "saddr" && in || p.Field == "daddr" && !in):
+			return an.remote(p.Protocol, op, m.Match.Right, values)
 		case p.Protocol == "ip6":
 			return classes{A: true}
 		case p.Protocol == "ip" && p.Field == "protocol":
@@ -465,19 +526,6 @@ func (an *analyzer) excludes(e json.RawMessage, hook string) classes {
 				return classes{A: !hasVPN, B: !hasLocal}
 			}
 			return classes{A: hasVPN && values.single()}
-		case p.Protocol == "ip" && (p.Field == "saddr" && in || p.Field == "daddr" && !in):
-			if !values.known() || len(an.ctx.Peers) == 0 {
-				return classes{}
-			}
-			hasPeer := false
-			for _, pa := range an.ctx.Peers {
-				if values.hasAddr(pa) {
-					hasPeer = true
-				}
-			}
-			if op == "==" {
-				return classes{A: !hasPeer}
-			}
 		}
 	case left.CT != nil && left.CT.Key == "state":
 		if op == "==" && values.known() && values.allStrings(func(s string) bool { return s == "invalid" || s == "untracked" }) {
@@ -485,6 +533,92 @@ func (an *analyzer) excludes(e json.RawMessage, hook string) classes {
 		}
 	}
 	return classes{}
+}
+
+// remote decides a match on the remote address: the source of inbound and
+// the destination of outbound packets. A named set without a range of VPN
+// addresses is a ban list: it excludes all Meshly traffic but that of the
+// listed peers, which an.ban records.
+func (an *analyzer) remote(proto, op string, right json.RawMessage, values valueSet) classes {
+	ex := classes{A: proto == "ip6"} // no IPv6 inside the VPN
+	if !values.known() || op != "==" {
+		return ex
+	}
+	var name string
+	if json.Unmarshal(right, &name) == nil && strings.HasPrefix(name, "@") && !an.vpnRange(values) {
+		b := &banMatch{set: strings.TrimPrefix(name, "@")}
+		if proto == "ip" {
+			b.a = an.vpnAddrs(values)
+		}
+		for _, e := range an.ctx.Endpoints {
+			if values.hasAddr(e.Unmap()) {
+				b.b = append(b.b, e.Unmap())
+			}
+		}
+		an.ban = b
+		return classes{A: len(b.a) == 0, B: len(b.b) == 0}
+	}
+	if proto == "ip6" || len(an.ctx.Peers) == 0 && !an.ctx.Network.IsValid() {
+		return ex
+	}
+	return classes{A: len(an.vpnAddrs(values)) == 0 && (len(an.ctx.Peers) > 0 || !an.vpnRange(values))}
+}
+
+// vpnAddrs returns the peer addresses in values or, while no peer is
+// known, the addresses of the VPN network.
+func (an *analyzer) vpnAddrs(v valueSet) []netip.Addr {
+	var out []netip.Addr
+	if len(an.ctx.Peers) > 0 {
+		for _, p := range an.ctx.Peers {
+			if v.hasAddr(p) {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	for _, p := range v.prefixes {
+		if p.IsSingleIP() && an.ctx.Network.Contains(p.Addr()) {
+			out = append(out, p.Addr())
+		}
+	}
+	return out
+}
+
+// vpnRange reports whether values hold a range or prefix that overlaps
+// the VPN network (or holds a peer when the network is unknown).
+func (an *analyzer) vpnRange(v valueSet) bool {
+	n := an.ctx.Network
+	for _, p := range v.prefixes {
+		if !p.IsSingleIP() && (n.IsValid() && p.Overlaps(n) || !n.IsValid() && slices.ContainsFunc(an.ctx.Peers, p.Contains)) {
+			return true
+		}
+	}
+	for _, r := range v.ranges {
+		if n.IsValid() && r[0].Compare(lastAddr(n)) <= 0 && r[1].Compare(n.Masked().Addr()) >= 0 {
+			return true
+		}
+		if !n.IsValid() && slices.ContainsFunc(an.ctx.Peers, func(a netip.Addr) bool { return a.Compare(r[0]) >= 0 && a.Compare(r[1]) <= 0 }) {
+			return true
+		}
+	}
+	return false
+}
+
+// lastAddr is the last address of a prefix.
+func lastAddr(p netip.Prefix) netip.Addr {
+	a := p.Masked().Addr().As16()
+	bits := p.Bits()
+	if p.Addr().Is4() {
+		bits += 96
+	}
+	for i := bits; i < 128; i++ {
+		a[i/8] |= 1 << (7 - i%8)
+	}
+	out := netip.AddrFrom16(a)
+	if p.Addr().Is4() {
+		out = out.Unmap()
+	}
+	return out
 }
 
 func (an *analyzer) protoExcl(op string, v valueSet) classes {

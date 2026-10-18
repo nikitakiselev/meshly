@@ -224,7 +224,9 @@ into them itself (see [iptables and UFW](#iptables-and-ufw)).
 | `unsupported` | The chain may drop meshly traffic and integration is impossible: it belongs to iptables but is not `filter INPUT` or `filter OUTPUT` (a `DROP` in `mangle`, for example), or it runs before meshly (prerouting/output at priority ≤ −180) |
 
 The analysis is conservative. A rule matching a source range that could include the peer's public endpoint, or
-`udp dport 53 reject` where an allowed VPN service could be on 53, counts as "may drop".
+`udp dport 53 reject` where an allowed VPN service could be on 53, counts as "may drop". Until a peer is known
+(`init`, `invite`, `join`), a rule on the peer's address counts only if it holds an address of the VPN network. A
+ban list, such as fail2ban's, never needs integration (see [fail2ban and other ban lists](#fail2ban-and-other-ban-lists)).
 
 The profile is chosen with `--firewall` at `init`/`join`. `auto` (the default) picks `nftables` when any native
 nftables chain needs, has, or misplaces integration, and `none` otherwise.
@@ -232,7 +234,7 @@ nftables chain needs, has, or misplaces integration, and `none` otherwise.
 ### `none`: no native nftables firewall on the host
 
 The host has no native nftables chain that could drop meshly traffic. This covers most fresh VPS images, Docker
-hosts that run only Docker's own chains, and hosts that filter only with iptables or UFW. Without iptables rules,
+hosts that run only Docker's own chains, hosts that filter only with iptables or UFW, and hosts with fail2ban. Without iptables rules,
 meshly's table is the entire policy for VPN traffic. If a native filtering chain appears later, `meshly doctor`
 reports it as a problem.
 
@@ -313,6 +315,55 @@ traffic (a `DROP` in `mangle`, for example) is refused, and so are rules of the 
 `TestUFW` checks this with real UFW 0.36.2 on Debian 12 and Ubuntu 24.04, `TestIptablesHost` with hand-written
 iptables rules, and `TestSystemdUFW` across a reboot and a restart of `netfilter-persistent.service` (see
 [testing.md](testing.md)).
+
+## fail2ban and other ban lists
+
+fail2ban bans an address by adding it to a named set. With its `nftables` actions, the default on Ubuntu 24.04, the
+sets and the rules that use them are in the table `inet f2b-table`:
+
+```nft
+table inet f2b-table {
+	set addr-set-sshd {
+		type ipv4_addr
+		elements = { 192.0.2.66 }
+	}
+
+	chain f2b-chain {
+		type filter hook input priority filter - 1; policy accept;
+		tcp dport 22 ip saddr @addr-set-sshd reject with icmp port-unreachable
+	}
+}
+```
+
+meshly treats such a rule as a ban list: it drops packets whose source address (on output, the destination) is in a
+named set, and the set holds no range that overlaps the VPN network. A ban list needs no integration rule, because
+it drops meshly traffic only from the addresses in the set. The same holds for sshguard, CrowdSec's nftables bouncer
+and your own blocklists.
+
+The bans hold for traffic through meshly too: a peer that fails SSH logins through the VPN is banned like any other
+address. While a ban hits a peer (its VPN address or its endpoint), commands that check the firewall and
+`meshly doctor` warn, but never refuse:
+
+```text
+meshly: warning: firewall-ban: fail2ban has banned 10.100.0.2 (peer home) in set addr-set-sshd of table inet f2b-table: its traffic through meshly is dropped until the ban ends
+         fix: sudo fail2ban-client unban 10.100.0.2   (to never ban it, add it to ignoreip in /etc/fail2ban/jail.local)
+```
+
+fail2ban's jails match only TCP by default (also its "all ports" actions), so its bans do not touch the WireGuard
+transport.
+
+Two kinds of sets are not ban lists. A set that holds a range over the VPN network (a "drop private sources" set
+with `10.0.0.0/8`, for example) would drop all VPN traffic, and an anonymous set written in the rule
+(`ip saddr { … } drop`) is judged like any other match. Preflight reports their chains as it reports any other chain
+that may drop meshly traffic.
+
+With fail2ban's iptables actions (`iptables-multiport`, the default on Debian 12) its jumps are in the iptables
+`INPUT` chain, below meshly's rule (see [iptables and UFW](#iptables-and-ufw)), so its bans do not apply to traffic
+that meshly accepted. When fail2ban starts, it inserts its jump above meshly's rule; `meshly-check.timer` moves
+meshly's rule back to the top.
+
+`TestFail2ban` checks this with real fail2ban 1.0.2 and its nftables actions on Debian 12 and Ubuntu 24.04, and
+`TestFail2banIptables` with its iptables actions (see [testing.md](testing.md)).
 
 ## Unsupported configurations
 

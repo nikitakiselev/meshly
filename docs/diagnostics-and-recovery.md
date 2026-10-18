@@ -141,12 +141,14 @@ never contains private keys.
 | `nftables-ruleset` | The ruleset could not be read. | Check that `nf_tables` is available in the kernel. |
 | `firewall-manager` | firewalld is active; there is no adapter for it. | Disable it and use UFW, iptables or native nftables, or do not use meshly on this host. |
 | `ufw` | UFW is enabled (information): meshly keeps its rule at the top of the iptables `INPUT` and `OUTPUT` chains. | — |
+| `fail2ban` | fail2ban's nftables table exists (information): the addresses it bans stay banned for traffic through meshly. | — |
 | `iptables-legacy` | Legacy iptables rules exist (or cannot be inspected). | Switch iptables to the `iptables-nft` backend (`update-alternatives --set iptables /usr/sbin/iptables-nft`, the same for `ip6tables`) and reload the rules. |
 | `firewall-table` | A table `inet meshly` exists that meshly did not create. | Rename or delete it; meshly never takes over foreign objects. |
 | `flowtable` | A flowtable offloads traffic of the meshly interface, which would bypass the policy. | Remove the interface from the flowtable devices. |
 | `firewall-chain` | A foreign chain is outside the supported profiles (for example an iptables-nft `mangle` chain that drops). | See [firewall.md](firewall.md). |
 | `firewall-iptables` | iptables chains filter traffic (information): meshly keeps its rule at the top of them. | — |
 | `firewall-integration` | A foreign base chain would drop meshly traffic: integration rule missing, misplaced (after a drop), or profile `none` on a host with a filtering firewall. | Add `meta mark & 0x10000000 == 0x10000000 accept comment "meshly"` before any drop/reject rule in that chain and reload nftables. |
+| `firewall-ban` | A ban list (fail2ban's, or a named set of addresses) holds a peer's VPN address or endpoint, so its traffic is dropped (warning, never a refusal). | fail2ban: `sudo fail2ban-client unban <address>`, or add it to `ignoreip`; another set: `sudo nft delete element <family> <table> <set> { <address> }` |
 | `firewall-profile` | Summary of the firewall profile (`none` or native `nftables`; iptables chains are not part of it). | — |
 | `docker` | Docker rules were detected. Published container ports are not reachable through the VPN; forwarding and DNAT from the VPN are blocked. | — |
 | `netdev` | A netdev chain exists; it runs before meshly and may drop WireGuard transport. | Review that chain. |

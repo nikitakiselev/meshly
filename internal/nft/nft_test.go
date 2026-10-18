@@ -15,9 +15,11 @@ import (
 
 var nftVersions = []string{"nft-1.0.6", "nft-1.0.9"}
 
-// ufwVersions adds nft-1.1.3 (Debian 13, iptables 1.8.11), captured only
-// with UFW: ufw.json and ufw-integrated.json.
-var ufwVersions = []string{"nft-1.0.6", "nft-1.0.9", "nft-1.1.3"}
+// allVersions adds nft-1.1.3 (Debian 13, iptables 1.8.11), captured only
+// with UFW and fail2ban (newerCaptures).
+var allVersions = []string{"nft-1.0.6", "nft-1.0.9", "nft-1.1.3"}
+
+var newerCaptures = map[string]bool{"ufw": true, "ufw-integrated": true, "fail2ban": true, "fail2ban-peer": true}
 
 func loadFixture(t testing.TB, version, name string) *Ruleset {
 	t.Helper()
@@ -267,8 +269,10 @@ func TestMarkerRoundTripRealNft(t *testing.T) {
 func TestAnalyzeFixtures(t *testing.T) {
 	type want struct {
 		chains     map[string]string // "family table chain" -> status
+		bans       map[string]string // "family table chain" -> "set addr,addr; ..."
 		docker     bool
 		ufw        bool
+		fail2ban   bool
 		firewalld  bool
 		flowtables int
 		netdev     int
@@ -282,8 +286,16 @@ func TestAnalyzeFixtures(t *testing.T) {
 		// endpoint (WireGuard transport) and "udp dport 53 reject" an
 		// allowed VPN service.
 		"accept-compatible": {chains: map[string]string{"inet filter input": "needs-integration"}},
-		"named-set-peer":    {chains: map[string]string{"inet filter input": "needs-integration"}},
-		"docker":            {chains: map[string]string{"ip nat PREROUTING": "compatible", "ip nat POSTROUTING": "compatible"}, docker: true},
+		// A named set of single addresses is a ban list: it may list the
+		// peer, which is reported, but needs no integration.
+		"named-set-peer": {chains: map[string]string{"inet filter input": "compatible"},
+			bans: map[string]string{"inet filter input": "blocked 10.100.0.2"}},
+		// fail2ban (sshd and recidive jails, IPv4 and IPv6 bans): only TCP,
+		// and only banned addresses.
+		"fail2ban": {chains: map[string]string{"inet f2b-table f2b-chain": "compatible"}, fail2ban: true},
+		"fail2ban-peer": {chains: map[string]string{"inet f2b-table f2b-chain": "compatible"}, fail2ban: true,
+			bans: map[string]string{"inet f2b-table f2b-chain": "addr-set-sshd 10.100.0.2"}},
+		"docker": {chains: map[string]string{"ip nat PREROUTING": "compatible", "ip nat POSTROUTING": "compatible"}, docker: true},
 		// iptables filter INPUT/OUTPUT: integrated by meshly itself.
 		"iptables-nft-drop": {chains: map[string]string{"ip filter INPUT": "needs-integration"}},
 		"ufw-chains":        {chains: map[string]string{"ip filter INPUT": "needs-integration"}, ufw: true},
@@ -294,9 +306,9 @@ func TestAnalyzeFixtures(t *testing.T) {
 		"firewalld":        {firewalld: true},
 		"flowtable-netdev": {flowtables: 1, netdev: 1},
 	}
-	for _, v := range ufwVersions {
+	for _, v := range allVersions {
 		for name, w := range cases {
-			if !slices.Contains(nftVersions, v) && name != "ufw" && name != "ufw-integrated" {
+			if !slices.Contains(nftVersions, v) && !newerCaptures[name] {
 				continue
 			}
 			t.Run(v+"/"+name, func(t *testing.T) {
@@ -314,6 +326,12 @@ func TestAnalyzeFixtures(t *testing.T) {
 					}
 				}
 				for _, c := range a.Chains {
+					k := c.Family + " " + c.Table + " " + c.Chain
+					if b := bansString(c.Bans); b != w.bans[k] {
+						t.Fatalf("%s: bans %q, want %q", k, b, w.bans[k])
+					}
+				}
+				for _, c := range a.Chains {
 					if want := c.Table == "filter" && c.IptablesManaged; c.ByMeshly != want {
 						t.Fatalf("%s %s %s: integrated by meshly %v, want %v", c.Family, c.Table, c.Chain, c.ByMeshly, want)
 					}
@@ -321,11 +339,87 @@ func TestAnalyzeFixtures(t *testing.T) {
 				if len(a.NeedsIntegration()) != 0 && strings.HasPrefix(name, "ufw") {
 					t.Fatalf("the administrator is asked to integrate iptables chains: %+v", a.NeedsIntegration())
 				}
-				if a.DockerDetected != w.docker || a.UFWChains != w.ufw || a.FirewalldTables != w.firewalld ||
+				if a.DockerDetected != w.docker || a.UFWChains != w.ufw || a.Fail2ban != w.fail2ban || a.FirewalldTables != w.firewalld ||
 					len(a.Flowtables) != w.flowtables || len(a.NetdevChains) != w.netdev {
 					t.Fatalf("flags: %+v", a)
 				}
 			})
+		}
+	}
+}
+
+func bansString(bans []Ban) string {
+	var out []string
+	for _, b := range bans {
+		var addrs []string
+		for _, a := range b.Addrs {
+			addrs = append(addrs, a.String())
+		}
+		out = append(out, b.Set+" "+strings.Join(addrs, ","))
+	}
+	return strings.Join(out, "; ")
+}
+
+// initContext is the context of init, invite and join: no peer yet.
+func initContext() Context {
+	c := testContext()
+	c.Peers = nil
+	c.Network = netip.MustParsePrefix("10.100.0.0/24")
+	return c
+}
+
+// Until a peer is known, a ban list is checked against the VPN network.
+func TestBanListsWithoutPeers(t *testing.T) {
+	for _, v := range allVersions {
+		a := Analyze(loadFixture(t, v, "fail2ban"), initContext())
+		if len(a.Chains) != 1 || a.Chains[0].Status != "compatible" || len(a.Chains[0].Bans) != 0 {
+			t.Fatalf("%s: fail2ban before pairing: %+v", v, a.Chains)
+		}
+		a = Analyze(loadFixture(t, v, "fail2ban-peer"), initContext())
+		if c := a.Chains[0]; c.Status != "compatible" || bansString(c.Bans) != "addr-set-sshd 10.100.0.2" {
+			t.Fatalf("%s: banned VPN address before pairing: %+v", v, c)
+		}
+	}
+}
+
+func TestBanLists(t *testing.T) {
+	ruleset := func(elems, rule string) *Ruleset {
+		t.Helper()
+		js := `{"nftables":[{"metainfo":{"json_schema_version":1}},{"table":{"family":"inet","name":"filter","handle":1}},` +
+			`{"set":{"family":"inet","name":"s","table":"filter","type":"ipv4_addr","handle":2,"elem":[` + elems + `]}},` +
+			`{"chain":{"family":"inet","table":"filter","name":"input","handle":3,"type":"filter","hook":"input","prio":0,"policy":"accept"}},` +
+			`{"rule":{"family":"inet","table":"filter","chain":"input","handle":4,"expr":[` + rule + `,{"drop":null}]}}]}`
+		rs, err := ParseRuleset([]byte(js))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rs
+	}
+	saddr := func(op, right string) string {
+		return `{"match":{"op":"` + op + `","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":` + right + `}}`
+	}
+	endpoint := testContext()
+	endpoint.Endpoints = []netip.Addr{netip.MustParseAddr("203.0.113.20")}
+	cases := []struct {
+		name, elems, rule string
+		ctx               Context
+		status, bans      string
+	}{
+		{"banned endpoint", `"203.0.113.20","198.51.100.7"`, saddr("==", `"@s"`), endpoint, "compatible", "s 203.0.113.20"},
+		{"endpoint not known", `"203.0.113.20","198.51.100.7"`, saddr("==", `"@s"`), testContext(), "compatible", ""},
+		{"range outside the VPN", `{"prefix":{"addr":"192.0.2.0","len":24}}`, saddr("==", `"@s"`), initContext(), "compatible", ""},
+		{"range over the VPN", `{"prefix":{"addr":"10.0.0.0","len":8}}`, saddr("==", `"@s"`), initContext(), "needs-integration", ""},
+		{"range over the peer", `{"prefix":{"addr":"10.0.0.0","len":8}}`, saddr("==", `"@s"`), testContext(), "needs-integration", ""},
+		{"interval over the VPN", `{"range":["10.100.0.100","10.100.1.5"]}`, saddr("==", `"@s"`), initContext(), "needs-integration", ""},
+		{"allow list", `"198.51.100.7"`, saddr("!=", `"@s"`), testContext(), "needs-integration", ""},
+		// An anonymous set is not a ban list: it may hold the peer's
+		// endpoint (WireGuard transport).
+		{"anonymous set", `"198.51.100.7"`, saddr("==", `{"set":["198.51.100.7"]}`), initContext(), "needs-integration", ""},
+	}
+	for _, c := range cases {
+		a := Analyze(ruleset(c.elems, c.rule), c.ctx)
+		if len(a.Chains) != 1 || a.Chains[0].Status != c.status || bansString(a.Chains[0].Bans) != c.bans {
+			t.Errorf("%s: %+v, want %s with bans %q", c.name, a.Chains, c.status, c.bans)
 		}
 	}
 }
@@ -335,7 +429,7 @@ func TestAnalyzeFixtures(t *testing.T) {
 func TestIptablesChainsRealUFW(t *testing.T) {
 	mark := model.DefaultFirewallMark
 	rule := `insert rule %s filter %s meta mark & 0x10000000 == 0x10000000 counter accept comment "meshly:v1 integration"` + "\n"
-	for _, v := range ufwVersions {
+	for _, v := range allVersions {
 		chains := loadFixture(t, v, "ufw").IptablesChains(mark)
 		if got := IptablesNames(chains); got != "ip filter INPUT, ip filter OUTPUT, ip6 filter INPUT, ip6 filter OUTPUT" {
 			t.Fatalf("%s: chains %s", v, got)

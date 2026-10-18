@@ -198,6 +198,9 @@ func (s *System) Managers(ctx context.Context, r *Report, a *nft.Analysis) {
 		r.add("firewall-manager", Fail, "firewalld is active; meshly has no firewalld adapter in this version",
 			"stop and disable firewalld (systemctl disable --now firewalld) and manage nftables natively, or do not use meshly on this host")
 	}
+	if a != nil && a.Fail2ban {
+		r.add("fail2ban", Info, "fail2ban is active: the addresses it bans stay banned for traffic through meshly", "")
+	}
 	if a != nil && a.UFWChains || s.UFWEnabled() {
 		r.add("ufw", Info, "UFW is enabled: meshly keeps its rule at the top of the iptables INPUT and OUTPUT chains, and UFW decides all other traffic", "")
 	}
@@ -278,9 +281,13 @@ func legacyHasRules(save []byte) bool {
 
 // AnalysisContext builds the nft analysis context for a config.
 func (s *System) AnalysisContext(c *model.Config) nft.Context {
-	ctx := nft.Context{Interface: c.Interface.Name, LocalVPN: c.Self.Address, ListenPort: c.Self.ListenPort, Mark: c.Firewall.Mark}
+	ctx := nft.Context{Interface: c.Interface.Name, LocalVPN: c.Self.Address, ListenPort: c.Self.ListenPort, Mark: c.Firewall.Mark,
+		Network: c.Network.CIDR}
 	for _, p := range c.Peers {
 		ctx.Peers = append(ctx.Peers, p.Address)
+		if p.Endpoint.IsValid() {
+			ctx.Endpoints = append(ctx.Endpoints, p.Endpoint.Addr())
+		}
 	}
 	if s.Links != nil {
 		ctx.LocalAddrs, _ = s.Links.LocalAddrs()
@@ -300,7 +307,35 @@ func (s *System) Firewall(ctx context.Context, r *Report, c *model.Config, stric
 	a := nft.Analyze(rs, s.AnalysisContext(c))
 	s.Managers(ctx, r, a)
 	EvaluateFirewall(r, a, c.Firewall.Profile, c.Firewall.Mark, strict)
+	Bans(r, a, c)
 	return a
+}
+
+// Bans warns about peers listed in a ban list, such as fail2ban's. The
+// ban drops their traffic on purpose, so it never blocks an operation.
+func Bans(r *Report, a *nft.Analysis, c *model.Config) {
+	for _, ch := range a.Chains {
+		for _, b := range ch.Bans {
+			for _, addr := range b.Addrs {
+				who := addr.String() + " (an address of the VPN network)"
+				for _, p := range c.Peers {
+					switch {
+					case p.Address == addr:
+						who = addr.String() + " (peer " + p.Name + ")"
+					case p.Endpoint.Addr().Unmap() == addr:
+						who = addr.String() + " (endpoint of peer " + p.Name + ")"
+					}
+				}
+				if b.Fail2ban(ch.Table) {
+					r.add("firewall-ban", Warn, fmt.Sprintf("fail2ban has banned %s in set %s of table %s %s: its traffic through meshly is dropped until the ban ends", who, b.Set, ch.Family, ch.Table),
+						fmt.Sprintf("sudo fail2ban-client unban %s   (to never ban it, add it to ignoreip in /etc/fail2ban/jail.local)", addr))
+					continue
+				}
+				r.add("firewall-ban", Warn, fmt.Sprintf("set %s in table %s %s lists %s: chain %s drops its traffic through meshly", b.Set, ch.Family, ch.Table, who, ch.Chain),
+					fmt.Sprintf("sudo nft delete element %s %s %s { %s }", ch.Family, ch.Table, b.Set, addr))
+			}
+		}
+	}
 }
 
 // EvaluateFirewall turns an analysis into checks for a profile.

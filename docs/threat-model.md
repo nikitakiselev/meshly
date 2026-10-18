@@ -345,7 +345,8 @@ an admin's `nft flush ruleset` can interfere with meshly's table.
   3. `--dry-run` reports the same. *Integration:* `TestUnsupportedFirewalls`
   checks that foreign state is unchanged after the refusal. Note that
   firewalld is simulated by its pid file, not by the real daemon. *Unit:*
-  `TestAnalyzeFixtures` over rulesets recorded from nft 1.0.6 and 1.0.9.
+  `TestAnalyzeFixtures` over rulesets recorded from nft 1.0.6 and 1.0.9
+  (UFW and fail2ban also from 1.1.3).
 - **UFW and iptables.** meshly keeps one rule at the top of the iptables
   `filter` chains `INPUT` and `OUTPUT`; it accepts only packets that carry
   meshly's mark, which meshly sets only on packets its own policy accepted
@@ -355,6 +356,15 @@ an admin's `nft flush ruleset` can interfere with meshly's table.
   `iptables-restore`, until the check repairs it) the VPN fails closed.
   *Integration:* `TestUFW` (Debian 12 and Ubuntu 24.04, real UFW on both
   nodes), `TestIptablesHost`, `TestSystemdUFW` (reboot).
+- **Ban lists hold.** A rule that drops sources listed in a named set
+  without a range of VPN addresses (fail2ban, sshguard, CrowdSec) is left
+  alone and needs no integration, so its bans apply to traffic through the
+  VPN too: a peer that fails SSH logins through the tunnel is banned like
+  any other host. A ban that hits a peer is a warning, never a refusal, so
+  it cannot keep meshly from starting. With fail2ban's iptables actions its
+  jumps come after meshly's rule, and its bans do not reach traffic meshly
+  accepted. *Integration:* `TestFail2ban` (Debian 12 and Ubuntu 24.04, real
+  fail2ban on both nodes), `TestFail2banIptables`. *Unit:* `TestBanLists`.
 - **Native nftables profile.** A host firewall with `policy drop` must
   contain the one integration rule
   `meta mark & 0x10000000 == 0x10000000 accept`. A missing or misplaced rule
