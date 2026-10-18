@@ -589,7 +589,9 @@ func TestBans(t *testing.T) {
 }
 
 // Whatever may drop container traffic on the forward hook is a warning
-// with the exact fix, never a failure, strict or not.
+// with the exact fix, never a failure, strict or not. The chains of
+// Docker's own nftables backend are information: they pass meshly's
+// traffic.
 func TestEvaluateFirewallForward(t *testing.T) {
 	const mark = model.DefaultFirewallMark
 	rule := nft.IntegrationRule(mark)
@@ -609,9 +611,8 @@ func TestEvaluateFirewallForward(t *testing.T) {
 		{ID: "firewall-forward", Status: Warn,
 			Detail: "chain ip mangle FORWARD (hook forward, policy accept) may drop the traffic of Docker containers through meshly: rules [10] may drop meshly traffic; meshly integrates only the FORWARD chain of the iptables filter table; containers cannot use the VPN through this chain",
 			Fix:    "see docs/firewall.md#docker"},
-		{ID: "firewall-forward", Status: Warn,
-			Detail: "chain ip docker-bridges filter-FORWARD (hook forward, policy accept) may drop the traffic of Docker containers through meshly: rules [7] may drop meshly traffic",
-			Fix:    `Docker's nftables firewall backend is not supported for containers through meshly: set "firewall-backend": "iptables" in /etc/docker/daemon.json and restart Docker`},
+		{ID: "firewall-forward", Status: Info,
+			Detail: "chain ip docker-bridges filter-FORWARD (hook forward, policy accept): Docker's nftables firewall backend decides container traffic here; published container ports and container connections work through meshly with it (tested with Docker 29), but rules you add to Docker's chains can block them"},
 	}
 	for _, profile := range []string{model.ProfileNone, model.ProfileNftables} {
 		for _, strict := range []bool{true, false} {

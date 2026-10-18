@@ -380,16 +380,19 @@ func EvaluateFirewall(r *Report, a *nft.Analysis, profile string, mark uint32, s
 		}
 	}
 	// Forward chains never fail: they carry only the traffic of Docker
-	// containers, not the tunnel between the hosts.
+	// containers, not the tunnel between the hosts. The chains of Docker's
+	// own nftables backend pass meshly's traffic (TestDockerNftablesBackend).
 	for _, c := range a.Forward() {
-		detail := fmt.Sprintf("chain %s %s %s (hook forward, policy %s) may drop the traffic of Docker containers through meshly: %s", c.Family, c.Table, c.Chain, c.Policy, c.Detail)
+		where := fmt.Sprintf("chain %s %s %s (hook forward, policy %s)", c.Family, c.Table, c.Chain, c.Policy)
+		if strings.HasPrefix(c.Table, "docker") {
+			r.add("firewall-forward", Info, where+": Docker's nftables firewall backend decides container traffic here; published container ports and container connections work through meshly with it (tested with Docker 29), but rules you add to Docker's chains can block them", "")
+			continue
+		}
+		detail := where + " may drop the traffic of Docker containers through meshly: " + c.Detail
 		fix := "add to that chain, before any drop/reject rule:\n      " + rule
 		if c.Status == "unsupported" {
 			detail += "; containers cannot use the VPN through this chain"
 			fix = "see docs/firewall.md#docker"
-		}
-		if strings.HasPrefix(c.Table, "docker") {
-			fix = `Docker's nftables firewall backend is not supported for containers through meshly: set "firewall-backend": "iptables" in /etc/docker/daemon.json and restart Docker`
 		}
 		r.add("firewall-forward", Warn, detail, fix)
 	}
