@@ -243,6 +243,23 @@ func TestInstallUpgradeUninstall(t *testing.T) {
 		}
 	})
 
+	// Before init, and with /run emptied as by a boot, upgrade still takes
+	// its lock.
+	l.Run("upgrade-uninitialized", func(t *testing.T) {
+		vps.MustSh("rm -rf /run/meshly")
+		r := vps.MustMeshly("MESHLY_TEST_RELEASE_URL="+base, "upgrade", "--yes")
+		if !strings.Contains(r.Out, "nothing to restart") {
+			t.Fatalf("upgrade before init: %s", r)
+		}
+		if v := strings.TrimSpace(vps.MustSh("meshly version --short")); v != "0.0.2" {
+			t.Fatalf("version after upgrade: %s", v)
+		}
+		if vps.Sh("test -e /etc/meshly").Code == 0 {
+			t.Fatal("upgrade created /etc/meshly on a node without meshly")
+		}
+		vps.MustSh("MESHLY_BASE_URL=" + base + " MESHLY_VERSION=0.0.1 sh /srv/releases/latest/download/install.sh")
+	})
+
 	vps, home := l.Pair()
 	vps.MustMeshly("allow", "8080/tcp", "from", "home")
 	vps.Listen("tcp", 8080)
@@ -272,7 +289,8 @@ func TestInstallUpgradeUninstall(t *testing.T) {
 		}
 		// Downgrade needs --force; a forged release is refused.
 		vps.ExpectCode(5, env, "upgrade", "--version", "0.0.1", "--yes")
-		vps.MustSh("cd /srv/releases/download/v0.0.1 && sed -i 's/^./0/' SHA256SUMS")
+		// Change the first hex digit of the hash, whatever it is.
+		vps.MustSh("cd /srv/releases/download/v0.0.1 && sed -i -e 's/^0/1/;t' -e 's/^./0/' SHA256SUMS")
 		if r := vps.ExpectCode(1, env, "upgrade", "--version", "0.0.1", "--force", "--yes"); !strings.Contains(r.Err, "verification failed") {
 			t.Fatalf("forged release not reported as such: %s", r)
 		}

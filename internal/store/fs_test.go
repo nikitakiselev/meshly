@@ -111,6 +111,24 @@ func TestEnsureDirs(t *testing.T) {
 	}
 }
 
+// The runtime directory alone, as upgrade needs it after a boot: nothing
+// else is created.
+func TestEnsureRuntimeDir(t *testing.T) {
+	p := RootedPaths(t.TempDir(), os.Getuid())
+	if err := p.EnsureRuntimeDir(); err != nil {
+		t.Fatal(err)
+	}
+	if perm := permOf(t, p.RuntimeDir); perm != 0o700 {
+		t.Errorf("runtime dir mode %04o, want 0700", perm)
+	}
+	if _, err := os.Lstat(p.ConfigDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("config dir created: %v", err)
+	}
+	if err := p.EnsureRuntimeDir(); err != nil {
+		t.Errorf("second EnsureRuntimeDir: %v", err)
+	}
+}
+
 func TestEnsureDirsRefusesInsecure(t *testing.T) {
 	tests := []struct {
 		name  string

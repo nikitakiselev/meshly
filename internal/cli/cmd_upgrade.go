@@ -80,6 +80,9 @@ func (a *App) cmdUpgrade(ctx context.Context, args []string) error {
 
 	// Replace the binary while holding the lock so that no operation (nor
 	// the check timer) runs half on the old and half on the new binary.
+	if err := a.Paths.EnsureRuntimeDir(); err != nil {
+		return err
+	}
 	l, err := lock.Acquire(a.Paths.LockFile(), a.LockTimeout)
 	if err != nil {
 		return err

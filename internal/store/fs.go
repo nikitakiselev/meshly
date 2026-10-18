@@ -84,6 +84,10 @@ func (p Paths) EnsureDirs() error {
 	return nil
 }
 
+// EnsureRuntimeDir creates the runtime directory, which holds the lock. It
+// is empty after every boot until meshly runs.
+func (p Paths) EnsureRuntimeDir() error { return ensureDir(p.RuntimeDir, 0o700, p.Owner) }
+
 func ensureDir(path string, mode fs.FileMode, owner int) error {
 	if err := os.Mkdir(path, mode); err != nil && !errors.Is(err, fs.ErrExist) {
 		if errors.Is(err, fs.ErrNotExist) {

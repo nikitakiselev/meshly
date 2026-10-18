@@ -7,6 +7,14 @@ on-disk formats.
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-10-18
+
+### Fixed
+
+- `upgrade` failed with `open lock /run/meshly/lock: no such file or directory` on a node where meshly had not run
+  since the last boot, for example before `init`. It now creates `/run/meshly` itself. On 0.0.1 and 0.0.2, update
+  with `install.sh` once, or run `sudo mkdir -p /run/meshly` before `meshly upgrade`.
+
 ## [0.0.2] - 2026-10-18
 
 ### Fixed
@@ -53,6 +61,7 @@ First public release.
 - Signed self-upgrade from GitHub releases (`upgrade`), `install.sh` with signature verification, reproducible
   release builds for linux/amd64 and linux/arm64.
 
-[Unreleased]: https://github.com/nikitakiselev/meshly/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/nikitakiselev/meshly/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/nikitakiselev/meshly/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/nikitakiselev/meshly/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/nikitakiselev/meshly/releases/tag/v0.0.1
