@@ -100,6 +100,8 @@ type App struct {
 	// lock is busy. After a failed check it ignores changes for
 	// WatchBackoff: mostly the failed transaction's own.
 	WatchQuiet, WatchMax, WatchRetry, WatchBackoff time.Duration
+	// watchChecked, if set, is called after each check of the watch (tests).
+	watchChecked func()
 }
 
 func (a *App) pairTimeouts() pairing.Timeouts {

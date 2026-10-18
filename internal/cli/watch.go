@@ -17,16 +17,15 @@ func (a *App) serviceWatch(ctx context.Context) error {
 	}
 	wait, cancel := a.waitContext(ctx)
 	defer cancel()
-	w := &watch{a: a, ctx: ctx, wait: wait}
-	if !w.check() {
-		return nil
-	}
+	// Subscribed before the first check, which covers what changed while
+	// the watch was not running: nothing that changes during it is missed.
+	// The changes of its own repair cause one more check, without drift.
 	changes, err := a.Changes(wait)
 	if err != nil {
 		return fmt.Errorf("watch: %w", err)
 	}
-	w.changes = changes
-	for w.settle() && w.check() {
+	w := &watch{a: a, ctx: ctx, wait: wait, changes: changes}
+	for w.check() && w.settle() {
 	}
 	if w.closed && wait.Err() == nil {
 		return errors.New("watch: the link and nftables events ended")
@@ -78,6 +77,9 @@ func (w *watch) settle() bool {
 func (w *watch) check() bool {
 	for {
 		busy, err := w.a.checkOnce(w.ctx)
+		if w.a.watchChecked != nil {
+			w.a.watchChecked()
+		}
 		if err != nil {
 			fmt.Fprintf(w.a.Stderr, "meshly: watch: %v\n", err)
 			return w.pause(w.a.WatchBackoff)

@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,23 +25,26 @@ import (
 // watchRun is a `meshly service watch` running in the background, fed with
 // the changes the test reports.
 type watchRun struct {
-	t          *testing.T
-	events     chan struct{}
-	subscribed chan struct{}
-	cancels    chan context.CancelFunc
-	done       chan struct{}
-	stopped    sync.Once
-	exit       int
-	out        string
+	t       *testing.T
+	events  chan struct{}
+	cancels chan context.CancelFunc
+	done    chan struct{}
+	stopped sync.Once
+	exit    int
+	out     string
+	// checks counts the finished checks; subscribedAt is their number when
+	// the watch subscribed (-1: not yet).
+	checks       atomic.Int64
+	subscribedAt atomic.Int64
 }
 
 // startWatch runs `meshly service watch` on n and returns once the watch has
-// made its first check and subscribed. SIGTERM is simulated through
+// subscribed and finished its first check. SIGTERM is simulated through
 // WaitContext.
 func startWatch(t *testing.T, n *testNode) *watchRun {
 	t.Helper()
-	w := &watchRun{t: t, events: make(chan struct{}, 1), subscribed: make(chan struct{}),
-		cancels: make(chan context.CancelFunc, 1), done: make(chan struct{})}
+	w := &watchRun{t: t, events: make(chan struct{}, 1), cancels: make(chan context.CancelFunc, 1), done: make(chan struct{})}
+	w.subscribedAt.Store(-1)
 	n.app.WatchQuiet, n.app.WatchMax, n.app.WatchRetry = 20*time.Millisecond, 100*time.Millisecond, 30*time.Millisecond
 	if n.app.WatchBackoff == 0 {
 		n.app.WatchBackoff = time.Hour
@@ -51,23 +55,35 @@ func startWatch(t *testing.T, n *testNode) *watchRun {
 		return ctx, cancel
 	}
 	n.app.Changes = func(context.Context) (<-chan struct{}, error) {
-		close(w.subscribed)
+		w.subscribedAt.Store(w.checks.Load())
 		return w.events, nil
 	}
+	n.app.watchChecked = func() { w.checks.Add(1) }
 	go func() {
 		defer close(w.done)
 		code, out, errOut := n.run("service", "watch")
 		w.exit, w.out = code, out+errOut
 	}()
 	t.Cleanup(func() { w.stop() })
-	select {
-	case <-w.subscribed:
-	case <-w.done:
-		t.Fatalf("meshly service watch: exit %d before it subscribed\n%s", w.exit, w.out)
-	case <-time.After(10 * time.Second):
-		t.Fatal("meshly service watch did not subscribe")
+	if !w.checked(1) || w.subscribedAt.Load() < 0 {
+		code, out := w.stop()
+		t.Fatalf("meshly service watch did not subscribe and check: exit %d\n%s", code, out)
 	}
 	return w
+}
+
+// checked waits until the watch has finished n checks in all and reports
+// whether it has.
+func (w *watchRun) checked(n int64) bool {
+	within(10*time.Second, func() bool {
+		select {
+		case <-w.done:
+			return true
+		default:
+			return w.checks.Load() >= n
+		}
+	})
+	return w.checks.Load() >= n
 }
 
 // change reports a change as the kernel does: at most one is pending.
@@ -146,8 +162,7 @@ func dockerApplied(n *testNode) bool {
 func TestServiceWatchAppliesDockerNetwork(t *testing.T) {
 	vps, _ := pair(t)
 	w := startWatch(t, vps)
-	// The watch waits for a change: it reads no kernel state meanwhile.
-	vps.k.Docker = docker0
+	vps.k.SetDocker(docker0)
 	w.change()
 	if !within(time.Second, func() bool { return dockerApplied(vps) }) {
 		t.Fatal("the Docker network is not applied")
@@ -175,7 +190,7 @@ func TestServiceWatchDebounce(t *testing.T) {
 	vps, _ := pair(t)
 	vps.k.AddIptables("ip", "FORWARD", "drop", 1)
 	w := startWatch(t, vps)
-	vps.k.Docker = docker0
+	vps.k.SetDocker(docker0)
 	for i := range 20 {
 		if i%5 == 0 {
 			rs := vps.k.IptablesRules("ip", "FORWARD")
@@ -202,20 +217,24 @@ func TestServiceWatchDebounce(t *testing.T) {
 func TestServiceWatchMaxWait(t *testing.T) {
 	vps, _ := pair(t)
 	w := startWatch(t, vps)
-	vps.k.Docker = docker0
+	vps.k.SetDocker(docker0)
 	if !within(time.Second, func() bool { w.change(); return dockerApplied(vps) }) {
 		t.Fatal("not applied while the changes went on")
 	}
 }
 
-// The first check, before the subscription, covers the changes made while
-// the watch was not running.
+// The first check covers the changes made while the watch was not running.
+// The watch subscribes before it: nothing that changes during the check is
+// missed.
 func TestServiceWatchChecksAtStart(t *testing.T) {
 	vps, _ := pair(t)
-	vps.k.Docker = docker0
-	startWatch(t, vps)
+	vps.k.SetDocker(docker0)
+	w := startWatch(t, vps)
 	if !dockerApplied(vps) {
 		t.Fatal("not applied at start")
+	}
+	if n := w.subscribedAt.Load(); n != 0 {
+		t.Fatalf("subscribed after %d checks, want before the first", n)
 	}
 }
 
@@ -228,7 +247,7 @@ func TestServiceWatchWaitsForLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	vps.k.Docker = docker0
+	vps.k.SetDocker(docker0)
 	w.change()
 	time.Sleep(200 * time.Millisecond)
 	if dockerApplied(vps) || checkRepairs(t, vps, journal.EventBegin) != 0 {
@@ -249,12 +268,14 @@ func TestServiceWatchNoChangeNoJournal(t *testing.T) {
 	w := startWatch(t, vps)
 	before := readFile(t, vps.app.Paths.JournalFile())
 	w.change()
-	time.Sleep(2 * vps.app.WatchMax)
+	if !w.checked(w.checks.Load() + 1) {
+		t.Fatal("no check after the change")
+	}
 	if after := readFile(t, vps.app.Paths.JournalFile()); after != before {
 		t.Fatalf("journal written:\n%s", strings.TrimPrefix(after, before))
 	}
 	// The watch is alive: a real change is still repaired.
-	vps.k.Docker = docker0
+	vps.k.SetDocker(docker0)
 	w.change()
 	if !within(time.Second, func() bool { return dockerApplied(vps) }) {
 		_, out := w.stop()
@@ -270,7 +291,7 @@ func TestServiceWatchBacksOffAfterFailure(t *testing.T) {
 	vps.app.WatchBackoff = 500 * time.Millisecond
 	w := startWatch(t, vps)
 	vps.k.Fail("docker.routing", -1)
-	vps.k.Docker = docker0
+	vps.k.SetDocker(docker0)
 	w.change()
 	if !within(time.Second, func() bool {
 		return checkRepairs(t, vps, journal.EventRolledBack, journal.EventSafeMode) == 1

@@ -108,6 +108,14 @@ func (k *Kernel) SetIptablesRules(family, chain string, rules []IptablesRule) {
 	}
 }
 
+// SetDocker replaces the Docker bridges, as Docker creating or removing
+// networks would, while meshly may be reading them.
+func (k *Kernel) SetDocker(bridges []netstack.Bridge) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.Docker = slices.Clone(bridges)
+}
+
 func (k *Kernel) iptablesChain(family, chain string) *IptablesChain {
 	for _, c := range k.Iptables {
 		if c.Family == family && c.Chain == chain {
