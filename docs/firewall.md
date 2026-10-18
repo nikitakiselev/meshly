@@ -558,16 +558,23 @@ consults before this rule, so they are not affected.
   from the addresses of the bridges and follow them. Every check compares the rule and the routes and repairs them
   as drift.
 - Without Docker networks there is neither the rule nor a route in table 109. On a node with Docker networks,
-  routes of another program in table 109 are a conflict (exit code 5); without Docker networks meshly leaves the
-  table alone.
+  routes of another program in table 109 turn container support off: meshly leaves the Docker networks out, so
+  there is neither the rule nor `forwarding`, the tunnel between the hosts works, and preflight and `doctor` warn
+  (`docker`) with the fix. Without Docker networks meshly leaves the table alone.
+- A bridge that is set down is left out until it is up again. A subnet that two Docker networks share is routed to
+  the first of them by name; the other network stays in the table, without a route.
+- If applying the Docker networks fails, meshly applies the configuration without them before it rolls back or
+  goes to safe mode: the tunnel between the hosts works, the command warns, and `meshly logs` shows
+  `completed without the Docker networks: …`. meshly retries with the networks every minute.
 - The rule exists before `forwarding` goes on, and is removed only after `forwarding` is off, also when a step
   fails.
 - The rule does not change the reverse-path check (`rp_filter`) of packets that come from the tunnel: the kernel
   does not look up their source as coming from `meshly0`. It does change the check of packets that would be
   forwarded *into* the tunnel, whose source the kernel looks up as if it came from `meshly0`, so in table 109. On a
   host with `rp_filter` on (`1` or `2`; Ubuntu sets `2`), a packet from the LAN to the tunnel therefore has no
-  reverse path and is dropped before the forward hook. Containers are not affected: table 109 routes their subnets
-  back to their bridges.
+  reverse path and is dropped before the forward hook. That is the kernel's behaviour, which meshly does not rely
+  on: the test of this path turns `rp_filter` off, so that `guard_fwd` alone decides. Containers are not affected:
+  table 109 routes their subnets back to their bridges.
 
 `TestDockerHostContained` checks this layer with real packets, also without the meshly table and without the rule
 (where `guard_fwd` alone drops), and `TestDockerNetworkLifecycle` checks that rule and routes follow the networks.
@@ -577,10 +584,10 @@ consults before this rule, so they are not affected.
 Forwarded packets also pass the forward chains of the host firewall. meshly marks the packets it accepts and keeps
 its rule at the top of `ip filter FORWARD`, whose policy Docker and UFW set to `DROP` (see
 [iptables and UFW](#iptables-and-ufw)); `meshly status` shows whether it is first. While the node has Docker
-networks, preflight and `meshly doctor` also analyse the other chains on the forward hook. A problem there concerns
-containers only: the tunnel between the hosts does not pass the forward hook. So whatever may drop container traffic
-there is a warning (`firewall-forward`) with the fix, never a refusal, in both profiles: `init`, `allow` and
-`service start` go on.
+networks, preflight, `meshly status` and `meshly doctor` also analyse the other chains on the forward hook, for
+container traffic only: the tunnel between the hosts does not pass the forward hook. So whatever may drop container
+traffic there is a warning (`firewall-forward`) with the fix, never a refusal, in both profiles: `init`, `allow` and
+`service start` go on. `status` names such chains (`forward chains`), and `doctor` prints the fix.
 
 | Chain | Finding | Fix |
 |---|---|---|
@@ -588,10 +595,11 @@ there is a warning (`firewall-forward`) with the fix, never a refusal, in both p
 | A chain that meshly cannot integrate: one of another iptables table that may drop (a `DROP` in `mangle FORWARD`), or one at priority −300 or lower, which runs before `guard_fwd` | warning: containers cannot use the VPN through this chain | Remove or narrow the rule that drops |
 | The chains of Docker's own nftables firewall backend (table `ip docker-bridges`) | information | — |
 
-Docker's nftables firewall backend (`"firewall-backend": "nftables"` in `/etc/docker/daemon.json`) works with meshly
-as its iptables rules do. With Docker CE 29.9.1 on Debian 12 and Ubuntu 24.04, a published port is closed until
-`allow` and reachable after it, and containers reach the peer (`TestDockerNftablesBackend`). `doctor` lists Docker's
-chains as information, because rules you add to them can still block container traffic.
+Docker's nftables firewall backend (`"firewall-backend": "nftables"` in `/etc/docker/daemon.json`) was tested with
+Docker CE 29.9.1 on Debian 12 and Ubuntu 24.04 (`TestDockerNftablesBackend`): a published port is closed until
+`allow` and reachable after it, containers on the default and on a user-defined network reach a port that the peer
+allows, and `doctor` lists Docker's chains as information, because rules you add to them can still block container
+traffic. The other Docker tests, `deny` and the closed LAN among them, run with Docker's iptables rules.
 
 `TestDockerNativeForwardChain` checks a native forward chain with `policy drop`: the tunnel between the hosts keeps
 working, `doctor` warns and prints the rule, and once the rule is added the published port works.
@@ -660,8 +668,16 @@ Until the table is back:
   addresses or on the VPN address, unless a forward chain of your own drops them: Docker's rules let them through,
   as they let the former through from the internet. The LAN stays closed, because
   [policy routing](#policy-routing-table-109) does not depend on the table. Container addresses do have a route
-  then, and only Docker's own rules keep them closed (the tested Docker drops packets for a container that arrive on
-  another interface).
+  then:
+  - When only `table inet meshly` is gone (`nft delete table inet meshly`), Docker's own rules keep them closed: the
+    tested Docker drops packets for a container that arrive on another interface (`TestDockerHostContained` deletes
+    only the meshly table).
+  - `nft flush ruleset`, and a start, reload or restart of `nftables.service` whose config begins with
+    `flush ruleset`, also remove Docker's rules: on the hosts meshly supports they are in nftables too (iptables-nft
+    or Docker's nftables backend). Until meshly re-applies its table, a peer that routes a Docker subnet into the
+    tunnel reaches every port of every container on it by the container's address, published or not. The window is
+    near zero after a start, reload or restart of `nftables.service` and usually seconds after a manual flush. No
+    test covers it. Docker restores its own rules only when it restarts.
 
 If `/etc/nftables.conf` starts with `flush ruleset`, `meshly doctor` points out this window. Replacing it with
 `table inet filter; delete table inet filter` (one pair per table you define) reloads your ruleset without

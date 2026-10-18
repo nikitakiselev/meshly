@@ -13,8 +13,9 @@ on-disk formats.
   or `down`, without a command. It follows interface and nftables changes and runs the same check as the timer; the
   check timer stays as a backstop. It starts and stops with `meshly.service`, also after `meshly upgrade`. A drop-in
   for `docker.service` re-applies meshly after Docker starts.
-- `meshly status` lists the Docker networks (`docker networks`; `firewall.docker_networks` in `--json`), and
-  `meshly logs` shows which networks appeared or went (`Docker networks changed: +br-…`).
+- `meshly status` lists the Docker networks (`docker networks`; `firewall.docker_networks` in `--json`) and the
+  forward chains that may drop container traffic (`forward chains`; `firewall.forward_findings`), and `meshly logs`
+  shows which networks appeared or went (`Docker networks changed: +br-…`).
 
 ### Changed
 
@@ -26,14 +27,17 @@ on-disk formats.
   - The LAN behind the node, container addresses and ports without `meshly allow` stay closed. The LAN stays closed
     also while the meshly table is missing: policy routing sends everything forwarded from the tunnel to a table that
     knows only the Docker networks. Ports that Docker publishes on all addresses or on the VPN address are open to
-    the peer meanwhile, as the former are to the internet (see the [threat model](docs/threat-model.md)).
+    the peer meanwhile, as the former are to the internet. `nft flush ruleset` also removes Docker's rules, and then
+    every container port is open to the peer by container address until meshly re-applies its table, usually within
+    seconds (see the [threat model](docs/threat-model.md)).
   - meshly's rule also goes to the top of the iptables `FORWARD` chain. A forward chain of the host firewall that may
-    drop container traffic is a warning in `doctor` with the fix, never a reason to refuse.
+    drop container traffic is a warning in `doctor` with the fix, and `status` names it; it is never a reason to
+    refuse.
   - A problem on the containers' path never takes the tunnel between the hosts down. A Docker bridge that is set down
     is left out until it is up again, and a subnet that two Docker networks share is routed to the first of them by
-    name. Routes of another program in routing table 109 turn container support off, with a warning and the fix, not
-    exit 5. Any other failure while applying the Docker networks applies the configuration without them, with a
-    warning and `completed without the Docker networks: …` in `meshly logs`; the check timer retries every minute.
+    name. Routes of another program in routing table 109 turn container support off, with a warning and the fix.
+    Any other failure while applying the Docker networks applies the configuration without them, with a warning and
+    `completed without the Docker networks: …` in `meshly logs`; meshly retries every minute.
   - On a node without Docker networks nothing changes. See [docs/firewall.md](docs/firewall.md#docker).
 
 ### Fixed

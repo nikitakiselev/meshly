@@ -111,12 +111,14 @@ addresses, try to use the node as a router into the VPN.
     bridge to a peer and the replies of published container ports;
   - on a node with Docker networks, `guard_post` drops, after NAT, anything
     that would leave through the interface with another source than the
-    node's VPN address;
-  - on a node with Docker networks and `rp_filter` on (Ubuntu's default),
-    the kernel drops packets from the LAN to the tunnel even before the
-    forward hook: it looks up their reverse path in meshly's routing table
-    109, which has no route to the LAN (see
-    [firewall.md](firewall.md#policy-routing-table-109)).
+    node's VPN address.
+
+  Besides, on a node with Docker networks and `rp_filter` on (Ubuntu's
+  default), the kernel is expected to drop packets from the LAN to the
+  tunnel even before the forward hook: it looks up their reverse path in
+  meshly's routing table 109, which has no route to the LAN (see
+  [firewall.md](firewall.md#policy-routing-table-109)). That is kernel
+  behaviour, not a guarantee of meshly, and no test checks it.
 
   *Integration:* `TestDockerHostContained/lan-into-vpn` (a LAN host routes
   the peer's VPN address through a Docker host that forwards, with
@@ -520,9 +522,18 @@ an admin's `nft flush ruleset` can interfere with meshly's table.
     through from the internet. This is the same class as the host services
     on `0.0.0.0` in profile `none`. The LAN stays closed: policy routing
     does not depend on the table (`TestDockerHostContained/without-table`).
-    Container addresses do have a route then, and only Docker's own rules
-    keep them closed (the tested Docker drops packets for a container that
-    arrive on another interface, in its raw `PREROUTING` rules).
+    Container addresses do have a route then. When only `table inet meshly`
+    is deleted, Docker's own rules keep them closed (the tested Docker drops
+    packets for a container that arrive on another interface, in its raw
+    `PREROUTING` rules; `without-table` deletes only the meshly table).
+  - `nft flush ruleset` also removes Docker's rules, which are in nftables
+    on the hosts meshly supports (iptables-nft or Docker's nftables
+    backend), and so does a start, reload or restart of `nftables.service`
+    whose config begins with `flush ruleset`. Until meshly re-applies its
+    table, a peer that routes a Docker subnet into the tunnel reaches every
+    port of every container on it by the container's address, published or
+    not. The window is near zero when `nftables.service` flushes and usually
+    seconds after a manual flush; no test covers it.
 
   `meshly-watch.service` usually re-applies the table within seconds of the
   change. The window is not measured by the tests; only the restoration is.

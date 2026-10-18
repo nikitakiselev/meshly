@@ -66,13 +66,16 @@ Drift
   On a host with UFW, iptables rules or Docker it also names the iptables
   chains that carry meshly's rule, and whether the rule is first in each
   (`ok`, `NOT FIRST` or `MISSING`). On a host with Docker networks it lists
-  them; `status --json` has them in `firewall.docker_networks`:
+  them, and `forward chains` names the forward chains that may drop container
+  traffic, as `doctor` warns about them (`firewall-forward`); `status --json`
+  has them in `firewall.docker_networks` and `firewall.forward_findings`:
 
   ```
   Firewall
     table inet meshly  present, matches config
     iptables chains   meshly rule first: ip filter INPUT ok, ip filter FORWARD ok
     docker networks   br-3f1c2a9b7d01, docker0
+    forward chains    inet filter forward may drop container traffic (meshly doctor)
   ```
 - **connectivity** is one of `handshake-recent` (within 180 s; WireGuard
   re-keys every 120 s while traffic flows), `handshake-stale`, `no-handshake`
@@ -179,12 +182,12 @@ never contains private keys.
 | `firewall-integration` | A foreign base chain would drop meshly traffic: integration rule missing, misplaced (after a drop), or profile `none` on a host with a filtering firewall. | Add `meta mark & 0x10000000 == 0x10000000 accept comment "meshly"` before any drop/reject rule in that chain and reload nftables. |
 | `firewall-ban` | A ban list (fail2ban's, or a named set of addresses) holds a peer's VPN address or endpoint, so its traffic is dropped (warning, never a refusal). | fail2ban: `sudo fail2ban-client unban <address>`, or add it to `ignoreip`; another set: `sudo nft delete element <family> <table> <set> { <address> }` |
 | `firewall-profile` | Summary of the firewall profile (`none` or native `nftables`; iptables chains are not part of it). | — |
-| `docker` | Information: the Docker networks found, whose published ports the peer reaches after `meshly allow <port>`, and whose containers reach the other node like programs on this host. A warning when the ruleset has Docker's rules but no bridge named `docker0` or `br-<id>`: containers on networks with custom bridge names cannot use the VPN. | Networks that set `com.docker.network.bridge.name`: use networks without it ([firewall.md](firewall.md#docker-networks)). |
+| `docker` | Information: the Docker networks found, whose published ports the peer reaches after `meshly allow <port>`, and whose containers reach the other node like programs on this host. A warning when the ruleset has Docker's rules but no bridge named `docker0` or `br-<id>`: containers on networks with custom bridge names cannot use the VPN. A warning when routing table 109 has routes that meshly did not create: meshly then leaves the Docker networks out, and only the tunnel between the hosts works. | Networks that set `com.docker.network.bridge.name`: use networks without it ([firewall.md](firewall.md#docker-networks)). Routes in table 109: remove those without `proto 109` (`ip route show table 109`); meshly serves the networks again within a minute. |
 | `firewall-forward` | Only while there are Docker networks. A forward chain of the host firewall may drop container traffic through meshly (warning, never a refusal: the tunnel between the hosts does not pass the forward hook). If meshly cannot integrate the chain (another iptables table, or a priority of −300 or lower), containers cannot use the VPN through it. The chains of Docker's own nftables backend are information. | Add the integration rule that `doctor` prints to that chain, before any drop/reject rule; for a chain meshly cannot integrate, remove or narrow the rule that drops ([firewall.md](firewall.md#the-forward-hook)). |
 | `netdev` | A netdev chain exists; it runs before meshly and may drop WireGuard transport. | Review that chain. |
 | `nftables-reload` | `/etc/nftables.conf` contains `flush ruleset` and nftables.service is enabled. Starting or reloading nftables removes the meshly table until meshly re-applies it. With profile `none` the VPN is unfiltered during that window; with profile `nftables` it is closed. | Prefer `table inet filter; delete table inet filter` over `flush ruleset`. |
 | `service` | `meshly.service` installed, enabled and active. | `meshly start`; `journalctl -u meshly` |
-| `transaction` | An operation did not finish (problem), or the last one ended in rollback or safe mode (warning). | `meshly recover`, or fix the cause and repeat; `meshly start` re-applies the configuration. |
+| `transaction` | An operation did not finish (problem), or the last one ended in rollback or safe mode (warning), or it completed without the Docker networks because applying them failed (warning: the tunnel between the hosts works, containers cannot use it). | `meshly recover`, or fix the cause and repeat; `meshly start` re-applies the configuration. Without the Docker networks: fix the cause; meshly retries every minute. |
 | `link` | The link is stopped by the administrator. | `meshly start` |
 | `invite` | An invite is open until the time shown; the drift check is skipped while it waits (info). | *"let it finish, or cancel it with Ctrl+C in its terminal"* |
 | `drift` | The kernel differs from the configuration; the finding lists the differences. | `meshly start` (or wait for the check timer). |
@@ -296,12 +299,15 @@ To leave safe mode, find the cause with `meshly doctor` and
 sudo meshly start
 ```
 
-While `meshly.service` is active, the check timer also sees the missing
-interface as drift and attempts the same repair about once a minute. If the
-cause persists, each attempt fails, is rolled back or ends in safe mode
-again, and is visible in `meshly logs`. The re-applied configuration is the
-last committed one, so the change that failed is not part of it
-(`TestSystemdLifecycle/safe-mode-retried-by-check`).
+While `meshly.service` is active, `meshly-watch.service` and the check
+timer also see the missing interface as drift and attempt the same repair:
+the watch within about a second of safe mode, then, after an attempt that
+failed, once a minute, as the timer does. If the cause persists, each
+attempt fails, is rolled back or ends in safe mode again, and is visible in
+`meshly logs`. The re-applied configuration is the last committed one, so
+the change that failed is not part of it
+(`TestSystemdLifecycle/safe-mode-retried-by-check`, with the watch stopped,
+so that the check does it).
 
 ## Drift and the check timer
 
@@ -448,9 +454,11 @@ For a port published by a container, on the node that runs it:
   not, check `systemctl status meshly-watch` and
   `journalctl -u meshly-watch`. A network with a custom bridge name is not
   supported (`doctor` warns with `docker`).
-- `doctor` must not report `firewall-forward`: a forward chain of the host
-  firewall that drops container traffic needs the integration rule that
-  `doctor` prints.
+- `doctor` must not warn with `firewall-forward` (as information it only
+  names the chains of Docker's own nftables backend): a forward chain of
+  the host firewall that drops container traffic needs the integration
+  rule that `doctor` prints. `status` names such chains under
+  `forward chains`.
 
 For a container that connects to the other node, the other node must allow
 the port from this node, as for a program on this host. A container cannot
