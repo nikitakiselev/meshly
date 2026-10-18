@@ -5,7 +5,9 @@ package integration
 import (
 	"encoding/json"
 	"os"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,17 @@ import (
 func inviteCode(n *Node) string {
 	line, _, _ := strings.Cut(string(n.ReadFile("/root/invite.out")), "\n")
 	return strings.TrimSpace(line)
+}
+
+// codeSecrets returns code and the temporary private key and preshared key
+// derived from it (base64), none of which may show up anywhere.
+func codeSecrets(t *testing.T, code string) []string {
+	t.Helper()
+	c, err := pairing.ParseCode(code, time.Now())
+	must(t, err)
+	sec, err := c.Secrets()
+	must(t, err)
+	return []string{code, sec.PrivateKey.String(), sec.PresharedKey.String()}
 }
 
 // noMeshly asserts that nothing of meshly exists on n: no interface, no
@@ -82,11 +95,7 @@ func TestPairing(t *testing.T) {
 	}
 
 	// The code and the keys derived from it are never journaled.
-	c, err := pairing.ParseCode(code, time.Now())
-	must(t, err)
-	sec, err := c.Secrets()
-	must(t, err)
-	secrets := []string{code, sec.PrivateKey.String(), sec.PresharedKey.String()}
+	secrets := codeSecrets(t, code)
 	for _, n := range []*Node{vps, home} {
 		for _, out := range []string{n.MustSh("cat /var/lib/meshly/journal.jsonl"), n.MustMeshly("logs", "--json", "-n", "1000").Out} {
 			for _, s := range secrets {
@@ -106,16 +115,27 @@ func TestPairing(t *testing.T) {
 	if !strings.Contains(ps, "meshly invite") {
 		t.Fatalf("invite not running:\n%s", ps)
 	}
-	if strings.Contains(ps, code2) {
-		t.Fatal("the invite code is in a process's arguments")
-	}
 	st := lanhost.MustMeshly("status", "--json").Out
 	if !strings.Contains(st, `"invite"`) {
 		t.Fatalf("status --json does not show the open invite:\n%s", st)
 	}
-	for _, out := range []string{st, lanhost.MustMeshly("status").Out, lanhost.Meshly("doctor", "--json").Out, lanhost.Meshly("doctor").Out, lanhost.MustMeshly("logs", "--json", "-n", "1000").Out} {
-		if strings.Contains(out, code2) {
-			t.Fatalf("the invite code is in status, doctor or logs:\n%s", out)
+	// The temporary rules are the invite's, not an alarm.
+	text := lanhost.MustMeshly("status").Out
+	if !strings.Contains(text, "present, with the open invite's temporary rules") || strings.Contains(text, "OUTDATED") {
+		t.Fatalf("status while the invite is open:\n%s", text)
+	}
+	doc := lanhost.Meshly("doctor").Out
+	for _, line := range strings.Split(doc, "\n") {
+		if f := strings.Fields(line); len(f) > 1 && (f[0] == "!" || f[0] == "✗") && (strings.Contains(f[1], "firewall") || f[1] == "drift") {
+			t.Fatalf("doctor flags the invite's temporary state:\n%s", doc)
+		}
+	}
+	secrets2 := codeSecrets(t, code2)
+	for _, out := range []string{ps, st, text, doc, lanhost.Meshly("doctor", "--json").Out, lanhost.MustMeshly("logs", "--json", "-n", "1000").Out} {
+		for _, s := range secrets2 {
+			if strings.Contains(out, s) {
+				t.Fatalf("the invite code or a key derived from it is in ps, status, doctor or logs:\n%s", out)
+			}
 		}
 	}
 	interrupt(t, lanhost, "INT")
@@ -244,10 +264,27 @@ func TestPairingNothingExposed(t *testing.T) {
 	if connect("198.51.100.10:51820") {
 		t.Fatal("the pairing port is reachable on the public address")
 	}
+	// Off the tunnel, with a route to the VPN address through the vps: the
+	// SYN reaches the vps and meshly's guard drops it.
 	attacker.MustSh("ip route add 10.100.0.0/24 via 198.51.100.10")
+	drops := guardDrops(t, vps)
 	if connect("10.100.0.1:51820") {
 		t.Fatal("the pairing port is reachable from outside the tunnel via a route to the VPN address")
 	}
+	if after := guardDrops(t, vps); after <= drops {
+		t.Fatalf("the probe never reached the vps's guard (%d -> %d drops), so its failure proves nothing", drops, after)
+	}
+	// Control through the same route: an address of the vps that the guard
+	// does not cover is reachable, so the guard alone keeps the pairing port
+	// closed; and the pairing listener does not answer on that address.
+	vps.MustSh("ip link add itdummy type dummy && ip addr add 10.100.0.200/32 dev itdummy && ip link set itdummy up")
+	if !connect("10.100.0.200:8080") {
+		t.Fatal("control: the route through the vps does not deliver to its local addresses")
+	}
+	if connect("10.100.0.200:51820") {
+		t.Fatal("the pairing listener answers on another address of the vps")
+	}
+	vps.MustSh("ip link del itdummy")
 	for _, s := range sockets(vps) {
 		if strings.HasPrefix(s, "udp ") && !slices.Contains(before, s) {
 			t.Fatalf("new UDP socket during the invite: %s", s)
@@ -257,6 +294,22 @@ func TestPairingNothingExposed(t *testing.T) {
 	if c, inv := vps.InviteExit(30 * time.Second); c != 10 {
 		t.Fatalf("cancelled invite: exit %d\n%s", c, inv)
 	}
+}
+
+var guardRe = regexp.MustCompile(`counter packets (\d+) bytes \d+ drop comment "vpn address reachable only through the vpn"`)
+
+// guardDrops returns the packets meshly's guard dropped because they came
+// for the VPN address from outside the tunnel.
+func guardDrops(t *testing.T, n *Node) int {
+	t.Helper()
+	out := n.MustSh("nft list chain inet meshly guard_pre")
+	m := guardRe.FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("%s: no guard counter in:\n%s", n.Name, out)
+	}
+	v, err := strconv.Atoi(m[1])
+	must(t, err)
+	return v
 }
 
 // UDP to the WireGuard port is blocked: join says so, changes nothing and
@@ -315,9 +368,21 @@ func TestPairingCleanup(t *testing.T) {
 	if out := strings.TrimSpace(vps.MustSh("wg show meshly0 peers")); out == "" {
 		t.Fatal("kill -9: the temporary peer is already gone (nothing for the check to do)")
 	}
+	if vps.Sh("test -e /run/meshly/invite.json").Code != 0 {
+		t.Fatal("kill -9: no marker left (nothing for the check to close)")
+	}
 	vps.MustMeshly("service", "check")
 	if out := strings.TrimSpace(vps.MustSh("wg show meshly0 peers")); out != "" {
 		t.Fatalf("temporary peer left after the check: %q", out)
+	}
+	if vps.Sh("test -e /run/meshly/invite.json").Code == 0 {
+		t.Fatal("/run/meshly/invite.json left after the check")
+	}
+	type record struct{ Event, Op, Detail string }
+	var logs struct{ Records []record }
+	must(t, json.Unmarshal([]byte(vps.MustMeshly("logs", "--json", "-n", "1000").Out), &logs))
+	if !slices.Contains(logs.Records, record{"audit", "invite", "closed: interrupted"}) {
+		t.Fatalf("the killed invite is not journaled as closed:\n%s", vps.MustMeshly("logs").Out)
 	}
 	if s := status(t, vps); len(s.Drift) != 0 {
 		t.Fatalf("drift after the check: %v", s.Drift)

@@ -16,6 +16,9 @@ type statusJSON struct {
 		Incomplete bool `json:"incomplete"`
 	} `json:"transaction"`
 	Drift []string `json:"drift"`
+	Peers []struct {
+		Name string `json:"name"`
+	} `json:"peers"`
 }
 
 func status(t *testing.T, n *Node) statusJSON {
@@ -186,7 +189,12 @@ func TestFaultsReduce(t *testing.T) {
 		if t.Failed() {
 			return
 		}
-		// Re-pair for the next case.
+		// Re-pair for the next case. The revoke removed home from the vps's
+		// configuration (the subtest checked the kernel); invite refuses to
+		// run while a peer is configured, so Pair would fail otherwise.
+		if s := status(t, vps); len(s.Peers) != 0 {
+			t.Fatalf("vps still has peers after the revoke: %+v", s.Peers)
+		}
 		home.MustMeshly("reset", "--yes")
 		l.Pair()
 		vps.MustMeshly("allow", "8080/tcp", "from", "home")
