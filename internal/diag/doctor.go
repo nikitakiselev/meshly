@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nikitakiselev/meshly/internal/engine"
 	"github.com/nikitakiselev/meshly/internal/model"
 	"github.com/nikitakiselev/meshly/internal/preflight"
 	"github.com/nikitakiselev/meshly/internal/store"
@@ -125,6 +126,9 @@ func RunDoctor(ctx context.Context, d Deps, sys *preflight.System, probe *Probe)
 		doc.add("transaction", "fail", Fact, fmt.Sprintf("operation %q (%s) did not finish", st.Transaction.IncompleteOp, st.Transaction.IncompleteID), "run `meshly recover` (any mutating command also recovers first)")
 	} else if st.Transaction.LastEvent == "safe-mode" || st.Transaction.LastEvent == "rolled-back" {
 		doc.add("transaction", "warn", Fact, fmt.Sprintf("last operation %q ended with %s: %s", st.Transaction.LastOp, st.Transaction.LastEvent, st.Transaction.LastDetail), "fix the cause and repeat the operation; `meshly start` re-applies the configuration")
+	} else if strings.Contains(st.Transaction.LastDetail, engine.WithoutDockerDetail) {
+		doc.add("transaction", "warn", Fact, fmt.Sprintf("last operation %q was %s; the tunnel between the hosts works, containers cannot use it", st.Transaction.LastOp, st.Transaction.LastDetail),
+			"fix the cause; meshly-check.timer retries with the Docker networks every minute, `meshly start` at once")
 	} else {
 		doc.add("transaction", "ok", Fact, "no interrupted operation", "")
 	}

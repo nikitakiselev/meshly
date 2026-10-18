@@ -95,6 +95,7 @@ type Links interface {
 	DefaultRouteAddrs() ([]model.LinkAddr, error)
 	LinkExists(name string) (exists, owned bool, kind string, err error)
 	DockerBridges() ([]netstack.Bridge, error)
+	ObserveDockerRouting() (netstack.DockerRouting, error)
 }
 
 // System gives access to the host; replaceable in tests.
@@ -297,12 +298,27 @@ func (s *System) AnalysisContext(c *model.Config) nft.Context {
 	}
 	if s.Links != nil {
 		ctx.LocalAddrs, _ = s.Links.LocalAddrs()
-		bridges, _ := s.Links.DockerBridges()
-		for _, b := range bridges {
-			ctx.DockerBridges = append(ctx.DockerBridges, b.Name)
-		}
+		ctx.DockerBridges, ctx.DockerOff = s.dockerBridges()
 	}
 	return ctx
+}
+
+// dockerBridges names the Docker bridges meshly serves, as the engine
+// derives them (netstack.ServedBridges), and those it leaves out because
+// routing table 109 has routes of another program.
+func (s *System) dockerBridges() (served, off []string) {
+	bridges, _ := s.Links.DockerBridges()
+	var names []string
+	for _, b := range netstack.ServedBridges(bridges, 0) {
+		names = append(names, b.Name)
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	if r, err := s.Links.ObserveDockerRouting(); err == nil && r.Foreign > 0 {
+		return nil, names
+	}
+	return names, nil
 }
 
 // Firewall analyses the live ruleset for cfg and evaluates the profile.
@@ -420,6 +436,9 @@ func EvaluateFirewall(r *Report, a *nft.Analysis, profile string, mark uint32, s
 		}
 	}
 	switch {
+	case len(a.DockerOff) > 0:
+		r.add("docker", Warn, fmt.Sprintf("routing table %d has routes that meshly did not create, so meshly leaves the Docker networks %s out: published container ports and container connections do not work through the VPN; the tunnel between the hosts works", netstack.RouteTable, strings.Join(a.DockerOff, ", ")),
+			fmt.Sprintf("remove the routes that meshly did not create from table %d (`ip route show table %d`; meshly's have proto %d); meshly then serves the Docker networks within a minute", netstack.RouteTable, netstack.RouteTable, netstack.RouteProtocol))
 	case len(a.DockerBridges) > 0:
 		r.add("docker", Info, "Docker networks "+strings.Join(a.DockerBridges, ", ")+": published container ports are reachable through the VPN after meshly allow <port>; containers reach the other node like programs on this host", "")
 	case a.DockerDetected:

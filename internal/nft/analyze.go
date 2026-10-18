@@ -31,9 +31,12 @@ type Context struct {
 	Network netip.Prefix
 	// Endpoints are the known public addresses of the peers.
 	Endpoints []netip.Addr
-	// DockerBridges are the names of the node's Docker bridges. The
+	// DockerBridges are the names of the Docker bridges meshly serves. The
 	// forward hook is analysed only while there is one.
 	DockerBridges []string
+	// DockerOff are the node's Docker bridges that meshly leaves out
+	// because its routing table has routes of another program.
+	DockerOff []string
 }
 
 // ChainFinding is the verdict for one foreign base chain.
@@ -97,8 +100,9 @@ type Analysis struct {
 	FirewalldTables bool           `json:"firewalld_tables"`
 	Flowtables      []string       `json:"flowtables_with_interface,omitempty"`
 	NetdevChains    []string       `json:"netdev_chains,omitempty"`
-	// DockerBridges are Context.DockerBridges.
+	// DockerBridges and DockerOff are those of the Context.
 	DockerBridges []string `json:"docker_bridges,omitempty"`
+	DockerOff     []string `json:"docker_off,omitempty"`
 }
 
 // NeedsIntegration reports chains that block Meshly until the
@@ -180,7 +184,7 @@ func isIptablesTable(rs *Ruleset, family, table string) bool {
 
 // Analyze inspects a ruleset in the given context.
 func Analyze(rs *Ruleset, ctx Context) *Analysis {
-	a := &Analysis{DockerBridges: ctx.DockerBridges}
+	a := &Analysis{DockerBridges: ctx.DockerBridges, DockerOff: ctx.DockerOff}
 	if t := rs.Table(TableFamily, TableName); t != nil {
 		a.OurTablePresent = true
 		a.MarkerNetwork, a.MarkerHash, a.OurTableOwned = t.Marker()

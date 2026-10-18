@@ -271,7 +271,7 @@ func (s *inviteSession) admit(c net.Conn, h *pairing.Hello) error {
 		Name: "invite", Args: "peer=" + h.Name, Actor: actor(a.Euid), Recovery: journal.Backward,
 		Base: cfg, Target: target, Overlay: inviterOverlay(s.code, s.sec, false),
 	}
-	if _, err := a.Engine.Execute(s.ctx, a.Journal, op); err != nil {
+	if _, err := a.execute(s.ctx, op); err != nil {
 		fmt.Fprintf(a.Stderr, "meshly: error: node %q could not be added: %v\n", h.Name, err)
 		if err := s.arm(); err != nil {
 			return err
@@ -305,7 +305,7 @@ func (s *inviteSession) undo() error {
 	a, peer := s.a, s.member.Peers[len(s.member.Peers)-1]
 	target := s.base.Clone()
 	op := engine.Op{Name: "invite-undo", Args: "peer=" + peer.Name, Actor: actor(a.Euid), Recovery: journal.Forward, Base: s.member, Target: target}
-	if _, err := a.Engine.Execute(s.ctx, a.Journal, op); err != nil {
+	if _, err := a.execute(s.ctx, op); err != nil {
 		return err
 	}
 	s.base, s.member = target, nil

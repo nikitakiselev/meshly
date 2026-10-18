@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nikitakiselev/meshly/internal/engine"
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/lock"
 	"github.com/nikitakiselev/meshly/internal/model"
@@ -382,11 +383,30 @@ func (a *App) serviceStop(ctx context.Context) error {
 }
 
 // serviceCheck is run by meshly-check.timer: it repairs drift (above all a
-// removed or modified firewall table). It never waits for a busy lock.
+// removed or modified firewall table). It never waits for a busy lock. A
+// repair completed only without the Docker networks succeeds (warned).
 func (a *App) serviceCheck(ctx context.Context) error {
 	_, err := a.checkOnce(ctx)
+	if errors.Is(err, errWithoutDocker) {
+		return nil
+	}
 	return err
 }
+
+// errWithoutDocker: the check-repair was completed only without the Docker
+// networks (engine.Result.WithoutDocker).
+var errWithoutDocker = errors.New("repaired only without the Docker networks")
+
+// failedRepair reports whether err ends a check whose repair failed: the
+// transaction failed, or it was completed only without the Docker networks.
+func failedRepair(err error) bool {
+	var ae *engine.ApplyError
+	return errors.As(err, &ae) || errors.Is(err, errWithoutDocker)
+}
+
+// lockBusy reports whether err means that another meshly operation holds
+// the lock, a waiting invite included.
+func lockBusy(err error) bool { return codeOf(err) == ExitBusy }
 
 // checkOnce repairs drift in a journaled check-repair transaction. busy
 // means that another meshly operation holds the lock: nothing was checked.
@@ -401,7 +421,7 @@ func (a *App) checkOnce(ctx context.Context) (busy bool, err error) {
 	a.LockTimeout = time.Second
 	s, err := a.begin(ctx)
 	a.LockTimeout = prev
-	if errors.Is(err, lock.ErrBusy) {
+	if lockBusy(err) {
 		return true, nil
 	}
 	if err != nil {
@@ -429,6 +449,9 @@ func (a *App) checkOnce(ctx context.Context) (busy bool, err error) {
 		fmt.Fprintf(a.Stderr, "meshly: drift detected, repairing: %s\n", d)
 	}
 	op := opFor("check-repair", fmt.Sprint(drift), journal.Backward, cfg, cfg.Clone())
-	_, err = a.apply(ctx, op, false)
+	res, err := a.apply(ctx, op, false)
+	if err == nil && res.WithoutDocker != nil {
+		err = errWithoutDocker
+	}
 	return false, err
 }

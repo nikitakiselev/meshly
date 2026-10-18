@@ -834,18 +834,301 @@ func TestDockerTeardown(t *testing.T) {
 	}
 }
 
-// Routes of another program in table 109 block Docker support, and only
-// it: without Docker networks meshly does not use the table.
-func TestDockerRoutingForeignConflict(t *testing.T) {
+// Routes of another program in table 109 turn Docker support off, not the
+// tunnel: the node is planned as one without Docker networks, and what
+// meshly had set up for them goes.
+func TestDockerRoutingForeignDisablesDocker(t *testing.T) {
 	v := newEnv(t)
 	v.k.Routing.Foreign = 1
-	c := v.config()
-	if _, err := v.planSteps(c); err != nil {
-		t.Fatalf("without Docker: %v", err)
-	}
 	v.k.Docker = []netstack.Bridge{docker0}
-	if _, err := v.planSteps(c); !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "routing table 109") {
-		t.Fatalf("with Docker: %v", err)
+	c := v.config()
+	want := []string{"firewall.apply", "link.create", "link.sysctl", "link.address", "wireguard.configure", "link.up", "routes.sync"}
+	if got := v.plan(c); !slices.Equal(got, want) {
+		t.Fatalf("plan %v, want %v", got, want)
+	}
+	v.k.Routing.Foreign = 0
+	v.commit(c)
+	if !v.k.Forward["meshly0"] {
+		t.Fatal("Docker not applied")
+	}
+	v.k.Routing.Foreign = 1
+	if _, err := v.repair(); err != nil {
+		t.Fatal(err)
+	}
+	v.tunnelWithoutDocker(c)
+	if v.k.Routing.Foreign != 1 {
+		t.Fatalf("foreign routes touched: %+v", v.k.Routing)
+	}
+}
+
+var brA = netstack.Bridge{Name: "br-0123456789ab", Prefixes: []netip.Prefix{netip.MustParsePrefix("172.18.0.0/16")}}
+
+// tunnelWithoutDocker fails unless the kernel has cfg as on a node without
+// Docker networks: the link up, forwarding off, no routing to Docker
+// networks, the table without them.
+func (v *env) tunnelWithoutDocker(cfg *model.Config) {
+	v.t.Helper()
+	if l := v.k.Links["meshly0"]; l == nil || !l.Up {
+		v.t.Fatalf("link %+v", l)
+	}
+	if v.k.Forward["meshly0"] || !v.k.Routing.Empty() {
+		v.t.Fatalf("forwarding %v, routing %+v", v.k.Forward["meshly0"], v.k.Routing)
+	}
+	if last := v.k.Scripts[len(v.k.Scripts)-1]; strings.Contains(last, "docker_ifs") {
+		v.t.Fatalf("firewall with Docker networks:\n%s", last)
+	}
+	d, err := DesiredFrom(cfg, "meshly0", Env{})
+	if err != nil {
+		v.t.Fatal(err)
+	}
+	o, err := v.e.Observe(context.Background(), "meshly0")
+	if err != nil {
+		v.t.Fatal(err)
+	}
+	if steps, err := v.e.Plan(d, o); err != nil || len(steps) > 0 {
+		v.t.Fatalf("kernel not at the configuration without Docker: %v %v", names(steps), err)
+	}
+}
+
+// lastRecord returns the last record of the journal.
+func (v *env) lastRecord() journal.Record {
+	v.t.Helper()
+	recs, err := v.j.Read()
+	if err != nil || len(recs) == 0 {
+		v.t.Fatalf("journal: %v %v", recs, err)
+	}
+	return recs[len(recs)-1]
+}
+
+// A failure on the containers' path never takes the tunnel down: a node
+// whose routing to the Docker networks cannot be set up starts without
+// them, and the journal says why.
+func TestDockerFailedStartKeepsTunnel(t *testing.T) {
+	v := newEnv(t)
+	c := v.config()
+	v.commit(c)
+	saved, _ := v.paths.LoadConfig()
+	// A reboot: the kernel state is gone.
+	delete(v.k.Links, "meshly0")
+	delete(v.k.Forward, "meshly0")
+	v.k.Table = ""
+	v.k.Docker = []netstack.Bridge{docker0}
+	v.k.Fail("docker.routing", -1)
+	res, err := v.e.Execute(context.Background(), v.j, Op{Name: "service-start", Recovery: journal.Backward, Base: saved, Target: saved.Clone()})
+	if err != nil || res.WithoutDocker == nil || !strings.Contains(res.WithoutDocker.Error(), "fake docker.routing failure") {
+		t.Fatalf("res %+v, err %v", res, err)
+	}
+	v.tunnelWithoutDocker(saved)
+	if r := v.lastRecord(); r.Event != journal.EventCommit || !strings.HasPrefix(r.Detail, WithoutDockerDetail) || !strings.Contains(r.Detail, "fake docker.routing failure") {
+		t.Fatalf("journal: %+v", r)
+	}
+}
+
+// A grant that fails with the Docker networks is applied without them
+// rather than rolled back; so is a removal. (The routing to the networks
+// that were applied still goes: here the failure is the new bridge's.)
+func TestDockerFailureFallsBackWithoutDocker(t *testing.T) {
+	ctx := context.Background()
+	v := newEnv(t)
+	v.k.Docker = []netstack.Bridge{docker0}
+	c := v.config()
+	v.commit(c)
+	saved, _ := v.paths.LoadConfig()
+	allow := saved.Clone()
+	allow.Rules = []model.Rule{{Peer: "home", Proto: model.ProtoTCP, Port: 22}}
+	v.k.Docker = []netstack.Bridge{docker0, brA}
+	v.k.Fail("docker.routing", 1)
+	res, err := v.e.Execute(ctx, v.j, Op{Name: "allow", Recovery: journal.Backward, Base: saved, Target: allow})
+	if err != nil || res.WithoutDocker == nil {
+		t.Fatalf("allow: res %+v, err %v", res, err)
+	}
+	got, _ := v.paths.LoadConfig()
+	if len(got.Rules) != 1 {
+		t.Fatalf("allow not saved: %+v", got.Rules)
+	}
+	v.tunnelWithoutDocker(got)
+	deny := got.Clone()
+	deny.Rules = nil
+	v.k.Docker = []netstack.Bridge{docker0}
+	if _, err := v.e.Execute(ctx, v.j, Op{Name: "check-repair", Recovery: journal.Backward, Base: got, Target: got.Clone()}); err != nil {
+		t.Fatal(err)
+	}
+	v.k.Docker = []netstack.Bridge{docker0, brA}
+	v.k.Fail("docker.routing", 1)
+	res, err = v.e.Execute(ctx, v.j, Op{Name: "deny", Recovery: journal.Forward, Base: got, Target: deny})
+	if err != nil || res.WithoutDocker == nil {
+		t.Fatalf("deny: res %+v, err %v", res, err)
+	}
+	if got, _ := v.paths.LoadConfig(); len(got.Rules) != 0 {
+		t.Fatalf("deny not saved: %+v", got.Rules)
+	}
+	v.tunnelWithoutDocker(deny)
+}
+
+// lostRule loses the routing rule right after a sync adds it, as if another
+// program deleted it: the result never verifies.
+type lostRule struct {
+	LinkOps
+	k *enginetest.Kernel
+}
+
+func (l *lostRule) SyncDockerRouting(want netstack.DockerRouting) error {
+	err := l.LinkOps.SyncDockerRouting(want)
+	l.k.Routing.Rules = nil
+	return err
+}
+
+// A transaction whose verification fails with the Docker networks is
+// completed without them.
+func TestDockerVerifyFailureFallsBack(t *testing.T) {
+	v := newEnv(t)
+	v.e.Links = &lostRule{LinkOps: v.e.Links, k: v.k}
+	v.k.Docker = []netstack.Bridge{docker0}
+	c := v.config()
+	res, err := v.e.Execute(context.Background(), v.j, Op{Name: "init", Recovery: journal.Backward, Target: c})
+	if err != nil || res.WithoutDocker == nil || !strings.Contains(res.WithoutDocker.Error(), "verification failed") {
+		t.Fatalf("res %+v, err %v", res, err)
+	}
+	v.tunnelWithoutDocker(c)
+}
+
+// When the configuration fails without the Docker networks too, the
+// transaction is rolled back as on a node without them.
+func TestDockerFallbackFailsRollsBack(t *testing.T) {
+	v := newEnv(t)
+	var progress []string
+	v.e.Progress = func(s string) { progress = append(progress, s) }
+	v.k.Docker = []netstack.Bridge{docker0}
+	c := v.config()
+	v.commit(c)
+	saved, _ := v.paths.LoadConfig()
+	target := saved.Clone()
+	target.Rules = []model.Rule{{Peer: "home", Proto: model.ProtoTCP, Port: 22}}
+	v.k.Fail("nft.apply", 2)
+	_, err := v.e.Execute(context.Background(), v.j, Op{Name: "allow", Recovery: journal.Backward, Base: saved, Target: target})
+	var ae *ApplyError
+	if !errors.As(err, &ae) || !ae.RolledBack {
+		t.Fatalf("want rollback, got %v", err)
+	}
+	if !slices.ContainsFunc(progress, func(s string) bool { return strings.Contains(s, "retrying without the Docker networks") }) {
+		t.Fatalf("no retry without Docker: %q", progress)
+	}
+	if !v.k.Forward["meshly0"] || !v.k.Routing.Equal(netstack.WantDockerRouting("meshly0", v.k.Docker)) {
+		t.Fatalf("base not restored: forwarding %v, routing %+v", v.k.Forward["meshly0"], v.k.Routing)
+	}
+	if p := v.plan(saved); len(p) != 0 {
+		t.Fatalf("kernel not at base: %v", p)
+	}
+}
+
+// Recovery that fails with the Docker networks recovers without them
+// instead of entering safe mode.
+func TestDockerRecoverFallsBack(t *testing.T) {
+	ctx := context.Background()
+	v := newEnv(t)
+	v.k.Docker = []netstack.Bridge{docker0}
+	v.commit(v.config())
+	saved, _ := v.paths.LoadConfig()
+	target := saved.Clone()
+	target.Rules = []model.Rule{{Peer: "home", Proto: model.ProtoTCP, Port: 22}}
+	target.Revision = saved.Revision + 1
+	_ = v.j.Append(journal.Record{OpID: "op1", Event: journal.EventBegin, Op: "allow", Recovery: journal.Backward, Target: target, Interface: "meshly0", BaseRevision: saved.Revision})
+	v.k.Docker = []netstack.Bridge{docker0, brA}
+	v.k.Fail("docker.routing", 1)
+	rec, err := v.e.Recover(ctx, v.j)
+	if err != nil || rec.Mode != "rolled-back" || rec.WithoutDocker == nil {
+		t.Fatalf("%+v %v", rec, err)
+	}
+	v.tunnelWithoutDocker(saved)
+	if r := v.lastRecord(); r.Event != journal.EventRecovered || !strings.Contains(r.Detail, WithoutDockerDetail) {
+		t.Fatalf("journal: %+v", r)
+	}
+}
+
+// So does a recovery that cannot read the Docker networks.
+func TestRecoverWithoutDockerRead(t *testing.T) {
+	v := newEnv(t)
+	v.commit(v.config())
+	saved, _ := v.paths.LoadConfig()
+	_ = v.j.Append(journal.Record{OpID: "op1", Event: journal.EventBegin, Op: "set", Recovery: journal.Backward, Target: saved.Clone(), Interface: "meshly0", BaseRevision: saved.Revision})
+	v.k.Fail("docker.bridges", 1)
+	rec, err := v.e.Recover(context.Background(), v.j)
+	if err != nil || rec.Mode != "completed" || rec.WithoutDocker == nil {
+		t.Fatalf("%+v %v", rec, err)
+	}
+	v.tunnelWithoutDocker(saved)
+}
+
+// A Docker bridge set down cannot carry routes: it is left out until it is
+// up again, and the other networks work.
+func TestDockerBridgeDownSkipped(t *testing.T) {
+	v := newEnv(t)
+	down := brA
+	down.Down = true
+	v.k.Docker = []netstack.Bridge{docker0, down}
+	c := v.config()
+	res, err := v.e.Execute(context.Background(), v.j, Op{Name: "init", Recovery: journal.Backward, Target: c})
+	if err != nil || res.WithoutDocker != nil {
+		t.Fatalf("res %+v, err %v", res, err)
+	}
+	if !v.k.Forward["meshly0"] || !v.k.Routing.Equal(netstack.WantDockerRouting("meshly0", []netstack.Bridge{docker0})) {
+		t.Fatalf("forwarding %v, routing %+v", v.k.Forward["meshly0"], v.k.Routing)
+	}
+	if s := v.k.Scripts[len(v.k.Scripts)-1]; !strings.Contains(s, `elements = { "docker0" }`) {
+		t.Fatalf("docker_ifs:\n%s", s)
+	}
+	v.k.Docker[1].Down = false
+	if drift := v.drift(); !strings.Contains(drift, "Docker networks changed: +br-0123456789ab") {
+		t.Fatalf("drift %q", drift)
+	}
+}
+
+// Two Docker bridges with the same subnet: the subnet is routed once, to
+// the first bridge by name; both stay in docker_ifs.
+func TestDockerDuplicateSubnet(t *testing.T) {
+	v := newEnv(t)
+	dup := netstack.Bridge{Name: "br-0123456789ab", Prefixes: docker0.Prefixes}
+	v.k.Docker = []netstack.Bridge{dup, docker0}
+	c := v.config()
+	res, err := v.e.Execute(context.Background(), v.j, Op{Name: "init", Recovery: journal.Backward, Target: c})
+	if err != nil || res.WithoutDocker != nil {
+		t.Fatalf("res %+v, err %v", res, err)
+	}
+	if !v.k.Routing.Equal(netstack.WantDockerRouting("meshly0", []netstack.Bridge{dup})) {
+		t.Fatalf("routing %+v", v.k.Routing)
+	}
+	if s := v.k.Scripts[len(v.k.Scripts)-1]; !strings.Contains(s, `elements = { "br-0123456789ab", "docker0" }`) {
+		t.Fatalf("docker_ifs:\n%s", s)
+	}
+}
+
+// Safe mode needs only the ruleset to install the lockdown table; a read
+// that fails is reported, the interface still goes.
+func TestSafeModeWithFailingReads(t *testing.T) {
+	ctx := context.Background()
+	v := newEnv(t)
+	v.k.Docker = []netstack.Bridge{docker0}
+	c := v.config()
+	v.commit(c)
+	n := len(v.k.Scripts)
+	v.k.Fail("docker.observe", -1)
+	if err := v.e.SafeMode(ctx, c, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.k.Scripts) != n+1 || !strings.Contains(v.k.Scripts[n], "table inet meshly") {
+		t.Fatalf("no lockdown table: %d new scripts", len(v.k.Scripts)-n)
+	}
+	if _, ok := v.k.Links["meshly0"]; ok {
+		t.Fatal("interface still present")
+	}
+	v.k.Fail("docker.observe", 0)
+	v.commit(c)
+	v.k.Fail("nft.list", 1)
+	if err := v.e.SafeMode(ctx, c, ""); err == nil || !strings.Contains(err.Error(), "fake nft.list failure") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, ok := v.k.Links["meshly0"]; ok {
+		t.Fatal("interface still present")
 	}
 }
 
@@ -884,11 +1167,10 @@ func TestForwardingNeverWithoutRouting(t *testing.T) {
 	c := v.config()
 	v.commit(c)
 	v.k.Docker = []netstack.Bridge{docker0}
-	v.k.Fail("docker.routing", 2) // the repair and its rollback
-	_, err := v.repair()
-	var ae *ApplyError
-	if !errors.As(err, &ae) {
-		t.Fatalf("err = %v", err)
+	v.k.Fail("docker.routing", 1) // the repair: completed without Docker
+	res, err := v.repair()
+	if err != nil || res.WithoutDocker == nil {
+		t.Fatalf("res %+v, err = %v", res, err)
 	}
 	if v.k.Forward["meshly0"] && v.k.Routing.Empty() {
 		t.Fatal("forwarding on without the routing rule")
@@ -896,9 +1178,10 @@ func TestForwardingNeverWithoutRouting(t *testing.T) {
 
 	// Up again, then the last network goes while forwarding cannot be
 	// turned off once: rolled back, then repaired.
-	if _, err := v.repair(); err != nil {
-		t.Fatal(err)
+	if res, err := v.repair(); err != nil || res.WithoutDocker != nil {
+		t.Fatalf("res %+v, err = %v", res, err)
 	}
+	var ae *ApplyError
 	v.k.Docker = nil
 	v.k.Fail("link.sysctl", 1)
 	if _, err := v.repair(); !errors.As(err, &ae) || !ae.RolledBack {

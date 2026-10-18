@@ -215,7 +215,7 @@ func (a *App) runJoin(ctx context.Context, pcfg *model.Config, code *pairing.Cod
 	// The inviter's peer is updated in place, so the kernel keeps the
 	// temporary tunnel's handshake; only a later one proves the real tunnel.
 	switched := time.Now()
-	if _, err := a.Engine.Execute(ctx, a.Journal, op); err != nil {
+	if _, err := a.execute(ctx, op); err != nil {
 		var ae *engine.ApplyError
 		if errors.As(err, &ae) && ae.SafeMode {
 			keep = true // the configuration may be saved
@@ -235,7 +235,7 @@ func (a *App) runJoin(ctx context.Context, pcfg *model.Config, code *pairing.Cod
 		Name: "join-undo", Args: fmt.Sprintf("network=%s peer=%s", w.NetworkName, w.Inviter.Name), Actor: actor(a.Euid),
 		Recovery: journal.Forward, Base: member,
 	}
-	if _, err := a.Engine.Execute(ctx, a.Journal, undo); err != nil {
+	if _, err := a.execute(ctx, undo); err != nil {
 		return nil, err
 	}
 	keep = false

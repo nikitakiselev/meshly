@@ -97,6 +97,7 @@ type Desired struct {
 // Env is the part of the desired state taken from the node, not from the
 // config.
 type Env struct {
+	// Docker are the Docker bridges meshly serves (netstack.ServedBridges).
 	Docker []netstack.Bridge
 }
 
@@ -217,7 +218,14 @@ func (e *Engine) Env() (Env, error) {
 	if err != nil {
 		return Env{}, fmt.Errorf("find Docker networks: %w", err)
 	}
-	return Env{Docker: b}, nil
+	if b = netstack.ServedBridges(b, 0); len(b) == 0 {
+		return Env{}, nil
+	}
+	r, err := e.Links.ObserveDockerRouting()
+	if err != nil {
+		return Env{}, fmt.Errorf("read the routing to Docker networks: %w", err)
+	}
+	return Env{Docker: netstack.ServedBridges(b, r.Foreign)}, nil
 }
 
 // desired derives the desired state of cfg plus ov on this node.
@@ -302,9 +310,6 @@ func (e *Engine) Plan(d *Desired, o *Observed) ([]Step, error) {
 		return nil, fmt.Errorf("%w: nftables table inet %s exists but has no meshly ownership marker; rename or remove it", ErrConflict, nft.TableName)
 	}
 	docker := len(d.Docker) > 0
-	if o.Routing.Foreign > 0 && docker {
-		return nil, fmt.Errorf("%w: routing table %d has routes that meshly did not create; meshly needs this table for Docker networks", ErrConflict, netstack.RouteTable)
-	}
 	var steps []Step
 	name := d.Interface
 	fwStale := !o.TablePresent || o.MarkerHash != d.Firewall.Hash || o.LiveHash != o.RecordedHash
@@ -782,17 +787,13 @@ func (e *Engine) Drift(ctx context.Context, cfg *model.Config) ([]string, error)
 
 // SafeMode closes the VPN path without touching anything else: a lockdown
 // firewall table (nothing allowed on the interface), then removal of the
-// interface. Errors are collected; every step is attempted.
+// interface. Errors are collected; every step is attempted. It reads only
+// the ruleset: the table may replace only one of meshly's own.
 func (e *Engine) SafeMode(ctx context.Context, cfg *model.Config, ifname string) error {
 	var errs []error
 	if cfg != nil {
-		if r, err := nft.Render(nft.InputFromConfig(cfg, true)); err == nil {
-			o, oerr := e.Observe(ctx, cfg.Interface.Name)
-			if oerr == nil && (!o.TablePresent || o.TableOwned) {
-				if err := e.FW.ApplyScript(ctx, r.ApplyScript()); err != nil {
-					errs = append(errs, fmt.Errorf("lockdown firewall: %w", err))
-				}
-			}
+		if err := e.lockdown(ctx, cfg); err != nil {
+			errs = append(errs, fmt.Errorf("lockdown firewall: %w", err))
 		}
 		ifname = cfg.Interface.Name
 	}
@@ -808,4 +809,23 @@ func (e *Engine) SafeMode(ctx context.Context, cfg *model.Config, ifname string)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// lockdown installs the lockdown table of cfg unless a foreign table has
+// meshly's name.
+func (e *Engine) lockdown(ctx context.Context, cfg *model.Config) error {
+	r, err := nft.Render(nft.InputFromConfig(cfg, true))
+	if err != nil {
+		return err
+	}
+	rs, err := e.FW.ListRuleset(ctx)
+	if err != nil {
+		return err
+	}
+	if t := rs.Table(nft.TableFamily, nft.TableName); t != nil {
+		if _, _, owned := t.Marker(); !owned {
+			return nil
+		}
+	}
+	return e.FW.ApplyScript(ctx, r.ApplyScript())
 }

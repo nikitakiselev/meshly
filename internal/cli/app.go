@@ -343,6 +343,9 @@ func (a *App) begin(ctx context.Context) (*session, error) {
 	rec, err := a.Engine.Recover(ctx, a.Journal)
 	if rec != nil {
 		fmt.Fprintf(a.Stderr, "meshly: recovered interrupted operation %q: %s\n", rec.Op, rec.Mode)
+		if rec.WithoutDocker != nil {
+			a.warnWithoutDocker(rec.WithoutDocker)
+		}
 	}
 	if err != nil {
 		s.end()

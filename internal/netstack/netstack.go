@@ -82,6 +82,34 @@ const (
 type Bridge struct {
 	Name     string
 	Prefixes []netip.Prefix
+	// Down: set administratively down, no route can use it.
+	Down bool
+}
+
+// ServedBridges returns the bridges meshly serves through the tunnel: none
+// while RouteTable has routes of another program (foreign), otherwise the
+// ones that are up, each subnet with the first bridge (by name) that has it.
+// A bridge whose subnets are all taken stays, without routes.
+func ServedBridges(bridges []Bridge, foreign int) []Bridge {
+	if foreign > 0 {
+		return nil
+	}
+	var out []Bridge
+	routed := map[netip.Prefix]bool{}
+	for _, b := range bridges {
+		if b.Down {
+			continue
+		}
+		s := Bridge{Name: b.Name}
+		for _, p := range b.Prefixes {
+			if !routed[p] {
+				routed[p] = true
+				s.Prefixes = append(s.Prefixes, p)
+			}
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // IsDockerBridge reports whether an interface of the given kind is

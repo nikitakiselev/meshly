@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nikitakiselev/meshly/internal/engine"
 	"github.com/nikitakiselev/meshly/internal/engine/enginetest"
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/lock"
@@ -288,10 +289,13 @@ func TestServiceWatchNoChangeNoJournal(t *testing.T) {
 // every second: for WatchBackoff it leaves the retry to the check timer.
 func TestServiceWatchBacksOffAfterFailure(t *testing.T) {
 	vps, _ := pair(t)
+	vps.k.AddIptables("ip", "INPUT", "drop", 1)
+	vps.must("service", "check")
 	vps.app.WatchBackoff = 500 * time.Millisecond
 	w := startWatch(t, vps)
-	vps.k.Fail("docker.routing", -1)
-	vps.k.SetDocker(docker0)
+	base := checkRepairs(t, vps, journal.EventBegin)
+	vps.k.Fail("iptables.apply", -1)
+	vps.k.SetIptablesRules("ip", "INPUT", []enginetest.IptablesRule{{Handle: 900}})
 	w.change()
 	if !within(time.Second, func() bool {
 		return checkRepairs(t, vps, journal.EventRolledBack, journal.EventSafeMode) == 1
@@ -303,18 +307,113 @@ func TestServiceWatchBacksOffAfterFailure(t *testing.T) {
 		w.change()
 		time.Sleep(10 * time.Millisecond)
 	}
-	if n := checkRepairs(t, vps, journal.EventBegin); n != 1 {
+	if n := checkRepairs(t, vps, journal.EventBegin) - base; n != 1 {
 		_, out := w.stop()
 		t.Fatalf("%d check-repair transactions during the backoff, want 1\n%s", n, out)
 	}
 	time.Sleep(vps.app.WatchBackoff - 100*time.Millisecond)
 	w.change()
-	if !within(time.Second, func() bool { return checkRepairs(t, vps, journal.EventBegin) == 2 }) {
+	if !within(time.Second, func() bool { return checkRepairs(t, vps, journal.EventBegin)-base == 2 }) {
 		_, out := w.stop()
 		t.Fatalf("no new attempt after the backoff\n%s", out)
 	}
 	code, out := w.stop()
 	if code != 0 || !strings.Contains(out, "meshly: watch: ") {
 		t.Fatalf("exit %d\n%s", code, out)
+	}
+}
+
+// A repair that succeeds only without the Docker networks counts as a
+// failure: its own changes are not answered with the same repair, the
+// next try comes after WatchBackoff.
+func TestServiceWatchBacksOffWithoutDocker(t *testing.T) {
+	vps, _ := pair(t)
+	vps.app.WatchBackoff = 500 * time.Millisecond
+	w := startWatch(t, vps)
+	vps.k.Fail("docker.routing", 1)
+	vps.k.SetDocker(docker0)
+	w.change()
+	if !within(time.Second, func() bool { return checkRepairs(t, vps, journal.EventCommit) == 1 }) {
+		_, out := w.stop()
+		t.Fatalf("no repair\n%s", out)
+	}
+	if dockerApplied(vps) {
+		t.Fatal("Docker applied despite the failure")
+	}
+	for range 20 {
+		w.change()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := checkRepairs(t, vps, journal.EventBegin); n != 1 {
+		_, out := w.stop()
+		t.Fatalf("%d check-repair transactions during the backoff, want 1\n%s", n, out)
+	}
+	time.Sleep(vps.app.WatchBackoff - 100*time.Millisecond)
+	w.change()
+	if !within(time.Second, func() bool { return dockerApplied(vps) }) {
+		_, out := w.stop()
+		t.Fatalf("not applied after the backoff\n%s", out)
+	}
+	code, out := w.stop()
+	if code != 0 || !strings.Contains(out, "meshly: watch: repaired only without the Docker networks") ||
+		!strings.Contains(out, "meshly: warning: applied without the Docker networks") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+}
+
+// An error before any transaction, such as a read of the links that a
+// burst of changes interrupted, is retried after WatchRetry, not after
+// WatchBackoff: the new network works within seconds.
+func TestServiceWatchRetriesAfterReadError(t *testing.T) {
+	vps, _ := pair(t)
+	w := startWatch(t, vps) // WatchBackoff: an hour
+	vps.k.Fail("docker.bridges", 2)
+	vps.k.SetDocker(docker0)
+	w.change()
+	if !within(time.Second, func() bool { return dockerApplied(vps) }) {
+		_, out := w.stop()
+		t.Fatalf("not applied after the read errors\n%s", out)
+	}
+	if code, out := w.stop(); code != 0 || strings.Count(out, "meshly: watch: find Docker networks: fake docker.bridges failure") != 2 {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+}
+
+// The lock held by a waiting invite is busy, like any other holder.
+func TestLockBusy(t *testing.T) {
+	for _, err := range []error{lock.ErrBusy, errorf(ExitBusy, "meshly invite is waiting for a node to join until now")} {
+		if !lockBusy(err) {
+			t.Errorf("lockBusy(%v) = false", err)
+		}
+	}
+	for _, err := range []error{nil, errors.New("read links"), errorf(ExitPreflight, "x"), &engine.ApplyError{Cause: errors.New("x"), RolledBack: true}} {
+		if lockBusy(err) {
+			t.Errorf("lockBusy(%v) = true", err)
+		}
+	}
+}
+
+// The check timer's repair that succeeds only without the Docker networks
+// succeeds, with a warning; doctor shows why.
+func TestServiceCheckWithoutDocker(t *testing.T) {
+	vps, _ := pair(t)
+	vps.k.Fail("docker.routing", 1)
+	vps.k.SetDocker(docker0)
+	code, _, errOut := vps.run("service", "check")
+	if code != 0 || !strings.Contains(errOut, "meshly: warning: applied without the Docker networks") || !strings.Contains(errOut, "fake docker.routing failure") {
+		t.Fatalf("exit %d\n%s", code, errOut)
+	}
+	if dockerApplied(vps) {
+		t.Fatal("Docker applied despite the failure")
+	}
+	if logs := vps.must("logs"); !strings.Contains(logs, "completed without the Docker networks: ") {
+		t.Fatalf("logs:\n%s", logs)
+	}
+	if _, d, _ := vps.run("doctor"); !strings.Contains(d, "completed without the Docker networks") {
+		t.Fatalf("doctor:\n%s", d)
+	}
+	vps.must("service", "check")
+	if !dockerApplied(vps) {
+		t.Fatal("Docker not applied by the next check")
 	}
 }

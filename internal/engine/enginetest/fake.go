@@ -137,7 +137,8 @@ func New() *Kernel {
 // link.create, link.delete, link.up, link.down, link.mtu, link.alias,
 // link.address, routes.sync, link.sysctl, docker.routing,
 // wireguard.configure, nft.check, nft.apply, iptables.check,
-// iptables.apply.
+// iptables.apply, and the reads docker.bridges, docker.observe (of the
+// policy routing) and nft.list.
 func (k *Kernel) Fail(op string, n int) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -280,9 +281,12 @@ func (f *Links) Forwarding(n string) (bool, error) {
 func (f *Links) DockerBridges() ([]netstack.Bridge, error) {
 	f.k.mu.Lock()
 	defer f.k.mu.Unlock()
+	if err := f.k.call("docker.bridges"); err != nil {
+		return nil, err
+	}
 	var out []netstack.Bridge
 	for _, b := range f.k.Docker {
-		out = append(out, netstack.Bridge{Name: b.Name, Prefixes: slices.Clone(b.Prefixes)})
+		out = append(out, netstack.Bridge{Name: b.Name, Prefixes: slices.Clone(b.Prefixes), Down: b.Down})
 	}
 	return out, nil
 }
@@ -290,6 +294,9 @@ func (f *Links) DockerBridges() ([]netstack.Bridge, error) {
 func (f *Links) ObserveDockerRouting() (netstack.DockerRouting, error) {
 	f.k.mu.Lock()
 	defer f.k.mu.Unlock()
+	if err := f.k.call("docker.observe"); err != nil {
+		return netstack.DockerRouting{}, err
+	}
 	r := f.k.Routing
 	return netstack.DockerRouting{Rules: slices.Clone(r.Rules), Routes: slices.Clone(r.Routes), Foreign: r.Foreign}, nil
 }
@@ -300,7 +307,31 @@ func (f *Links) SyncDockerRouting(want netstack.DockerRouting) error {
 	if err := f.k.call("docker.routing"); err != nil {
 		return err
 	}
+	if err := f.k.checkRoutes(want.Routes); err != nil {
+		return err
+	}
 	f.k.Routing = netstack.DockerRouting{Rules: slices.Clone(want.Rules), Routes: slices.Clone(want.Routes), Foreign: f.k.Routing.Foreign}
+	return nil
+}
+
+// checkRoutes fails as the kernel would add the routes to the table: a
+// subnet only once, through a bridge that exists and is up.
+func (k *Kernel) checkRoutes(rs []netstack.TableRoute) error {
+	for i, r := range rs {
+		if slices.ContainsFunc(rs[:i], func(o netstack.TableRoute) bool { return o.Dst == r.Dst }) {
+			return fmt.Errorf("add route %s to table %d: file exists", r.Dst, netstack.RouteTable)
+		}
+		if r.Dev == "" {
+			continue
+		}
+		j := slices.IndexFunc(k.Docker, func(b netstack.Bridge) bool { return b.Name == r.Dev })
+		switch {
+		case j < 0:
+			return fmt.Errorf("link %s: link not found", r.Dev)
+		case k.Docker[j].Down:
+			return fmt.Errorf("add route %s to table %d: network is down", r.Dst, netstack.RouteTable)
+		}
+	}
 	return nil
 }
 
@@ -477,6 +508,9 @@ func (r runner) Run(_ context.Context, stdin string, args ...string) ([]byte, er
 		}
 		return nil, nil
 	case "-j list ruleset":
+		if err := k.call("nft.list"); err != nil {
+			return nil, err
+		}
 		return []byte(k.rulesetJSON()), nil
 	}
 	return nil, fmt.Errorf("fake nft: unsupported arguments %q", args)

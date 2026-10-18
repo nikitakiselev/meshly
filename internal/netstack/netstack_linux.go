@@ -443,7 +443,7 @@ func (n *Netlink) DockerBridges() ([]Bridge, error) {
 		if err != nil {
 			return nil, fmt.Errorf("list addresses of %s: %w", attrs.Name, err)
 		}
-		b := Bridge{Name: attrs.Name}
+		b := Bridge{Name: attrs.Name, Down: attrs.Flags&net.FlagUp == 0}
 		for _, a := range addrs {
 			if p, ok := prefixOf(a.IPNet); ok && p.Addr().Is4() {
 				b.Prefixes = append(b.Prefixes, p.Masked())

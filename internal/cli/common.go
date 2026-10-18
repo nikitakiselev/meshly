@@ -103,7 +103,7 @@ func (a *App) apply(ctx context.Context, op engine.Op, dryRun bool) (*engine.Res
 		return nil, nil
 	}
 	a.printf("Applying %s:\n", op.Name)
-	res, err := a.Engine.Execute(ctx, a.Journal, op)
+	res, err := a.execute(ctx, op)
 	if err != nil {
 		return nil, err
 	}
@@ -111,6 +111,23 @@ func (a *App) apply(ctx context.Context, op engine.Op, dryRun bool) (*engine.Res
 		a.printf("  (kernel state already matches; nothing to change)\n")
 	}
 	return res, nil
+}
+
+// execute runs op as a transaction and warns when it was completed only
+// without the Docker networks.
+func (a *App) execute(ctx context.Context, op engine.Op) (*engine.Result, error) {
+	res, err := a.Engine.Execute(ctx, a.Journal, op)
+	if err == nil && res.WithoutDocker != nil {
+		a.warnWithoutDocker(res.WithoutDocker)
+	}
+	return res, err
+}
+
+// warnWithoutDocker says that the configuration is applied without the
+// Docker networks after cause.
+func (a *App) warnWithoutDocker(cause error) {
+	fmt.Fprintf(a.Stderr, "meshly: warning: applied without the Docker networks, which failed: %v\n", cause)
+	fmt.Fprintf(a.Stderr, "         the tunnel between the hosts works; published container ports and container connections do not until a retry succeeds (meshly-check.timer, every minute; see meshly doctor)\n")
 }
 
 func (a *App) printPlan(d *engine.Desired, steps []engine.Step, cfgChanged bool) {

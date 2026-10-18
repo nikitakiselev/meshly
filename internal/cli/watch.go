@@ -69,11 +69,13 @@ func (w *watch) settle() bool {
 	}
 }
 
-// check runs checkOnce, again every WatchRetry while the lock is busy, and
-// reports whether the watch goes on. A failed check is followed by a pause
-// of WatchBackoff: the changes after a failure are mostly its own (rollback,
-// safe mode), and answering them would repeat the failing transaction every
-// second. The check timer retries meanwhile.
+// check runs checkOnce, again every WatchRetry while the lock is busy or
+// the check failed before a repair (a read that changes interrupted), and
+// reports whether the watch goes on. A failed repair (failedRepair) is
+// followed by a pause of WatchBackoff: the changes after it are mostly its
+// own (rollback, safe mode, the table without the Docker networks), and
+// answering them would repeat the failing transaction every second. The
+// check timer retries meanwhile.
 func (w *watch) check() bool {
 	for {
 		busy, err := w.a.checkOnce(w.ctx)
@@ -82,9 +84,11 @@ func (w *watch) check() bool {
 		}
 		if err != nil {
 			fmt.Fprintf(w.a.Stderr, "meshly: watch: %v\n", err)
-			return w.pause(w.a.WatchBackoff)
 		}
-		if !busy {
+		switch {
+		case failedRepair(err):
+			return w.pause(w.a.WatchBackoff)
+		case err == nil && !busy:
 			return true
 		}
 		if !w.pause(w.a.WatchRetry) {
@@ -94,8 +98,8 @@ func (w *watch) check() bool {
 }
 
 // pause waits for d and reports whether the watch goes on. Changes that come
-// meanwhile are dropped: the check after a busy lock sees them, and after a
-// failure they are left to the check timer.
+// meanwhile are dropped: the check after a retry sees them, and after a
+// failed repair they are left to the check timer.
 func (w *watch) pause(d time.Duration) bool {
 	t := time.After(d)
 	for {

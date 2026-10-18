@@ -186,6 +186,7 @@ type fakeLinks struct {
 	linkErr  error
 	excluded string
 	bridges  []netstack.Bridge
+	routing  netstack.DockerRouting
 }
 
 func (f *fakeLinks) UsedPrefixes(exclude string) ([]model.UsedPrefix, error) {
@@ -197,6 +198,9 @@ func (f *fakeLinks) LocalAddrs() ([]netip.Addr, error) {
 }
 func (f *fakeLinks) DefaultRouteAddrs() ([]model.LinkAddr, error) { return nil, nil }
 func (f *fakeLinks) DockerBridges() ([]netstack.Bridge, error)    { return f.bridges, nil }
+func (f *fakeLinks) ObserveDockerRouting() (netstack.DockerRouting, error) {
+	return f.routing, nil
+}
 func (f *fakeLinks) LinkExists(string) (bool, bool, string, error) {
 	return f.exists, f.owned, f.kind, f.linkErr
 }
@@ -552,6 +556,19 @@ func TestAnalysisContext(t *testing.T) {
 	if got := (&System{Links: &fakeLinks{}}).AnalysisContext(c); got.DockerBridges != nil {
 		t.Errorf("AnalysisContext without Docker networks = %+v", got)
 	}
+	// The bridges meshly serves (netstack.ServedBridges): not one set down,
+	// none while table 109 has routes of another program.
+	links.bridges = append(links.bridges, netstack.Bridge{Name: "br-3f1c2a9b7d01", Down: true})
+	if got := (&System{Links: links}).AnalysisContext(c); !slices.Equal(got.DockerBridges, []string{"docker0"}) || got.DockerOff != nil {
+		t.Errorf("AnalysisContext with a bridge set down = %+v", got)
+	}
+	links.routing.Foreign = 2
+	if got := (&System{Links: links}).AnalysisContext(c); got.DockerBridges != nil || !slices.Equal(got.DockerOff, []string{"docker0"}) {
+		t.Errorf("AnalysisContext with foreign routes in table 109 = %+v", got)
+	}
+	if got := (&System{Links: &fakeLinks{routing: links.routing}}).AnalysisContext(c); got.DockerBridges != nil || got.DockerOff != nil {
+		t.Errorf("AnalysisContext with foreign routes and no Docker = %+v", got)
+	}
 	if got := (&System{}).AnalysisContext(c); got.LocalAddrs != nil || got.DockerBridges != nil {
 		t.Errorf("AnalysisContext without Links = %+v", got)
 	}
@@ -650,6 +667,8 @@ func TestEvaluateFirewallForward(t *testing.T) {
 func TestEvaluateFirewallDockerMessages(t *testing.T) {
 	const networks = "Docker networks docker0, br-3f1c2a9b7d01: published container ports are reachable through the VPN after meshly allow <port>; containers reach the other node like programs on this host"
 	const noBridge = "Docker rules found but no Docker bridge network (docker0, br-<id>): containers on networks with custom bridge names cannot use the VPN"
+	const off = "routing table 109 has routes that meshly did not create, so meshly leaves the Docker networks docker0, br-3f1c2a9b7d01 out: published container ports and container connections do not work through the VPN; the tunnel between the hosts works"
+	const offFix = "remove the routes that meshly did not create from table 109 (`ip route show table 109`; meshly's have proto 109); meshly then serves the Docker networks within a minute"
 	tests := []struct {
 		name string
 		a    nft.Analysis
@@ -660,6 +679,8 @@ func TestEvaluateFirewallDockerMessages(t *testing.T) {
 			[]Check{{ID: "docker", Status: Info, Detail: networks}}},
 		{"Docker rules without a bridge", nft.Analysis{DockerDetected: true, DNATRules: 3},
 			[]Check{{ID: "docker", Status: Warn, Detail: noBridge}}},
+		{"Docker networks left out", nft.Analysis{DockerDetected: true, DNATRules: 3, DockerOff: []string{"docker0", "br-3f1c2a9b7d01"}},
+			[]Check{{ID: "docker", Status: Warn, Detail: off, Fix: offFix}}},
 	}
 	for _, tt := range tests {
 		for _, strict := range []bool{true, false} {

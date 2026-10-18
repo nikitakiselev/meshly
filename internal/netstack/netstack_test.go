@@ -2,6 +2,7 @@ package netstack
 
 import (
 	"net/netip"
+	"slices"
 	"testing"
 )
 
@@ -71,5 +72,38 @@ func TestDockerRoutingEqual(t *testing.T) {
 	iif.Rules = []PolicyRule{{Iif: "other0", Table: 109, Priority: 109}}
 	if a.Equal(iif) {
 		t.Error("a different Iif must differ")
+	}
+}
+
+// Only bridges that are up are served, each subnet with the first bridge
+// (by name) that has it; routes of another program in RouteTable leave none.
+func TestServedBridges(t *testing.T) {
+	p17, p18 := netip.MustParsePrefix("172.17.0.0/16"), netip.MustParsePrefix("172.18.0.0/16")
+	bridges := []Bridge{
+		{Name: "br-000000000001", Prefixes: []netip.Prefix{p17, p18}},
+		{Name: "br-000000000002", Prefixes: []netip.Prefix{netip.MustParsePrefix("172.20.0.0/16")}, Down: true},
+		{Name: "docker0", Prefixes: []netip.Prefix{p17}},
+	}
+	want := []Bridge{
+		{Name: "br-000000000001", Prefixes: []netip.Prefix{p17, p18}},
+		{Name: "docker0"},
+	}
+	got := ServedBridges(bridges, 0)
+	if len(got) != len(want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].Name != want[i].Name || !slices.Equal(got[i].Prefixes, want[i].Prefixes) || got[i].Down {
+			t.Fatalf("got %+v, want %+v", got, want)
+		}
+	}
+	if !slices.Equal(bridges[2].Prefixes, []netip.Prefix{p17}) {
+		t.Fatalf("input changed: %+v", bridges)
+	}
+	if got := ServedBridges(bridges, 1); got != nil {
+		t.Fatalf("with foreign routes: %+v", got)
+	}
+	if got := ServedBridges(nil, 0); got != nil {
+		t.Fatalf("without bridges: %+v", got)
 	}
 }

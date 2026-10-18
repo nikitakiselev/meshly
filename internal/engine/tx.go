@@ -35,7 +35,14 @@ type Result struct {
 	Steps         []Step
 	ConfigChanged bool
 	OpID          string
+	// WithoutDocker is the failure with the Docker networks when the
+	// operation was completed without them (nil: it was not).
+	WithoutDocker error
 }
+
+// WithoutDockerDetail starts the journal detail of an operation completed
+// without the Docker networks; the failure with them follows.
+const WithoutDockerDetail = "completed without the Docker networks: "
 
 // ApplyError is returned when applying failed. Exactly one of RolledBack
 // and SafeMode is set when the system was brought to a safe state.
@@ -104,8 +111,11 @@ func (e *Engine) Preview(ctx context.Context, op Op) (*Desired, []Step, error) {
 //	plan → journal begin → [forward ops: write-ahead target config] →
 //	steps (firewall first) → verify → save config → journal commit
 //
-// On failure, backward ops restore the base config and forward ops are
-// retried; if that fails too, SafeMode closes the VPN path.
+// On failure with Docker networks, the target is applied without them
+// first (Result.WithoutDocker): a problem on the containers' path never
+// takes the tunnel down. Otherwise, or if that fails too, backward ops
+// restore the base config and forward ops are retried; if that fails too,
+// SafeMode closes the VPN path.
 func (e *Engine) Execute(ctx context.Context, j *journal.Journal, op Op) (*Result, error) {
 	ifname := ifnameOf(op.Target, op.Base)
 	changed := !SameConfig(op.Base, op.Target)
@@ -136,6 +146,7 @@ func (e *Engine) Execute(ctx context.Context, j *journal.Journal, op Op) (*Resul
 	if !changed && len(steps) == 0 {
 		return res, nil
 	}
+	docker := hasDocker(d)
 	opID, err := model.NewRandomID(rand.Read)
 	if err != nil {
 		return nil, err
@@ -156,15 +167,22 @@ func (e *Engine) Execute(ctx context.Context, j *journal.Journal, op Op) (*Resul
 	if err := j.Append(begin); err != nil {
 		return nil, fmt.Errorf("cannot write transaction journal, nothing changed: %w", err)
 	}
+	fail := func(cause error) (*Result, error) {
+		if docker && !errors.Is(cause, ErrConflict) && e.withoutDocker(ctx, j, op, opID, ifname, cause) == nil {
+			res.WithoutDocker = cause
+			return res, nil
+		}
+		return res, e.fail(ctx, j, op, opID, ifname, cause)
+	}
 	if err := fault.Point("tx:after-begin"); err != nil {
-		return res, e.fail(ctx, j, op, opID, ifname, err)
+		return fail(err)
 	}
 	forward := op.Recovery == journal.Forward
 	if forward && changed {
 		// Access-reducing operations become authoritative immediately:
 		// an interruption must complete them, never undo them.
 		if err := e.persist(op.Target); err != nil {
-			return res, e.fail(ctx, j, op, opID, ifname, err)
+			return fail(err)
 		}
 	}
 	hook := func(s Step) error { return fault.Point("step:" + s.Name) }
@@ -181,15 +199,48 @@ func (e *Engine) Execute(ctx context.Context, j *journal.Journal, op Op) (*Resul
 		}
 	}
 	if err != nil {
-		return res, e.fail(ctx, j, op, opID, ifname, err)
+		return fail(err)
 	}
 	if err := fault.Point("tx:before-commit"); err != nil {
-		return res, e.fail(ctx, j, op, opID, ifname, err)
+		return fail(err)
 	}
 	if err := j.Append(journal.Record{OpID: opID, Event: journal.EventCommit, Op: op.Name}); err != nil {
 		return res, fmt.Errorf("changes applied but the journal commit failed: %w", err)
 	}
 	return res, nil
+}
+
+// hasDocker reports whether d serves Docker networks.
+func hasDocker(d *Desired) bool { return d.Present && len(d.Docker) > 0 }
+
+// withoutDocker completes op after cause without the Docker networks: its
+// target (with the overlay) as on a node without them, saved and committed.
+// "tx:without-docker" lets tests make it fail.
+func (e *Engine) withoutDocker(ctx context.Context, j *journal.Journal, op Op, opID, ifname string, cause error) error {
+	e.progress("apply failed (%v); retrying without the Docker networks", cause)
+	err := fault.Point("tx:without-docker")
+	if err == nil {
+		err = e.reconcileWithout(ctx, op.Target, ifname, op.Overlay)
+	}
+	if err == nil && !SameConfig(op.Base, op.Target) {
+		// The failure may have preceded the save (or the write-ahead save).
+		err = e.persist(op.Target)
+	}
+	if err != nil {
+		return err
+	}
+	_ = j.Append(journal.Record{OpID: opID, Event: journal.EventCommit, Op: op.Name, Detail: WithoutDockerDetail + cause.Error()})
+	return nil
+}
+
+// reconcileWithout applies cfg plus ov as on a node without Docker
+// networks and verifies it.
+func (e *Engine) reconcileWithout(ctx context.Context, cfg *model.Config, ifname string, ov *Overlay) error {
+	d, err := DesiredWith(cfg, ifname, ov, Env{})
+	if err == nil {
+		_, err = e.reconcileTo(ctx, d, nil)
+	}
+	return err
 }
 
 func (e *Engine) persist(c *model.Config) error {
@@ -250,6 +301,8 @@ type RecoveryResult struct {
 	Op   string
 	OpID string
 	Mode string // "completed", "rolled-forward", "rolled-back", "safe-mode"
+	// WithoutDocker is as in Result.
+	WithoutDocker error
 }
 
 // Recover finishes an interrupted transaction found in the journal. It is
@@ -289,13 +342,29 @@ func (e *Engine) Recover(ctx context.Context, j *journal.Journal) (*RecoveryResu
 		}
 	}
 	e.progress("recovering interrupted operation %q (%s)", inc.Op, mode)
-	if _, err := e.Reconcile(ctx, target, ifname, nil); err != nil {
+	res := &RecoveryResult{Op: inc.Op, OpID: inc.OpID, Mode: mode}
+	d, err := e.desired(target, ifname, nil)
+	if err == nil {
+		_, err = e.reconcileTo(ctx, d, nil)
+	}
+	// d is nil when the node's Docker networks could not be read.
+	if err != nil && (d == nil || hasDocker(d)) {
+		e.progress("recovery failed (%v); retrying without the Docker networks", err)
+		if werr := e.reconcileWithout(ctx, target, ifname, nil); werr == nil {
+			res.WithoutDocker, err = err, nil
+		}
+	}
+	if err != nil {
 		smErr := e.SafeMode(ctx, target, ifname)
 		_ = j.Append(journal.Record{OpID: inc.OpID, Event: journal.EventSafeMode, Op: inc.Op, Detail: errors.Join(err, smErr).Error()})
 		return &RecoveryResult{Op: inc.Op, OpID: inc.OpID, Mode: "safe-mode"}, &ApplyError{Cause: err, SafeMode: true, Detail: smErr}
 	}
-	if err := j.Append(journal.Record{OpID: inc.OpID, Event: journal.EventRecovered, Op: inc.Op, Detail: mode}); err != nil {
+	detail := mode
+	if res.WithoutDocker != nil {
+		detail += "; " + WithoutDockerDetail + res.WithoutDocker.Error()
+	}
+	if err := j.Append(journal.Record{OpID: inc.OpID, Event: journal.EventRecovered, Op: inc.Op, Detail: detail}); err != nil {
 		return nil, err
 	}
-	return &RecoveryResult{Op: inc.Op, OpID: inc.OpID, Mode: mode}, nil
+	return res, nil
 }

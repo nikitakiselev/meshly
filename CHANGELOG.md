@@ -29,6 +29,11 @@ on-disk formats.
     the peer meanwhile, as the former are to the internet (see the [threat model](docs/threat-model.md)).
   - meshly's rule also goes to the top of the iptables `FORWARD` chain. A forward chain of the host firewall that may
     drop container traffic is a warning in `doctor` with the fix, never a reason to refuse.
+  - A problem on the containers' path never takes the tunnel between the hosts down. A Docker bridge that is set down
+    is left out until it is up again, and a subnet that two Docker networks share is routed to the first of them by
+    name. Routes of another program in routing table 109 turn container support off, with a warning and the fix, not
+    exit 5. Any other failure while applying the Docker networks applies the configuration without them, with a
+    warning and `completed without the Docker networks: …` in `meshly logs`; the check timer retries every minute.
   - On a node without Docker networks nothing changes. See [docs/firewall.md](docs/firewall.md#docker).
 
 ### Fixed
