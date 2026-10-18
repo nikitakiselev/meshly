@@ -68,7 +68,7 @@ func (a *App) cmdJoin(ctx context.Context, args []string) error {
 	}
 	code, err := pairing.ParseCode(line, a.Now())
 	if errors.Is(err, pairing.ErrExpired) {
-		return fmt.Errorf("%w; run `sudo meshly invite` on the inviting node again", err)
+		return fmt.Errorf("%w; run `sudo meshly invite` on the inviting node again, and if the new code is refused as expired too, check the clock of this node", err)
 	}
 	if err != nil {
 		return err
@@ -115,7 +115,8 @@ func (a *App) cmdJoin(ctx context.Context, args []string) error {
 	if pcfg.Firewall.Profile, err = a.resolveProfile(ctx, *profile, pcfg); err != nil {
 		return err
 	}
-	// Nothing has been changed or sent yet.
+	// Nothing has been sent yet, and nothing changed but the leftovers
+	// removed above.
 	if err := a.preflight(ctx, pcfg, pfOpts{conflicts: true, strict: true}); err != nil {
 		return err
 	}
@@ -339,7 +340,7 @@ func checkWelcome(w *pairing.Welcome, code *pairing.Code, name string) error {
 	default:
 		return nil
 	}
-	return fmt.Errorf("%w: the inviting node's answer does not match the invite code (%s); nothing was changed on this node", pairing.ErrProtocol, what)
+	return fmt.Errorf("%w: the inviting node's answer does not match the invite code (%s)", pairing.ErrProtocol, what)
 }
 
 // pairingConfig is what the joining node runs the temporary tunnel on. It

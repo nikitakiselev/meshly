@@ -53,13 +53,17 @@ func NewApp() *App {
 	return a
 }
 
-// interruptible ends with Ctrl+C, SIGTERM or the hang-up of the terminal (a
-// closed SSH session), so that the invite or join cleans up rather than dies
-// halfway. A SIGHUP ignored at start, as under nohup, stays ignored.
+// interruptible ends with Ctrl+C, SIGTERM, the hang-up of the terminal (a
+// closed SSH session) or a broken pipe on stdout or stderr (`| tee` killed
+// by Ctrl+C first), so that the invite or join cleans up rather than dies
+// halfway: caught, a broken pipe only fails the write. A SIGHUP or SIGPIPE
+// ignored at start, as under nohup, stays ignored.
 func interruptible(c context.Context) (context.Context, context.CancelFunc) {
 	sigs := []os.Signal{os.Interrupt, syscall.SIGTERM}
-	if !signal.Ignored(syscall.SIGHUP) {
-		sigs = append(sigs, syscall.SIGHUP)
+	for _, s := range []os.Signal{syscall.SIGHUP, syscall.SIGPIPE} {
+		if !signal.Ignored(s) {
+			sigs = append(sigs, s)
+		}
 	}
 	return signal.NotifyContext(c, sigs...)
 }

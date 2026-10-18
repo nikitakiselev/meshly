@@ -137,7 +137,7 @@ func RunDoctor(ctx context.Context, d Deps, sys *preflight.System, probe *Probe)
 		return finish(doc)
 	}
 	if st.Invite != nil {
-		doc.add("invite", "info", Fact, fmt.Sprintf("an invite is open until %s; the drift check is skipped", st.Invite.ExpiresAt.Local().Format(time.RFC3339)), "")
+		doc.add("invite", "info", Fact, fmt.Sprintf("an invite is open until %s; the drift check is skipped", st.Invite.ExpiresAt.Local().Format(time.RFC3339)), "let it finish, or cancel it with Ctrl+C in its terminal")
 	} else if len(st.Drift) > 0 {
 		doc.add("drift", "fail", Fact, "kernel state differs from the configuration: "+strings.Join(st.Drift, "; "), "meshly start   (re-applies the saved configuration)")
 	} else {

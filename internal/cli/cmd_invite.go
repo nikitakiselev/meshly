@@ -159,6 +159,7 @@ func (a *App) runInvite(ctx context.Context, cfg *model.Config, code *pairing.Co
 			if err := st.arm(); err != nil {
 				return nil, err
 			}
+			st.markOpen(code.ExpiresAt)
 			fmt.Fprintf(a.Stderr, "The code stays valid until %s.\n", clockTime(code.ExpiresAt))
 		case in := <-srv.requests:
 			confirmed, err := st.serve(srv, in)
@@ -280,7 +281,22 @@ func (s *inviteSession) admit(c net.Conn, h *pairing.Hello) error {
 	}
 	s.member = target
 	s.timer = time.NewTimer(t.Confirm)
+	// The node may confirm after the code's expiry: until then the invite
+	// is open, for status and for other commands.
+	s.markOpen(a.Now().Add(t.Confirm))
 	return nil
+}
+
+// markOpen records in the marker that the invite is open until until, or
+// the code's expiry if that is later. A failure only affects what status
+// and other commands show, so it is a warning.
+func (s *inviteSession) markOpen(until time.Time) {
+	if until.Before(s.code.ExpiresAt) {
+		until = s.code.ExpiresAt
+	}
+	if err := s.a.Paths.SaveInviteMarker(store.InviteMarker{ExpiresAt: until}); err != nil {
+		fmt.Fprintf(s.a.Stderr, "meshly: warning: %v\n", err)
+	}
 }
 
 // undo removes the node that did not confirm.

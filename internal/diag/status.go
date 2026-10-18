@@ -51,7 +51,8 @@ type InviteInfo struct {
 
 // OpenInvite reports the invite that waits for a node to join, or nil. It
 // is open only for a privileged run (the marker is root's), while the marker
-// is readable, the lock is held and the invite has not expired.
+// is readable, the lock is held and the marker's time has not passed: the
+// code's expiry, or the confirmation deadline of a node that joined.
 func OpenInvite(d Deps) *InviteInfo {
 	if !d.Privileged {
 		return nil

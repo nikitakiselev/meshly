@@ -33,13 +33,15 @@ Examples:
 Wait for the second node to join this network. Prints a one-time code, then
 waits until a node joins with it, the code expires or Ctrl+C. Run it on the
 node the other one reaches over UDP (it needs a public endpoint). Nothing new
-is reachable from the internet meanwhile: the exchange runs through the
-WireGuard port, over a temporary peer that only the code unlocks.
+is reachable meanwhile, from the internet or by local users: the exchange
+runs through the WireGuard port, over a temporary peer that only the code
+unlocks.
 
   --ttl DURATION   how long the code is valid (default 10m, 1m to 1h)
 
-Example:
-  sudo meshly invite`,
+Examples:
+  sudo meshly invite
+  sudo meshly invite --ttl 30m`,
 	"join": `meshly join [--name NAME] [--endpoint IP[:PORT]|auto|none] [options]
 
 Join the network of the node where ` + "`meshly invite`" + ` waits: paste the code it

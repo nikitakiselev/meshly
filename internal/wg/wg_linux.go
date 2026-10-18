@@ -80,7 +80,8 @@ func (Kernel) Configure(name string, priv wgtypes.Key, listenPort int, want []De
 		}
 	}()
 	wanted := map[string]bool{}
-	for _, p := range want {
+	for i := range want {
+		p := &want[i] // not a copy: it holds the preshared key
 		key, err := wgtypes.ParseKey(p.PublicKey)
 		if err != nil {
 			return fmt.Errorf("peer key: %w", err)
@@ -88,7 +89,9 @@ func (Kernel) Configure(name string, priv wgtypes.Key, listenPort int, want []De
 		wanted[p.PublicKey] = true
 		ka := time.Duration(p.Keepalive) * time.Second
 		// Always set: the zero key clears the PSK of a peer updated in place.
+		// The copy is wiped once the device is configured, like priv.
 		psk := p.PresharedKey
+		defer clear(psk[:])
 		pc := wgtypes.PeerConfig{
 			PublicKey:                   key,
 			ReplaceAllowedIPs:           true,

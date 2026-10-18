@@ -152,7 +152,7 @@ never contains private keys.
 | `service` | `meshly.service` installed, enabled and active. | `meshly start`; `journalctl -u meshly` |
 | `transaction` | An operation did not finish (problem), or the last one ended in rollback or safe mode (warning). | `meshly recover`, or fix the cause and repeat; `meshly start` re-applies the configuration. |
 | `link` | The link is stopped by the administrator. | `meshly start` |
-| `invite` | An invite is open until the time shown; the drift check is skipped while it waits (info). | Let it finish, or cancel it with Ctrl+C where it runs. |
+| `invite` | An invite is open until the time shown; the drift check is skipped while it waits (info). | *"let it finish, or cancel it with Ctrl+C in its terminal"* |
 | `drift` | The kernel differs from the configuration; the finding lists the differences. | `meshly start` (or wait for the check timer). |
 | `routes` | Routes on the meshly interface that meshly did not create; traffic to them is dropped. | Remove them (`ip route show dev meshly0`). |
 | `mtu` | The interface MTU is larger than the smallest outer MTU minus 80 bytes of WireGuard overhead. | `meshly set mtu <n>` on both nodes. |

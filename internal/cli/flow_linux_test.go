@@ -865,7 +865,8 @@ func TestJoinCodeInput(t *testing.T) {
 		}
 	}
 	home.now = vps.now.Add(16 * time.Minute)
-	if code, out, errOut := joinWith(home, inv.code, "--name", "home"); code != ExitInvalidCode || !strings.Contains(out+errOut, "expired") {
+	if code, out, errOut := joinWith(home, inv.code, "--name", "home"); code != ExitInvalidCode || !strings.Contains(out+errOut, "expired") ||
+		!strings.Contains(errOut, "check the clock of this node") {
 		t.Errorf("join with an expired code: exit %d\n%s%s", code, out, errOut)
 	}
 	home.now = vps.now
@@ -1452,6 +1453,107 @@ func TestInviteIgnoresForeignSource(t *testing.T) {
 	}
 }
 
+// A welcome that does not match the code stops the join before anything
+// changes, and says so once.
+func TestJoinWelcomeMismatch(t *testing.T) {
+	vps, home, mem := newPair(t)
+	cfg := vps.config()
+	c, err := pairing.NewCode(cfg.Self.Endpoint, cfg.Self.WGPublicKey, cfg.Network.CIDR, start.Add(10*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inviter, joiner := c.Addresses()
+	l, err := mem.View(inviter, nil).Listen(netip.AddrPortFrom(inviter, pairing.Port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		deadline := time.Now().Add(5 * time.Second)
+		if _, err := pairing.ReadRequest(conn, deadline); err == nil {
+			_ = pairing.WriteWelcome(conn, deadline, pairing.Welcome{
+				NetworkID: cfg.Network.ID, NetworkName: cfg.Network.Name, CIDR: cfg.Network.CIDR, MTU: cfg.Interface.MTU,
+				Inviter: pairing.Node{Name: "vps", Address: inviter, WGPublicKey: cfg.Self.WGPublicKey, Endpoint: netip.MustParseAddrPort("203.0.113.99:51820")},
+				Address: joiner,
+			})
+		}
+	}()
+	home.app.Pairing = mem.View(homeVPN, nil)
+	code, out, errOut := joinWith(home, c.String(), "--name", "home")
+	if code != ExitError || !strings.Contains(errOut, "does not match the invite code (endpoint)") || strings.Count(errOut, "nothing was changed on this node") != 1 {
+		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
+	}
+	home.untouched()
+}
+
+// A node that joined just before the code expired may confirm after it:
+// until its confirmation deadline the invite stays open for status and for
+// other commands. Undone, the invite is open until the code's expiry again.
+func TestInviteOpenUntilConfirmDeadline(t *testing.T) {
+	vps, home, mem := newPair(t)
+	var now atomic.Int64 // vps's clock, moved while the invite runs
+	now.Store(start.UnixNano())
+	clock := func() time.Time { return time.Unix(0, now.Load()).UTC() }
+	vps.app.Now, vps.app.Engine.Now = clock, clock
+	vps.app.Journal = journal.Open(vps.app.Paths.JournalFile(), clock)
+	confirm := 4 * time.Second
+	vps.app.PairTimeouts = pairing.Timeouts{Connect: time.Second, Exchange: time.Second, Confirm: confirm}
+	home.app.PairTimeouts = shortTimeouts
+	inv := startInvite(t, vps)
+	c, err := pairing.ParseCode(inv.code, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := func() time.Time {
+		m, err := vps.app.Paths.LoadInviteMarker()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m.ExpiresAt
+	}
+	if got := marker(); !got.Equal(c.ExpiresAt) {
+		t.Fatalf("marker until %s, want the code's expiry %s", got, c.ExpiresAt)
+	}
+
+	// home joins a second before the expiry; its confirmation is lost.
+	joined := c.ExpiresAt.Add(-time.Second)
+	now.Store(joined.UnixNano())
+	tempPub, _ := tempKeys(t, inv.code)
+	var blocked atomic.Bool
+	blocked.Store(true)
+	home.app.Pairing = mem.View(homeVPN, blockReal(vps, home, tempPub, &blocked, nil))
+	if code, out, errOut := joinWith(home, inv.code, "--name", "home"); code != ExitRolledBack {
+		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
+	}
+	deadline := joined.Add(confirm)
+	for wait := time.Now().Add(confirm / 2); !marker().Equal(deadline); {
+		if time.Now().After(wait) {
+			t.Fatalf("marker until %s, want the confirmation deadline %s", marker(), deadline)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	vps2 := vps.sibling()
+	vps2.now = c.ExpiresAt.Add(time.Second)
+	if out := vps2.expect(0, "status"); !strings.Contains(out, "Invite open until") || strings.Contains(out, "Drift") || strings.Contains(out, "OUTDATED") {
+		t.Errorf("status past the code's expiry, before the confirmation deadline:\n%s", out)
+	}
+
+	inv.waitFor(`Node "home" did not confirm the connection; its membership was undone.`)
+	inv.waitFor("The code stays valid until")
+	if got := marker(); !got.Equal(c.ExpiresAt) {
+		t.Errorf("marker until %s after the undo, want the code's expiry %s", got, c.ExpiresAt)
+	}
+	inv.cancel()
+	if code, out := inv.wait(); code != ExitDeclined {
+		t.Errorf("invite: exit %d\n%s", code, out)
+	}
+}
+
 // testSession is an armed invite of network homelab on node vps, with no
 // engine behind it: enough for the answers that change nothing.
 func testSession(t *testing.T) *inviteSession {
@@ -1607,37 +1709,42 @@ func TestInviteConfirmAtDeadline(t *testing.T) {
 	}
 }
 
-// Ctrl+C, SIGTERM and the hang-up of the terminal end the waiting phases of
-// invite and join; a SIGHUP ignored at start, as under nohup, stays ignored.
+// Ctrl+C, SIGTERM, the hang-up of the terminal and a broken pipe on the
+// output (`| tee` killed first) end the waiting phases of invite and join;
+// a SIGHUP or SIGPIPE ignored at start, as under nohup, stays ignored.
 func TestInterruptibleHangUp(t *testing.T) {
-	if signal.Ignored(syscall.SIGHUP) {
-		t.Skip("SIGHUP is ignored where the test runs")
-	}
-	ctx, stop := interruptible(context.Background())
-	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-ctx.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("SIGHUP did not end the wait")
-	}
-	stop()
+	for _, sig := range []syscall.Signal{syscall.SIGHUP, syscall.SIGPIPE} {
+		t.Run(sig.String(), func(t *testing.T) {
+			if signal.Ignored(sig) {
+				t.Skipf("%v is ignored where the test runs", sig)
+			}
+			ctx, stop := interruptible(context.Background())
+			if err := syscall.Kill(os.Getpid(), sig); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%v did not end the wait", sig)
+			}
+			stop()
 
-	signal.Ignore(syscall.SIGHUP)
-	defer signal.Reset(syscall.SIGHUP)
-	ctx, stop = interruptible(context.Background())
-	defer stop()
-	if !signal.Ignored(syscall.SIGHUP) {
-		t.Fatal("waiting stopped ignoring SIGHUP")
-	}
-	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-ctx.Done():
-		t.Fatal("an ignored SIGHUP ended the wait")
-	case <-time.After(100 * time.Millisecond):
+			signal.Ignore(sig)
+			defer signal.Reset(sig)
+			ctx, stop = interruptible(context.Background())
+			defer stop()
+			if !signal.Ignored(sig) {
+				t.Fatalf("waiting stopped ignoring %v", sig)
+			}
+			if err := syscall.Kill(os.Getpid(), sig); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatalf("an ignored %v ended the wait", sig)
+			case <-time.After(100 * time.Millisecond):
+			}
+		})
 	}
 }
 
@@ -1674,7 +1781,8 @@ func TestOpenInviteIsVisible(t *testing.T) {
 		t.Error("the invite code is shown")
 	}
 	_, doc, _ := vps2.run("doctor")
-	if strings.Contains(doc, "✗") || strings.Contains(doc, " drift  ") || !strings.Contains(doc, "an invite is open until") {
+	if strings.Contains(doc, "✗") || strings.Contains(doc, " drift  ") || !strings.Contains(doc, "an invite is open until") ||
+		!strings.Contains(doc, "→ let it finish, or cancel it with Ctrl+C in its terminal\n") {
 		t.Errorf("doctor:\n%s", doc)
 	}
 	for _, line := range strings.Split(doc, "\n") {
