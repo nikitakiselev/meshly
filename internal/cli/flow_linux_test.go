@@ -1585,10 +1585,80 @@ func TestOpenInviteIsVisible(t *testing.T) {
 	if out := vps2.expect(ExitBusy, "allow", "22/tcp", "from", "home"); !strings.Contains(out, "meshly invite is waiting") {
 		t.Errorf("allow: %s", out)
 	}
+	// The check timer leaves a running invite alone, marker included.
+	vps2.must("service", "check")
+	if _, err := vps2.app.Paths.LoadInviteMarker(); err != nil {
+		t.Errorf("invite marker of the running invite: %v", err)
+	}
 
 	inv.cancel()
 	inv.wait()
 	if out := vps2.expect(0, "status"); strings.Contains(out, "Invite open") {
 		t.Errorf("status after cancel:\n%s", out)
 	}
+}
+
+// An invite killed with SIGKILL leaves its temporary state, its marker and
+// an "opened" record without a "closed" one. The next command that takes
+// the lock (the check timer at the latest) closes it: marker removed, the
+// end journaled, the temporary state reconciled away.
+func TestLeftoverInviteClosed(t *testing.T) {
+	vps, _, _ := newPair(t)
+	for _, cmd := range [][]string{{"service", "check"}, {"start"}} {
+		t.Run(strings.Join(cmd, " "), func(t *testing.T) {
+			vps.t = t
+			cfg := vps.config()
+			code, err := pairing.NewCode(cfg.Self.Endpoint, cfg.Self.WGPublicKey, cfg.Network.CIDR, vps.now.Add(pairing.DefaultTTL))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sec, err := code.Secrets()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := vps.app.applyOverlay(context.Background(), cfg, inviterOverlay(code, sec, true)); err != nil {
+				t.Fatal(err)
+			}
+			if err := vps.app.Paths.SaveInviteMarker(store.InviteMarker{ExpiresAt: code.ExpiresAt}); err != nil {
+				t.Fatal(err)
+			}
+			vps.app.audit("invite", "", "opened, expires "+code.ExpiresAt.Format(time.RFC3339))
+			if len(vps.drift()) == 0 {
+				t.Fatal("no temporary state to clean up")
+			}
+
+			before := interrupted(t, vps)
+			vps.must(cmd...)
+			if d := vps.drift(); len(d) != 0 {
+				t.Errorf("drift: %v", d)
+			}
+			if d := vps.device(); len(d.Peers) != 0 {
+				t.Errorf("WireGuard peers left: %+v", d.Peers)
+			}
+			if strings.Contains(vps.lastScript(), "tcp . 51820") {
+				t.Error("the pairing port is still allowed")
+			}
+			if _, err := vps.app.Paths.LoadInviteMarker(); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("invite marker: %v", err)
+			}
+			if n := interrupted(t, vps); n != before+1 {
+				t.Errorf("%d new \"closed: interrupted\" records, want 1", n-before)
+			}
+			if out := vps.must("status"); strings.Contains(out, "Invite open") {
+				t.Errorf("status:\n%s", out)
+			}
+		})
+	}
+}
+
+// interrupted counts the journal records of invites closed as interrupted.
+func interrupted(t *testing.T, n *testNode) int {
+	t.Helper()
+	c := 0
+	for _, r := range journalRecords(t, n) {
+		if r.Event == journal.EventAudit && r.Op == "invite" && r.Detail == "closed: interrupted" {
+			c++
+		}
+	}
+	return c
 }

@@ -323,6 +323,7 @@ func (a *App) begin(ctx context.Context) (*session, error) {
 		return nil, err
 	}
 	s := &session{a: a, lock: l}
+	a.closeLeftoverInvite()
 	rec, err := a.Engine.Recover(ctx, a.Journal)
 	if rec != nil {
 		fmt.Fprintf(a.Stderr, "meshly: recovered interrupted operation %q: %s\n", rec.Op, rec.Mode)
@@ -335,6 +336,23 @@ func (a *App) begin(ctx context.Context) (*session, error) {
 }
 
 func (s *session) end() { s.lock.Release() }
+
+// closeLeftoverInvite removes the marker of an invite that ended without
+// its cleanup (it was killed) and journals the end of that invite. An
+// invite takes the lock before it writes its marker and removes the marker
+// before it releases the lock, so a marker found by the lock holder is a
+// leftover. The invite's temporary kernel state goes with the next apply of
+// the saved configuration, at the latest by meshly-check.timer.
+func (a *App) closeLeftoverInvite() {
+	if _, err := os.Lstat(a.Paths.InviteFile()); err != nil {
+		return
+	}
+	if err := a.Paths.RemoveInviteMarker(); err != nil {
+		fmt.Fprintf(a.Stderr, "meshly: warning: %v\n", err)
+		return
+	}
+	a.audit("invite", "", "closed: interrupted")
+}
 
 // confirm asks a yes/no question on the terminal. Non-interactive runs
 // return false.
