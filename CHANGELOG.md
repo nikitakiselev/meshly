@@ -7,7 +7,7 @@ on-disk formats.
 
 ## [Unreleased]
 
-## [0.0.1] - 2026-10-17
+## [0.0.1] - 2026-10-18
 
 First public release.
 
