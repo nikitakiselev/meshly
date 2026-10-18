@@ -204,6 +204,8 @@ admin@home:~$ sudo meshly allow ping from vps
 **5. Check.**
 
 ```sh
+sudo meshly nodes      # the nodes of the network and whether they are connected
+sudo meshly ping home  # on vps: ping through the tunnel; if home does not answer, says why
 sudo meshly status     # configuration, interface, handshake, traffic, rules, drift
 sudo meshly doctor     # every check with a verdict; exit 0 = no problems
 ```
@@ -218,6 +220,7 @@ The link starts at boot via `meshly.service`. For scripts, `meshly join` also re
 | Open a service to the peer | `sudo meshly allow 5432/tcp from home` |
 | Close it (cuts established connections too) | `sudo meshly deny 5432/tcp from home` |
 | List rules | `sudo meshly rules` |
+| Who is in the network, does the link work | `sudo meshly nodes`, `sudo meshly ping home` |
 | Health and diagnostics | `sudo meshly status`, `sudo meshly doctor`, `sudo meshly doctor --probe 22/tcp` |
 | Stop or start the link (stop survives reboot) | `sudo meshly stop`, `sudo meshly start`, `sudo meshly restart` |
 | VPS changed its IP | `sudo meshly set peer-endpoint vps 198.51.100.7` (on home) |

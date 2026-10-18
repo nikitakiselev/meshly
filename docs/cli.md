@@ -1,7 +1,7 @@
 # CLI reference
 
-`meshly <command> [arguments]`. All commands that change the system require root. `status`, `rules`, `version`
-and `help` also work without root, with reduced detail. Every changing command takes a lock: a second meshly
+`meshly <command> [arguments]`. All commands that change the system require root, and so does `ping`. `status`,
+`nodes`, `rules`, `version` and `help` also work without root, with reduced detail. Every changing command takes a lock: a second meshly
 operation waits briefly and then fails with exit code 6. `init`, `allow`, `deny`, `revoke`, `start`, `stop` and
 `set` accept `--dry-run`, which prints the plan, the rendered nftables table and the config diff, and changes nothing.
 
@@ -11,7 +11,7 @@ logs or JSON output. Private keys are never printed; the invite code is printed 
 - [Network setup](#network-setup): `init`, `invite`, `join`
 - [Access policy](#access-policy): `allow`, `deny`, `rules`, `revoke`
 - [Link lifecycle](#link-lifecycle): `start`, `stop`, `restart`, `set`
-- [Information](#information): `status`, `doctor`, `logs`, `version`
+- [Information](#information): `status`, `nodes`, `ping`, `doctor`, `logs`, `version`
 - [Maintenance](#maintenance): `upgrade`, `reset`, `recover`, `service`
 - [Exit codes](#exit-codes)
 - [JSON output](#json-output)
@@ -239,6 +239,52 @@ kernel. The systemd state is shown separately and says nothing about connectivit
 details are omitted. While `meshly invite` waits, status shows `Invite open until …` instead of the drift, and the
 firewall table as `present, with the open invite's temporary rules`.
 
+### `meshly nodes [--json]`
+
+Lists the nodes of the network, this one first:
+
+```
+Network homelab  10.100.0.0/24
+
+NODE              VPN ADDRESS   PUBLIC ADDRESS       CONNECTION                  MAY USE THIS NODE
+vps (this node)   10.100.0.1    203.0.113.10:51820   -                           -
+home              10.100.0.2    198.51.100.7:51820   online, last seen 36s ago   ping, 22/tcp
+
+Check the link to home: sudo meshly ping home
+```
+
+The connection comes from the last WireGuard handshake. `online` means a handshake within the last 3 minutes. A
+working link keeps handshaking every 2 minutes, because keepalive (25 seconds by default) keeps it in use. `offline`
+means only an older handshake. When keepalive is off (`meshly set keepalive 0`), an unused link looks the same, so
+it shows `idle or offline`. `never connected` means no handshake at all. `link stopped` means `meshly stop` was run
+on this node. Without root the connection is `unknown`. The public address of a peer is where its packets last came
+from, or the configured endpoint before that. `MAY USE THIS NODE` lists the allow rules of the peer on this node. Under
+the table, meshly prints the next step for each peer: `ping` it, find out why it is not connected, or allow it a
+service.
+
+### `meshly ping [<node>] [-c N] [--json]`
+
+Sends `N` (default 4, `--count` too) ICMP echo requests to another node through the VPN, from this node's VPN
+address, one per second, and waits up to 2 seconds for each reply. `<node>` is a name or a VPN address. Without it,
+meshly pings the only other node. Ctrl+C stops early and still prints the summary. Needs root, because it sends ICMP
+from a raw socket.
+
+```
+PING home (10.100.0.2) from vps (10.100.0.1) through meshly0
+reply from home: seq=1 time=11.0 ms
+...
+--- home: 4 sent, 4 received, 0% loss, time min/avg/max 11.0/12.5/14.0 ms
+```
+
+A node answers only if it allows ping: `meshly allow ping from vps` on home. When no reply comes, meshly checks the
+handshake after the pings and says which of two cases it is (exit code 13):
+
+- a recent handshake: the link works, so most likely home does not allow ping from vps. The message names the
+  command to run on home.
+- no recent handshake: the nodes have no connection. See `meshly doctor`.
+
+Exit code 0 means at least one reply. A local failure, such as a missing VPN address, exits 1 at once.
+
 ### `meshly doctor [--json] [--probe <port>/<tcp|udp>] [--peer NAME]`
 
 Runs every check and prints one line per finding: `✓` ok, `·` info, `!` warning, `✗` problem. Each finding has
@@ -314,17 +360,19 @@ Exit codes are stable and safe to use in scripts.
 | 10 | declined | Confirmation missing (no terminal and no `--yes`) or answered "no"; Ctrl+C, SIGTERM or a hang-up of the terminal during `invite` or `join`. Ctrl+C before they change anything (while waiting for the lock, during the preflight or at the `Invite code:` prompt) ends them as usual, with 130 |
 | 11 | warnings | `doctor`: warnings only |
 | 12 | problems | `doctor`: at least one problem |
-| 13 | unreachable | The other node did not come: `join` got no answer from the inviting node (nothing was changed), or the invite expired before a node joined |
+| 13 | unreachable | The other node did not answer: `join` got no answer from the inviting node (nothing was changed), the invite expired before a node joined, or `ping` got no reply |
 
 ## JSON output
 
-`status`, `doctor`, `rules` and `logs` accept `--json`, and each document carries a `schema` field. Within a schema
+`status`, `nodes`, `ping`, `doctor`, `rules` and `logs` accept `--json`, and each document carries a `schema` field. Within a schema
 version, fields are only added, never renamed or removed; a breaking change gets a new version. `version --json`
 prints `{"version", "commit", "go", "os", "arch"}`.
 
 | Command | Schema |
 |---|---|
 | `status --json` | `meshly.status/v1` |
+| `nodes --json` | `meshly.nodes/v1` |
+| `ping --json` | `meshly.ping/v1` |
 | `doctor --json` | `meshly.doctor/v1` |
 | `rules --json` | `meshly.rules/v1` |
 | `logs --json` | `meshly.logs/v1` |
@@ -366,6 +414,21 @@ While `meshly invite` waits, the document has `"invite": {"expires_at": "2026-10
 `operation_in_progress` is `true`. `drift` stays empty, because the drift check is skipped: the invite's temporary
 peer and firewall rule are not part of the saved configuration, so `firewall.matches_config` is `false` meanwhile.
 Without an open invite there is no `invite` field. The code is never in the document.
+
+A `meshly.nodes/v1` document has `network`, `cidr` and `nodes[]`, this node first. Each node has:
+
+- `name`, `this_node`, `vpn_address` and `public_address`;
+- `connection`: one of `this-node`, `online`, `offline`, `idle`, `never-connected`, `link-stopped` or `unknown`;
+- `last_seen` and `last_seen_seconds_ago`;
+- `may_use_here`, for example `["ping", "22/tcp"]`.
+
+A `meshly.ping/v1` document has:
+
+- `node`, `address`, `from` and `from_address`;
+- `sent` and `received`;
+- `packets[]`, each with `seq`, `reply` and `rtt_ms`;
+- `min_ms`, `avg_ms` and `max_ms`, when a reply came;
+- `diagnosis`, when none came. Then the exit code is 13.
 
 A `meshly.doctor/v1` document has `findings[]`, each with `id`, `status` (`ok`, `info`, `warn`, `fail`),
 `certainty`, `detail` and `fix`, plus a `summary`.

@@ -6,6 +6,24 @@ and what to do when the link or a service stops working. Architecture
 background: [architecture.md](architecture.md). Exit codes of all commands:
 [cli.md](cli.md). Firewall details: [firewall.md](firewall.md).
 
+## Is the link up?
+
+Start with `sudo meshly nodes`. It shows each other node as one of:
+
+- `online`: a handshake within the last 3 minutes;
+- `offline`;
+- `never connected`;
+- `link stopped`.
+
+It also shows what each node may use on this one.
+
+Then check the path with `sudo meshly ping <node>`. When no reply comes, meshly tells two cases apart:
+
+- the link is down, because there is no recent handshake. Run `meshly doctor`.
+- the link works, but the other node does not allow ping. Run `meshly allow ping from <this node>` there.
+
+To check a TCP service rather than ICMP, use `meshly doctor --probe <port>/tcp`.
+
 ## `meshly status`
 
 `status` shows the saved configuration and the observed kernel state side by

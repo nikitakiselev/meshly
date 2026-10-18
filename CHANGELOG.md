@@ -7,6 +7,18 @@ on-disk formats.
 
 ## [Unreleased]
 
+### Added
+
+- `meshly nodes` lists the nodes of the network:
+  - their VPN and public addresses;
+  - whether each is connected: online, offline or never connected, with the time it was last seen;
+  - what it may use on this node;
+  - the next step for each node.
+- `meshly ping [<node>] [-c N]` pings the other node through the tunnel from this node's VPN address. When no reply
+  comes, it says why, with exit code 13: either the nodes have no connection, or the link works and the other node
+  does not allow ping. In the second case it names the command to run there. Both commands accept `--json`
+  (`meshly.nodes/v1` and `meshly.ping/v1`).
+
 ## [0.0.3] - 2026-10-18
 
 ### Fixed

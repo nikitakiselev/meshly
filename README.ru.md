@@ -206,6 +206,8 @@ admin@home:~$ sudo meshly allow ping from vps
 **5. Проверьте.**
 
 ```sh
+sudo meshly nodes      # узлы сети и есть ли с ними связь
+sudo meshly ping home  # на vps: ping через туннель; если home не отвечает, объясняет почему
 sudo meshly status     # конфигурация, интерфейс, рукопожатие, трафик, правила, расхождения
 sudo meshly doctor     # все проверки с вердиктом; код 0 = проблем нет
 ```
@@ -220,6 +222,7 @@ sudo meshly doctor     # все проверки с вердиктом; код 0
 | Открыть сервис соседу | `sudo meshly allow 5432/tcp from home` |
 | Закрыть (обрывает и установленные соединения) | `sudo meshly deny 5432/tcp from home` |
 | Список правил | `sudo meshly rules` |
+| Кто в сети, работает ли связь | `sudo meshly nodes`, `sudo meshly ping home` |
 | Состояние и диагностика | `sudo meshly status`, `sudo meshly doctor`, `sudo meshly doctor --probe 22/tcp` |
 | Остановить или запустить канал (stop сохраняется после перезагрузки) | `sudo meshly stop`, `sudo meshly start`, `sudo meshly restart` |
 | У VPS сменился IP | `sudo meshly set peer-endpoint vps 198.51.100.7` (на home) |

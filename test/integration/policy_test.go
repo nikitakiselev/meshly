@@ -44,6 +44,16 @@ func TestPolicy(t *testing.T) {
 		if !strings.Contains(r.Out, `"connectivity": "handshake-recent"`) {
 			t.Fatalf("status does not report a recent handshake:\n%s", r.Out)
 		}
+		// meshly nodes sees the peer online; meshly ping gets no reply
+		// and blames the peer's policy, not the link.
+		r = vps.MustMeshly("nodes")
+		if !strings.Contains(r.Out, "online, last seen") || !strings.Contains(r.Out, "home may use nothing") {
+			t.Fatalf("meshly nodes:\n%s", r.Out)
+		}
+		r = vps.ExpectCode(13, "ping", "home", "-c", "2")
+		if !strings.Contains(r.Out, "2 sent, 0 received") || !strings.Contains(r.Err, "most likely home does not allow ping from vps") {
+			t.Fatalf("meshly ping without a ping rule: %s", r)
+		}
 
 		// 2./3. allow opens exactly the given port and protocol.
 		vps.MustMeshly("allow", "8080/tcp", "from", "home")
@@ -73,6 +83,13 @@ func TestPolicy(t *testing.T) {
 		vps.MustMeshly("allow", "ping", "from", "home")
 		if !home.Ping("10.100.0.1") {
 			t.Fatal("ping rule does not work")
+		}
+		r = home.MustMeshly("ping", "vps", "-c", "2")
+		if !strings.Contains(r.Out, "reply from vps: seq=2") || !strings.Contains(r.Out, "2 sent, 2 received, 0% loss") {
+			t.Fatalf("meshly ping with a ping rule: %s", r)
+		}
+		if r = home.MustMeshly("ping", "10.100.0.1", "-c", "1", "--json"); !strings.Contains(r.Out, `"received": 1`) {
+			t.Fatalf("meshly ping --json: %s", r)
 		}
 		// Rules list.
 		r = vps.MustMeshly("rules", "--json")

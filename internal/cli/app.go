@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"os/user"
 	"strconv"
@@ -41,7 +42,7 @@ const (
 	ExitDeclined    = 10 // confirmation missing or declined
 	ExitWarnings    = 11 // doctor: warnings
 	ExitProblems    = 12 // doctor: problems
-	ExitUnreachable = 13 // the other node did not come: no answer to join, or nobody joined before the invite expired
+	ExitUnreachable = 13 // the other node did not answer: join or ping got no reply, or nobody joined before the invite expired
 )
 
 // exitError carries an exit code.
@@ -88,6 +89,9 @@ type App struct {
 	WaitContext func(context.Context) (context.Context, context.CancelFunc)
 	After       func(time.Duration) <-chan time.Time // invite expiry timer
 	Hostname    func() (string, error)
+	// Echo sends one ICMP echo request from src to dst and returns the
+	// round-trip time, or ping.ErrNoReply after timeout (meshly ping).
+	Echo func(ctx context.Context, src, dst netip.Addr, seq int, timeout time.Duration) (time.Duration, error)
 }
 
 func (a *App) pairTimeouts() pairing.Timeouts {
@@ -135,6 +139,8 @@ func commands() []command {
 		{"rules", "list allow rules", false, (*App).cmdRules},
 		{"revoke", "close access of a peer and remove it", false, (*App).cmdRevoke},
 		{"status", "show configuration, kernel state and connectivity", false, (*App).cmdStatus},
+		{"nodes", "list the nodes of the network and whether they are connected", false, (*App).cmdNodes},
+		{"ping", "ping another node through the VPN and explain a failure", false, (*App).cmdPing},
 		{"doctor", "diagnose problems", false, (*App).cmdDoctor},
 		{"start", "start the VPN link and enable autostart", false, (*App).cmdStart},
 		{"stop", "stop the VPN link (stays stopped after reboot)", false, (*App).cmdStop},

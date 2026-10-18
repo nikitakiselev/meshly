@@ -15,6 +15,7 @@ import (
 	"github.com/nikitakiselev/meshly/internal/netstack"
 	"github.com/nikitakiselev/meshly/internal/nft"
 	"github.com/nikitakiselev/meshly/internal/pairing"
+	"github.com/nikitakiselev/meshly/internal/ping"
 	"github.com/nikitakiselev/meshly/internal/preflight"
 	"github.com/nikitakiselev/meshly/internal/store"
 	"github.com/nikitakiselev/meshly/internal/systemd"
@@ -44,6 +45,7 @@ func NewApp() *App {
 		WaitContext: interruptible,
 		After:       time.After,
 		Hostname:    os.Hostname,
+		Echo:        ping.Kernel{}.Echo,
 	}
 	a.Engine = &engine.Engine{
 		Links: links, WG: wg.Kernel{}, FW: fw, Paths: paths,
