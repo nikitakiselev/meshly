@@ -42,6 +42,9 @@ const (
 	domain    = "meshly-pair/1"
 	checkLen  = 4
 	secretLen = 16
+	// bodyLen4 and bodyLen6 are the bytes before the checksum, by family.
+	bodyLen4 = 1 + 4 + 2 + 32 + 4 + 1 + 4 + secretLen
+	bodyLen6 = bodyLen4 + 12
 )
 
 var b32 = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -125,16 +128,57 @@ func (c *Code) String() string {
 	return prefix + strings.ToLower(b32.EncodeToString(b))
 }
 
-// ParseCode decodes and validates a code typed or pasted by a person:
-// whitespace anywhere and letter case are ignored. A code is accepted up to
-// ClockSkew past its expiry.
-func ParseCode(s string, now time.Time) (*Code, error) {
-	s = strings.ToLower(strings.Map(func(r rune) rune {
+// normalize removes whitespace and lowercases: how a person's input is read.
+func normalize(s string) string {
+	return strings.ToLower(strings.Map(func(r rune) rune {
 		if unicode.IsSpace(r) {
 			return -1
 		}
 		return r
 	}, s))
+}
+
+// Partial reports whether s, read as ParseCode reads it, is the start of a
+// code that more input could complete: the prefix, base32, and fewer
+// characters than the family byte implies. A complete code, garbage and
+// another version are not partial.
+func Partial(s string) bool {
+	s = normalize(s)
+	if len(s) < len(prefix) {
+		return s == prefix[:len(s)]
+	}
+	if !strings.HasPrefix(s, prefix) {
+		return false
+	}
+	body := s[len(prefix):]
+	v := make([]byte, len(body)) // the 5-bit values
+	for i := 0; i < len(body); i++ {
+		switch c := body[i]; {
+		case c >= 'a' && c <= 'z':
+			v[i] = c - 'a'
+		case c >= '2' && c <= '7':
+			v[i] = c - '2' + 26
+		default:
+			return false
+		}
+	}
+	if len(body) < 2 {
+		return true
+	}
+	switch v[0]<<3 | v[1]>>2 { // the family byte
+	case 4:
+		return len(body) < b32.EncodedLen(bodyLen4+checkLen)
+	case 6:
+		return len(body) < b32.EncodedLen(bodyLen6+checkLen)
+	}
+	return false
+}
+
+// ParseCode decodes and validates a code typed or pasted by a person:
+// whitespace anywhere and letter case are ignored. A code is accepted up to
+// ClockSkew past its expiry.
+func ParseCode(s string, now time.Time) (*Code, error) {
+	s = normalize(s)
 	if len(s) >= 2 && s[0] == 'm' && s[1] >= '0' && s[1] <= '9' && s[:2] != prefix {
 		return nil, ErrVersion
 	}
@@ -142,7 +186,7 @@ func ParseCode(s string, now time.Time) (*Code, error) {
 		return nil, ErrMalformed
 	}
 	raw, err := b32.DecodeString(strings.ToUpper(s[len(prefix):]))
-	if err != nil || len(raw) < 1+4+2+32+4+1+4+secretLen+checkLen {
+	if err != nil || len(raw) < bodyLen4+checkLen {
 		return nil, ErrMalformed
 	}
 	body, sum := raw[:len(raw)-checkLen], raw[len(raw)-checkLen:]
@@ -154,13 +198,13 @@ func ParseCode(s string, now time.Time) (*Code, error) {
 	var ip netip.Addr
 	switch body[0] {
 	case 4:
-		if len(body) != 64 {
+		if len(body) != bodyLen4 {
 			return nil, ErrMalformed
 		}
 		ip = netip.AddrFrom4([4]byte(body[1:5]))
 		body = body[5:]
 	case 6:
-		if len(body) != 76 {
+		if len(body) != bodyLen6 {
 			return nil, ErrMalformed
 		}
 		ip = netip.AddrFrom16([16]byte(body[1:17]))

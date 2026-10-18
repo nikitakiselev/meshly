@@ -890,6 +890,62 @@ func TestJoinCodeInput(t *testing.T) {
 	}
 }
 
+// A code broken across lines, as a console, a terminal or a mail client
+// may paste it, is read on until it is complete. Garbage on the first line
+// is refused at once, without waiting for more input.
+func TestJoinCodeWrapped(t *testing.T) {
+	vps, home, _ := newPair(t)
+	inv := startInvite(t, vps)
+	tempPub, _ := tempKeys(t, inv.code)
+	half := len(inv.code) / 2
+
+	joinFrom := func(first string) (int, string) {
+		t.Helper()
+		pr, pw := io.Pipe()
+		defer pw.Close()
+		go func() { _, _ = pw.Write([]byte(first)) }()
+		home.app.Stdin = pr
+		done := make(chan int, 1)
+		var errOut string
+		go func() {
+			code, _, e := home.run("join", "--name", "home")
+			errOut = e
+			done <- code
+		}()
+		select {
+		case code := <-done:
+			return code, errOut
+		case <-time.After(10 * time.Second):
+			t.Fatalf("join with %q waits for more input", first)
+			return 0, ""
+		}
+	}
+	for _, first := range []string{"garbage\n", "m2" + inv.code[2:half] + "\n", inv.code[:half] + "\n\n"} {
+		if code, errOut := joinFrom(first); code != ExitInvalidCode {
+			t.Errorf("join with %.20q: exit %d, want %d\n%s", first, code, ExitInvalidCode, errOut)
+		}
+	}
+	// On a terminal the continuation gets a prompt of its own; a blank line
+	// ends the input.
+	home.app.Interactive = true
+	home.app.Stdin = strings.NewReader(inv.code[:half] + "\n\n" + inv.code[half:] + "\n")
+	code, _, errOut := home.run("join", "--name", "home")
+	home.app.Interactive = false
+	if code != ExitInvalidCode || !strings.HasPrefix(errOut, "Invite code: > meshly: error: the invite code is damaged or incomplete") {
+		t.Errorf("join on a terminal with half a code: exit %d\n%s", code, errOut)
+	}
+	home.untouched()
+	vps.armed(tempPub)
+
+	code, out, errOut := joinWith(home, inv.code[:half]+"\n"+inv.code[half:], "--name", "home")
+	if code != 0 {
+		t.Fatalf("join with the code on two lines: exit %d\n%s%s", code, out, errOut)
+	}
+	if code, out := inv.wait(); code != 0 {
+		t.Fatalf("invite: exit %d\n%s", code, out)
+	}
+}
+
 func TestJoinUnreachable(t *testing.T) {
 	vps, home, mem := newPair(t)
 	inv := startInvite(t, vps)

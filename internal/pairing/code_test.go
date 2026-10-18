@@ -166,6 +166,31 @@ func TestParseCodeErrors(t *testing.T) {
 	}
 }
 
+// Every proper start of a code is partial, as typed or pasted (whitespace,
+// letter case); a complete code, garbage, another version and a code with
+// an unknown family are not.
+func TestPartial(t *testing.T) {
+	for _, ep := range []string{"203.0.113.10:51820", "[2001:db8::1]:51820"} {
+		s := mustCode(t, ep).String()
+		for i := 0; i < len(s); i++ {
+			if !Partial(s[:i]) {
+				t.Fatalf("%s: the first %d characters are not partial", ep, i)
+			}
+		}
+		if Partial(s) || Partial(s+"a") {
+			t.Errorf("%s: a complete code is partial", ep)
+		}
+		if half := len(s) / 2; !Partial(" " + strings.ToUpper(s[:half]) + "\r\n\t" + s[half:len(s)-1] + "\n") {
+			t.Errorf("%s: a wrapped start of the code is not partial", ep)
+		}
+	}
+	for _, s := range []string{"garbage", "hello", "m2", "m2aq", "m1a1", "m1ab", "m1aa", "x", "m1a=", "m1 aq!"} {
+		if Partial(s) {
+			t.Errorf("%q is partial", s)
+		}
+	}
+}
+
 func TestSecrets(t *testing.T) {
 	a := mustCode(t, "203.0.113.10:51820")
 	b := *a

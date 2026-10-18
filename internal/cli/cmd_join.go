@@ -18,7 +18,7 @@ import (
 	"github.com/nikitakiselev/meshly/internal/wg"
 )
 
-// maxCodeInput bounds the line the invite code is read from.
+// maxCodeInput bounds the input the invite code is read from.
 const maxCodeInput = 1 << 10
 
 func (a *App) cmdJoin(ctx context.Context, args []string) error {
@@ -398,22 +398,35 @@ func (a *App) removeLeftovers(ctx context.Context, ifname string) error {
 }
 
 // readCode reads the invite code: after a prompt on a terminal, otherwise
-// the first line of stdin.
+// from stdin, the first line. A code that a console, a terminal or a mail
+// client broke across lines is read on while the input is the start of a
+// code (pairing.Partial): until it is complete, a blank line, the end of
+// the input or maxCodeInput bytes.
 func (a *App) readCode() (string, error) {
 	if a.Interactive {
 		fmt.Fprint(a.Stderr, "Invite code: ")
 	}
-	line, err := bufio.NewReader(io.LimitReader(a.Stdin, maxCodeInput+1)).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return "", fmt.Errorf("cannot read the invite code: %w", err)
+	r := bufio.NewReader(io.LimitReader(a.Stdin, maxCodeInput+1))
+	var in string
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("cannot read the invite code: %w", err)
+		}
+		in += line
+		if len(in) > maxCodeInput {
+			return "", fmt.Errorf("%w (longer than %d bytes)", pairing.ErrMalformed, maxCodeInput)
+		}
+		if strings.TrimSpace(in) == "" {
+			return "", errorf(ExitUsage, "no invite code given: paste the code printed by `sudo meshly invite` when asked, or pass it on stdin")
+		}
+		if err != nil || strings.TrimSpace(line) == "" || !pairing.Partial(in) {
+			return in, nil
+		}
+		if a.Interactive {
+			fmt.Fprint(a.Stderr, "> ")
+		}
 	}
-	if len(line) > maxCodeInput {
-		return "", fmt.Errorf("%w (longer than %d bytes)", pairing.ErrMalformed, maxCodeInput)
-	}
-	if strings.TrimSpace(line) == "" {
-		return "", errorf(ExitUsage, "no invite code given: paste the code printed by `sudo meshly invite` when asked, or pass it on stdin")
-	}
-	return line, nil
 }
 
 // joinName returns --name, or else a name made from the host name.

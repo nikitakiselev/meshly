@@ -28,6 +28,10 @@ func FuzzParseCode(f *testing.F) {
 			}
 			return
 		}
+		// join stops reading at a valid code.
+		if Partial(s) {
+			t.Fatalf("the valid code %q is partial", s)
+		}
 		c2, err := ParseCode(c.String(), now)
 		if err != nil {
 			t.Fatalf("re-parse of %q: %v", c.String(), err)
