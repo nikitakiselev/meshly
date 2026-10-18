@@ -7,6 +7,30 @@ on-disk formats.
 
 ## [Unreleased]
 
+### Added
+
+- `meshly-watch.service` applies a new or removed Docker network within seconds, for example after `docker compose up`
+  or `down`, without a command. It follows interface and nftables changes and runs the same check as the timer; the
+  check timer stays as a backstop. It starts and stops with `meshly.service`, also after `meshly upgrade`. A drop-in
+  for `docker.service` re-applies meshly after Docker starts.
+- `meshly status` lists the Docker networks (`docker networks`; `firewall.docker_networks` in `--json`), and
+  `meshly logs` shows which networks appeared or went (`Docker networks changed: +br-…`).
+
+### Changed
+
+- Docker containers work through the VPN like programs on the server, with nothing to configure in Docker or compose:
+  - A port published with `-p` or `ports:` on all addresses or on the VPN address opens to the peer with
+    `meshly allow <host port>/<proto> from <peer>`. `deny` and `revoke` close it, established connections included.
+  - Containers on Docker's bridge networks reach the other node, to the ports it allows, and appear there as this
+    node's VPN address.
+  - The LAN behind the node, container addresses and ports without `meshly allow` stay closed. The LAN stays closed
+    also while the meshly table is missing: policy routing sends everything forwarded from the tunnel to a table that
+    knows only the Docker networks. Ports that Docker publishes on all addresses are open to the peer meanwhile, as
+    they are to the internet (see the [threat model](docs/threat-model.md)).
+  - meshly's rule also goes to the top of the iptables `FORWARD` chain. A forward chain of the host firewall that may
+    drop container traffic is a warning in `doctor` with the fix, never a reason to refuse.
+  - On a node without Docker networks nothing changes. See [docs/firewall.md](docs/firewall.md#docker).
+
 ### Fixed
 
 - A verdict map in a foreign nftables chain (`iifname vmap @jumps`, `vmap { … : jump … }`) no longer counts as a rule

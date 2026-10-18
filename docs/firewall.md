@@ -17,9 +17,9 @@ and Docker.
 ## The `inet meshly` table
 
 meshly owns exactly one nftables table, `inet meshly`. Outside it, meshly adds a single rule at the top of the
-iptables `INPUT` and `OUTPUT` chains when the host filters with iptables or UFW (see
-[iptables and UFW](#iptables-and-ufw)), and modifies nothing else. Each change replaces the whole table in a single
-nft transaction:
+iptables `INPUT` and `OUTPUT` chains (and `FORWARD`, on a node with Docker networks) when the host filters with
+iptables or UFW (see [iptables and UFW](#iptables-and-ufw)), and modifies nothing else. Each change replaces the
+whole table in a single nft transaction:
 
 ```text
 table inet meshly          # make the delete below valid if the table does not exist
@@ -104,6 +104,38 @@ table inet meshly {
 
 The sets are condensed here for reading. `meshly allow … --dry-run` prints the exact table for your node.
 
+On a node with Docker networks (here `docker0` and the bridge of a compose network), the table also has the set
+`docker_ifs`, more rules in `guard_fwd` and two chains on the postrouting hook, `nat_out` at priority 99 (srcnat − 1)
+and `guard_post` at 101 (srcnat + 1). On a node without Docker networks none of this exists, and the table is the
+same as before meshly supported Docker (see [Docker](#docker)):
+
+```nft
+	set docker_ifs { type ifname; elements = { "br-3f1c2a9b7d01", "docker0" } }
+
+	chain guard_fwd {
+		type filter hook forward priority -300; policy accept;
+		iifname "meshly0" ct state invalid,untracked counter drop
+		oifname "meshly0" ct state invalid,untracked counter drop
+		iifname "meshly0" oifname @docker_ifs ct direction original ct status dnat ct original ip daddr 10.100.0.1 meta mark set meta mark | 0x10000000 accept comment "published container port"
+		iifname "meshly0" oifname @docker_ifs ct direction reply ct status snat meta mark set meta mark | 0x10000000 accept comment "replies to containers"
+		oifname "meshly0" iifname @docker_ifs ct direction original ip daddr @peers meta mark set meta mark | 0x10000000 accept comment "connections from containers"
+		oifname "meshly0" iifname @docker_ifs ct direction reply ct status dnat meta mark set meta mark | 0x10000000 accept comment "replies of published container ports"
+		iifname "meshly0" counter drop comment "no forwarding from the vpn"
+		oifname "meshly0" counter drop comment "no forwarding into the vpn"
+	}
+
+	chain nat_out {
+		type nat hook postrouting priority 99; policy accept;
+		oifname "meshly0" ip saddr != 10.100.0.1 counter snat ip to 10.100.0.1 comment "containers appear as this node"
+	}
+
+	chain guard_post {
+		type filter hook postrouting priority 101; policy accept;
+		oifname "meshly0" ip saddr != 10.100.0.1 counter drop comment "only the vpn address into the vpn"
+		oifname "meshly0" iifname @docker_ifs ct direction reply ct status dnat meta l4proto { tcp, udp } ip daddr . meta l4proto . th sport != @allow_in counter drop comment "replies of denied container ports"
+	}
+```
+
 ## Packet path
 
 **Inbound through the tunnel** (a packet that WireGuard decrypted on `meshly0`):
@@ -122,12 +154,16 @@ The sets are condensed here for reading. `meshly allow … --dry-run` prints the
 3. `guard_in` (input) drops anything whose destination was rewritten on the way: DNAT or REDIRECT from the
    tunnel is refused. While an invite waits, it also guards the pairing port (see
    [During an invite](#during-an-invite)).
-4. `guard_fwd` (forward, priority −300) drops all forwarding from or into `meshly0`. The peer can never reach the
-   LAN, Docker networks or anything behind this node.
+4. `guard_fwd` (forward, priority −300) drops all forwarding from or into `meshly0`. On a node with Docker
+   networks, it lets through only the connections of published container ports and of containers (see
+   [Docker](#docker)). The peer cannot reach the LAN, a container's own address or anything else behind this
+   node.
 
 **Outbound into the tunnel:** `guard_out` sends packets for `meshly0` to `to_vpn`. That chain allows packets that
 this node originates and replies to connections the peer was allowed to open. It drops replies of denied
-connections and NATed traffic, so the peer cannot obtain responses through any side path.
+connections and NATed traffic, so the peer cannot obtain responses through any side path. What containers send
+into the tunnel is forwarded, not sent by this node: `guard_fwd`, `nat_out` and `guard_post` decide it (see
+[Docker](#docker)).
 
 **Other interfaces:** packets to the VPN address or from the VPN range that arrive on any interface other than
 `meshly0` (or `lo`) are dropped, so a host on the LAN cannot spoof the peer. WireGuard's cryptokey routing also
@@ -201,19 +237,25 @@ meshly sets these on `meshly0` only. It changes no global sysctl.
 
 | Sysctl | Value | Why |
 |---|---|---|
-| `net.ipv4.conf.meshly0.forwarding` | `0` | No routing through the VPN interface (second layer after `guard_fwd`) |
+| `net.ipv4.conf.meshly0.forwarding` | `0`; `1` while the node has Docker networks | Without Docker networks, no routing through the VPN interface (second layer after `guard_fwd`). With them, the kernel must forward between the tunnel and the containers; policy routing becomes the second layer (see [Policy routing](#policy-routing-table-109)) |
 | `net.ipv4.conf.meshly0.rp_filter` | `1` | Strict reverse-path filtering |
 | `net.ipv4.conf.meshly0.accept_redirects` | `0` | |
 | `net.ipv4.conf.meshly0.send_redirects` | `0` | |
 | `net.ipv4.conf.meshly0.accept_source_route` | `0` | |
 | `net.ipv6.conf.meshly0.disable_ipv6` | `1` | No IPv6 inside the VPN (skipped when the host has no IPv6) |
 
+meshly turns `forwarding` on only after its routing rule exists, and off before it removes the rule. Writing the
+global `net.ipv4.ip_forward` sets `forwarding` on every interface, `meshly0` included; Docker does that on its first
+start (see [Docker](#docker)). Without Docker networks, meshly sees `forwarding=1` as drift and sets `0` again.
+
 ## Profiles
 
 Preflight reads the whole ruleset (`nft -j list ruleset`) and classifies every foreign base chain on the
 `prerouting`, `input`, `output` and `postrouting` hooks in the `ip`, `ip6` and `inet` families. The iptables
 `filter` chains `INPUT` and `OUTPUT` are classified too, but they are not part of the profile: meshly puts its rule
-into them itself (see [iptables and UFW](#iptables-and-ufw)).
+into them itself (see [iptables and UFW](#iptables-and-ufw)). On a node with Docker networks, chains on the
+`forward` hook are classified as well. They are never part of the profile either and never stop a command (see
+[The forward hook](#the-forward-hook)).
 
 | Status | Meaning |
 |---|---|
@@ -286,6 +328,13 @@ table already accepted: VPN traffic allowed by `meshly allow`, and the WireGuard
 need no `ufw allow 51820/udp` and no rule for the VPN. Your rules still decide all other traffic: a port that UFW
 opens to the internet stays closed to the peer through the VPN until `meshly allow` opens it.
 
+While the node has Docker networks, meshly keeps the same rule at the top of the IPv4 `filter` chain `FORWARD`
+too. Docker sets the policy of that chain to `DROP` when it turns forwarding on itself, and UFW does the same; the
+rule lets through the container traffic that meshly accepted ([Docker](#docker)). Docker's `DOCKER-USER` chain and
+UFW's rules therefore never see it: on the VPN, meshly decides, as on `INPUT`. Without Docker networks, meshly keeps
+no rule in `FORWARD` and removes one left over. The IPv6 `FORWARD` chain never carries VPN traffic and gets no
+rule.
+
 meshly writes no file of UFW or iptables: the rule lives in the kernel. `ufw status` does not list it;
 `iptables -S INPUT` shows it. `meshly status` shows each chain as `ok`, `MISSING` or `NOT FIRST`. `meshly stop` and
 `meshly reset` remove the rule.
@@ -302,19 +351,29 @@ The rule can disappear when something reloads the iptables rules. meshly puts it
 | `ufw allow`, `ufw reload`, `ufw disable` and `enable`, `systemctl restart ufw` | Nothing: UFW rewrites only its own `ufw-*` chains, and the rule stays |
 | Reboot | UFW and netfilter-persistent load their rules before `network-pre.target`; `meshly.service` starts after them and adds the rule |
 | `systemctl restart netfilter-persistent` | `iptables-restore` removes the rule; the drop-in `/etc/systemd/system/netfilter-persistent.service.d/50-meshly.conf` asks `meshly.service` to put it back at once |
+| Docker starts or restarts | Docker inserts its own jumps at the top of `FORWARD`; the drop-in `/etc/systemd/system/docker.service.d/50-meshly.conf` asks `meshly.service` to re-apply once Docker is up, and meshly's rule is first again |
+| A Docker network is created (`docker network create`, `docker compose up`) | Docker puts its jumps at the top of `FORWARD` again; `meshly-watch.service` moves meshly's rule back within seconds |
 | `iptables-restore` or `netfilter-persistent reload` by hand, `iptables -F` | `meshly-check.timer` puts it back within about a minute |
 | A rule inserted above it (`iptables -I INPUT 1 …`) | `meshly-check.timer` moves meshly's rule back to the top |
 | UFW enabled after meshly | `meshly-check.timer` adds the rule within about a minute; `sudo systemctl reload meshly` adds it at once |
 
+`meshly-watch.service` runs with `meshly.service` on every node, not only on Docker hosts. It follows the changes of
+the network interfaces and of nftables, iptables-nft's included, and runs the same check as `meshly-check.timer` a
+second after they settle (at most 5 seconds after the first one). So the rows that name the timer usually take
+seconds, not a minute; the timer stays as the fallback. The watch's output is in `journalctl -u meshly-watch`.
+
 Until the rule is back, VPN packets meet your own rules and your `DROP` policy: the VPN **fails closed**. Ports
 that your firewall opens on all interfaces stay as reachable to the peer as to any internet host.
 
-meshly integrates only `filter INPUT` and `filter OUTPUT`. A chain of another iptables table that may drop meshly
-traffic (a `DROP` in `mangle`, for example) is refused, and so are rules of the legacy backend (see below).
+meshly integrates only `filter INPUT` and `filter OUTPUT`, and `ip filter FORWARD` on a node with Docker networks.
+A chain of another iptables table that may drop meshly traffic (a `DROP` in `mangle`, for example) is refused, and
+so are rules of the legacy backend (see below). On the forward hook, such a chain is only a warning (see
+[The forward hook](#the-forward-hook)).
 
 `TestUFW` checks this with real UFW 0.36.2 on Debian 12 and Ubuntu 24.04, `TestIptablesHost` with hand-written
-iptables rules, and `TestSystemdUFW` across a reboot and a restart of `netfilter-persistent.service` (see
-[testing.md](testing.md)).
+iptables rules, and `TestSystemdUFW` across a reboot and a restart of `netfilter-persistent.service`. With a real
+Docker daemon, `TestDockerAfterMeshly` checks the `FORWARD` rule after Docker starts and restarts,
+`TestDockerNetworkLifecycle` after a new network, and `TestDockerUFW` with UFW (see [testing.md](testing.md)).
 
 ## fail2ban and other ban lists
 
@@ -373,29 +432,202 @@ These are detected before any change. `init`, `invite` and `join` then exit with
 |---|---|
 | **firewalld** active | firewalld rewrites its tables on its own schedule and has no meshly adapter in this version |
 | **iptables-legacy** rules (also UFW on the legacy backend) | Invisible to nftables. meshly cannot analyse them. Switch to the default backend: `update-alternatives --set iptables /usr/sbin/iptables-nft` (and `ip6tables`), then reload the rules |
-| **iptables-nft** chains outside `filter INPUT`/`OUTPUT` that may drop meshly traffic (a `DROP` in `mangle`, …) | meshly integrates only the `filter` chains `INPUT` and `OUTPUT` |
+| **iptables-nft** chains outside `filter INPUT`/`OUTPUT` that may drop meshly traffic (a `DROP` in `mangle`, …) | meshly integrates only the `filter` chains `INPUT` and `OUTPUT` (and `ip filter FORWARD`, for containers) |
 | Foreign chains before meshly (prerouting/output at priority ≤ −180) that may drop | They run before meshly's guard, so no integration rule can help |
 | A **flowtable** containing `meshly0` | Offloaded flows bypass the policy |
 | A foreign table named `inet meshly` | Ownership conflict (exit code 5) |
 
 `netdev` chains are reported as a warning: they run before everything else and may drop the WireGuard transport.
+Chains on the forward hook are never refused, whatever they contain (see [The forward hook](#the-forward-hook)).
 
 ## Docker
 
-Docker is supported as a neighbour on a host with profile `none` (Docker's own chains are `compatible`). Through
-the tunnel:
+meshly treats a running container like a program installed on the server. A port that Docker publishes is a port
+of the server, and a container that connects somewhere is a program that connects somewhere. `meshly allow` is the
+only thing to do:
 
-- **Published container ports are not reachable** (`docker run -p 8080:80` …). A published port works through
-  DNAT. meshly's policy runs before DNAT and allows only this node's own VPN address and the listed ports.
-  `guard_in` drops anything whose destination was rewritten. A port forwarded with DNAT to another host is
-  forwarded traffic, and `guard_fwd` drops it.
-- **Container networks are not reachable.** There is no forwarding from or into `meshly0`.
-- To make a container service available to the peer, have it listen on the host itself, with `network_mode: host`
-  or a host-level reverse proxy in front of it. Then run `meshly allow <port>/tcp from <peer>`. Publishing on the VPN
-  address (`-p 10.100.0.1:8080:80`) still uses DNAT and is therefore refused as well.
+```yaml
+services:
+  mysqld-exporter:
+    image: prom/mysqld-exporter
+    ports: ["9104:9104"]
+```
 
-`meshly doctor` reports Docker as information with the number of DNAT rules it found. The integration tests check
-both Docker-style `dnat` and `redirect` rules from the tunnel with real packets (`TestCompromisedPeerContained`).
+```console
+admin@vps:~$ docker compose up -d
+admin@vps:~$ sudo meshly allow 9104/tcp from home
+```
+
+A Prometheus container on home, on its usual bridge network, can now scrape `10.100.0.1:9104`. Nothing else is
+needed: no meshly flag, no change to the compose file or to `daemon.json`, and no command after `docker compose up`,
+`down` or a recreated container. Docker can be installed before or after meshly and restarted at any time.
+
+- **Published ports.** A port published with `-p` or `ports:` on all addresses or on this node's VPN address is
+  reachable by the peer after `meshly allow <port>/<proto> from <peer>`, exactly like the port of a program on the
+  host. The port in `allow` is the host port: the left number of `-p 9104:9104`. `meshly deny` and `revoke` close
+  it, connections that are already established included.
+- **Containers as clients.** A container connects to the peer's VPN address like a program on the host, to the
+  ports that the peer allows this node: services of the peer's host and ports published by the peer's containers.
+  The peer sees this node's VPN address as the source, never a container's address.
+- **New networks.** A new Docker network, for example of a new compose project, works through the tunnel within
+  seconds, without a command (see [Docker networks](#docker-networks)).
+
+What stays closed, as for programs on the host:
+
+- the LAN behind this node and any other host, also when a DNAT rule on an allowed port points there;
+- a container's own address (`172.18.0.5`), and container ports that are not published;
+- a port published only on `127.0.0.1`, like a program that listens on localhost only;
+- every port without `meshly allow`;
+- the tunnel, for anything forwarded from the LAN or from any other interface that is not a Docker network;
+- this node's own VPN address, for its own containers. `guard_pre` drops packets for it that come from a bridge:
+  letting them through with meshly's mark would open every port of the host to the containers, past the host
+  firewall. A container reaches its own host as usual in Docker, through the gateway address of its bridge (for
+  example with `--add-host host.docker.internal:host-gateway`).
+
+### Publishing a port only to the VPN
+
+`-p 9104:9104` publishes the port on all addresses, so it is open to the internet too: Docker's rules bypass UFW,
+and meshly does not change that. To publish a port only to the VPN, bind it to this node's VPN address, which
+`meshly status` shows:
+
+```sh
+docker run -d -p 10.100.0.1:9104:9104 prom/mysqld-exporter
+```
+
+In compose, that is `ports: ["10.100.0.1:9104:9104"]`. With Docker's default userland proxy, Docker binds this
+address when it starts the container, so the address must exist at that moment. While `meshly0` is down (after
+`meshly stop`, or in safe mode), a container that starts or restarts fails with `cannot assign requested address`;
+start it again once the link is up. At boot this is not a problem: `meshly.service` comes up before
+`network-online.target`, and `docker.service` starts after it.
+
+### Packet path through the tunnel
+
+**Peer → published port.** The peer connects to `10.100.0.1:9104`, which Docker publishes from a container at
+`172.18.0.5`:
+
+1. `guard_pre` and `from_vpn` (priority −180, before DNAT) check the packet as for any port of the host: the peer's
+   address, this node's VPN address and `allow_in`, on every packet. An accepted packet gets meshly's mark.
+2. Docker's DNAT (−100) rewrites the destination to the container.
+3. The kernel forwards the packet: `forwarding` is `1` on `meshly0`, and [policy routing](#policy-routing-table-109)
+   knows only Docker networks. `guard_fwd` accepts it only from `meshly0` into a bridge in `@docker_ifs`, for a
+   connection in the original direction that DNAT rewrote and whose original destination is this node's VPN
+   address ("published container port"). Everything else from the tunnel hits "no forwarding from the vpn".
+4. The container's reply is forwarded from the bridge into `meshly0` ("replies of published container ports").
+   After Docker's NAT has restored its source to `10.100.0.1:9104` on postrouting, `guard_post` drops it if the
+   peer, protocol and port are no longer in `allow_in` ("replies of denied container ports"). So `meshly deny` stops
+   the replies too, as `to_vpn` does for the services of the host.
+
+**Container → peer.** A container at `172.18.0.7` connects to `10.100.0.2:3100`:
+
+1. The packet comes from a bridge and is forwarded into `meshly0`. `guard_fwd` accepts it only in the original
+   direction, from `@docker_ifs` to an address in `@peers` ("connections from containers").
+2. `nat_out` (srcnat − 1, before Docker's masquerade) rewrites the source to this node's VPN address ("containers
+   appear as this node"). It does not rely on Docker's masquerade, which can be turned off per network.
+   `guard_post` drops anything that would leave through `meshly0` with another source ("only the vpn address into
+   the vpn").
+3. The peer's own policy decides, as for a program on this host.
+4. The peer's reply passes `from_vpn` as a reply to a connection of this node. NAT gives it the container's address
+   back, and `guard_fwd` forwards it to the bridge ("replies to containers").
+
+Before these rules, `guard_fwd` drops forwarded packets from or into `meshly0` in conntrack state `invalid` or
+`untracked`. Every packet it accepts gets meshly's mark, so it passes the integration rule of the host firewall
+(see [The forward hook](#the-forward-hook)).
+
+### Policy routing (table 109)
+
+Both paths need `forwarding=1` on `meshly0`, so on a node with Docker networks that sysctl is no longer a second
+layer. Policy routing takes its place:
+
+```text
+rule       iif meshly0 lookup 109          (priority 109, protocol 109)
+table 109  172.17.0.0/16 dev docker0
+           172.18.0.0/16 dev br-3f1c2a9b7d01
+           unreachable default
+```
+
+Whatever the kernel would forward from the tunnel is routed with table 109, which knows only the subnets of the
+Docker bridges. The LAN, the other interfaces and the internet have no route from the tunnel, also while table
+`inet meshly` is missing (after a foreign `nft flush ruleset`, until meshly re-applies it) and when the policy of
+`FORWARD` accepts. Packets for this node's own VPN address are delivered through the `local` table, which the kernel
+consults before this rule, so they are not affected.
+
+- meshly owns the rule and the routes by their protocol, `109`, as it owns its other routes. The subnets are taken
+  from the addresses of the bridges and follow them. Every check compares the rule and the routes and repairs them
+  as drift.
+- Without Docker networks there is neither the rule nor a route in table 109. On a node with Docker networks,
+  routes of another program in table 109 are a conflict (exit code 5); without Docker networks meshly leaves the
+  table alone.
+- The rule exists before `forwarding` goes on, and is removed only after `forwarding` is off, also when a step
+  fails.
+- The rule does not change the reverse-path check (`rp_filter`) of packets that come from the tunnel: the kernel
+  does not look up their source as coming from `meshly0`. It does change the check of packets that would be
+  forwarded *into* the tunnel, whose source the kernel looks up as if it came from `meshly0`, so in table 109. On a
+  host with `rp_filter` on (`1` or `2`; Ubuntu sets `2`), a packet from the LAN to the tunnel therefore has no
+  reverse path and is dropped before the forward hook. Containers are not affected: table 109 routes their subnets
+  back to their bridges.
+
+`TestDockerHostContained` checks this layer with real packets, also without the meshly table and without the rule
+(where `guard_fwd` alone drops), and `TestDockerNetworkLifecycle` checks that rule and routes follow the networks.
+
+### The forward hook
+
+Forwarded packets also pass the forward chains of the host firewall. meshly marks the packets it accepts and keeps
+its rule at the top of `ip filter FORWARD`, whose policy Docker and UFW set to `DROP` (see
+[iptables and UFW](#iptables-and-ufw)); `meshly status` shows whether it is first. While the node has Docker
+networks, preflight and `meshly doctor` also analyse the other chains on the forward hook. A problem there concerns
+containers only: the tunnel between the hosts does not pass the forward hook. So whatever may drop container traffic
+there is a warning (`firewall-forward`) with the fix, never a refusal, in both profiles: `init`, `allow` and
+`service start` go on.
+
+| Chain | Finding | Fix |
+|---|---|---|
+| A native nftables chain that may drop container traffic, for example `chain forward` with `policy drop` in your `table inet filter` | warning | Add the integration rule to that chain before any drop or reject rule, as `doctor` prints it: `meta mark & 0x10000000 == 0x10000000 accept comment "meshly"`. The same in both profiles |
+| A chain that meshly cannot integrate: one of another iptables table that may drop (a `DROP` in `mangle FORWARD`), or one at priority −300 or lower, which runs before `guard_fwd` | warning: containers cannot use the VPN through this chain | Remove or narrow the rule that drops |
+| The chains of Docker's own nftables firewall backend (table `ip docker-bridges`) | information | — |
+
+Docker's nftables firewall backend (`"firewall-backend": "nftables"` in `/etc/docker/daemon.json`) works with meshly
+as its iptables rules do. With Docker CE 29.9.1 on Debian 12 and Ubuntu 24.04, a published port is closed until
+`allow` and reachable after it, and containers reach the peer (`TestDockerNftablesBackend`). `doctor` lists Docker's
+chains as information, because rules you add to them can still block container traffic.
+
+`TestDockerNativeForwardChain` checks a native forward chain with `policy drop`: the tunnel between the hosts keeps
+working, `doctor` warns and prints the rule, and once the rule is added the published port works.
+
+### Docker networks
+
+meshly finds the Docker networks itself, in the kernel. A Docker network is an interface of kind `bridge` named
+`docker0` or `br-` plus 12 hexadecimal digits: the names Docker gives its default network and every user-defined or
+compose network. meshly does not use the Docker API or `docker.sock`, and does not need Docker running. Bridges of
+other programs (`br-lan`, `vmbr0`, `virbr0`, `lxdbr0`, `podman0`) do not match.
+
+The networks are part of the desired state, besides the configuration. A network that appears or goes away is
+drift, and meshly repairs it in a journaled `check-repair` operation that names the change, for example
+`Docker networks changed: +br-3f1c2a9b7d01` in `meshly logs`:
+
+- `meshly-watch.service` applies a change within seconds of the bridge appearing or going. If another meshly
+  command or an open `meshly invite` holds the lock, it waits and applies the change right after.
+  `meshly-check.timer` repairs the same within a minute when the watch is not running.
+- The drop-in `/etc/systemd/system/docker.service.d/50-meshly.conf` re-applies meshly after Docker starts.
+- Until meshly has applied a new network, its containers cannot use the tunnel: a bridge that is not in the table
+  stays closed.
+
+`meshly status` lists the networks (`docker networks`), and `meshly doctor` names them in its `docker` finding.
+When the ruleset has Docker's rules but no bridge with one of Docker's names, `doctor` warns instead.
+
+Not supported:
+
+- networks with a custom bridge name (`com.docker.network.bridge.name`): their containers cannot use the VPN;
+- macvlan, ipvlan and overlay (swarm) networks; Podman, containerd/nerdctl, LXC/LXD, Kubernetes and the bridges of
+  virtual machines;
+- reaching a container by its address, a port that is not published, or a whole Docker network from the peer;
+- IPv6 inside the VPN, as for the host.
+
+Containers on the host's network (`--network host`) use the network of the host and are programs on the host in every
+respect.
+
+The integration tests run a real Docker daemon in the lab nodes on Debian 12 and Ubuntu 24.04: Docker CE from
+download.docker.com, 29.9.1 when this was written (see [testing.md](testing.md) and the
+[threat model](threat-model.md)).
 
 ## When the table disappears
 
@@ -408,24 +640,34 @@ follows:
   meshly.
 - **`systemctl reload nftables`** propagates to `meshly.service` (`ReloadPropagatedFrom=`), which re-applies the
   table.
-- **Anything else** (a manual `nft flush ruleset`, another tool): `meshly-check.timer` notices the missing or
-  modified table within about a minute and re-applies it.
+- **Anything else** (a manual `nft flush ruleset`, another tool): `meshly-watch.service` sees the nftables change
+  and re-applies the table, usually within seconds; `meshly-check.timer` notices the missing or modified table
+  within about a minute if the watch did not.
 
 Until the table is back:
 
 - With profile **`nftables`**, VPN traffic is blocked: no mark, so your `policy drop` applies.
 - With profile **`none`**, nothing filters the VPN interface unless iptables or UFW do. Without them, during that
-  window, the peer can reach every host service that listens on all addresses (`0.0.0.0`). The window lasts until the next check (at most about a
-  minute), or is near zero after a `systemctl restart nftables`. If that window is unacceptable, use the
+  window, the peer can reach every host service that listens on all addresses (`0.0.0.0`). The window lasts until the
+  watch or the next check re-applies the table (usually seconds, at most about a minute), or is near zero after a
+  `systemctl restart nftables`. If that window is unacceptable, use the
   `nftables` profile with a `policy drop` input chain, or bind host services to specific addresses. The
   [threat model](threat-model.md) lists this as a known limitation.
+- On a node with Docker networks, in either profile, the peer can also reach the ports that Docker publishes on all
+  addresses or on the VPN address, unless a forward chain of your own drops them: Docker's rules let them through,
+  as they let the former through from the internet. The LAN stays closed, because
+  [policy routing](#policy-routing-table-109) does not depend on the table. Container addresses do have a route
+  then, and only Docker's own rules keep them closed (the tested Docker drops packets for a container that arrive on
+  another interface).
 
 If `/etc/nftables.conf` starts with `flush ruleset`, `meshly doctor` points out this window. Replacing it with
 `table inet filter; delete table inet filter` (one pair per table you define) reloads your ruleset without
 touching the meshly table.
 
-The integration tests cover the following (`TestSystemdLifecycle`, `TestNativeNftablesProfile`):
+The integration tests cover the following (`TestSystemdLifecycle`, `TestNativeNftablesProfile`,
+`TestDockerHostContained`):
 
 - start, reload and restart of `nftables.service` with a `flush ruleset` config;
 - the check restoring a deleted table;
-- a native nftables ruleset that fails closed.
+- a native nftables ruleset that fails closed;
+- a Docker host without the table, whose LAN stays closed to the peer.

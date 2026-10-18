@@ -27,8 +27,8 @@ through, for example `meshly allow 22/tcp from home`.
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 400}}}%%
 flowchart LR
-    home["🏠 <b>home</b> · behind NAT<br/>10.100.0.2<br/><br/>✅ :9100 open for vps<br/>🔒 LAN, Docker, the rest"]
-    vps["☁️ <b>VPS</b> · public IP<br/>10.100.0.1<br/><br/>✅ :22 open for home<br/>🔒 Docker, the rest"]
+    home["🏠 <b>home</b> · behind NAT<br/>10.100.0.2<br/><br/>✅ :9100 open for vps<br/>✅ Docker ports you allow<br/>🔒 LAN, the rest"]
+    vps["☁️ <b>VPS</b> · public IP<br/>10.100.0.1<br/><br/>✅ :22 open for home<br/>✅ Docker ports you allow<br/>🔒 the rest"]
     home <==>|"🔐 WireGuard<br/>UDP 51820"| vps
 ```
 
@@ -56,8 +56,9 @@ flowchart LR
 - **Default deny.** A peer can reach only the ports you list with `meshly allow`. A rule applies only to traffic
   coming in through the tunnel, in one direction (peer → this node). `meshly deny` also cuts connections that are
   already established.
-- **No accidental exposure.** No forwarding into or out of the tunnel, no access to the LAN, and no IPv6 inside the
-  VPN. Docker port publishing (DNAT) cannot be used to bypass the policy. Spoofed sources are dropped.
+- **No accidental exposure.** No access to the LAN behind a server, nothing forwarded from the LAN into the tunnel,
+  and no IPv6 inside the VPN. A Docker container is like a program on the server: a port it publishes opens only
+  with `meshly allow`, and containers reach the other server only where it allows. Spoofed sources are dropped.
 - **Secure pairing without a server.** `meshly invite` prints a one-time code, and `meshly join` on the other server
   asks for it. The servers exchange their keys through the WireGuard port that is already open, so nothing new is
   reachable from the internet or by other users of the server, even while the invite waits. The code works once,
@@ -65,13 +66,14 @@ flowchart LR
 - **Safe changes.** Every change is a journaled transaction with verification and rollback. If a failure leaves the
   tunnel in an unknown state, meshly closes it (*safe mode*) rather than leaving it open. An operation interrupted by
   a crash or power loss is finished or rolled back on the next start.
-- **Works with your firewall.** meshly owns one nftables table, `inet meshly`, and replaces it atomically. With UFW
-  or iptables rules, meshly keeps one rule at the top of their `INPUT` and `OUTPUT` chains that lets through only
-  what meshly allowed; no `ufw allow` is needed. fail2ban needs nothing either. It touches nothing else. Unsupported setups (firewalld,
-  iptables-legacy rules, native nftables drop chains without the integration rule) are detected *before* any change.
+- **Works with your firewall.** meshly owns one nftables table, `inet meshly`, and replaces it atomically. With UFW or
+  iptables rules, meshly keeps one rule at the top of their `INPUT` and `OUTPUT` chains (and `FORWARD` on a Docker
+  host) that lets through only what meshly allowed; no `ufw allow` is needed. fail2ban needs nothing either. It
+  touches nothing else. Unsupported setups (firewalld, iptables-legacy rules, native nftables drop chains without the
+  integration rule) are detected *before* any change.
 - **Survives the real world.** NAT and idle timeouts (keepalive on both sides), VPS restarts (instant re-handshake
-  from learned endpoints), reboots, `systemctl restart nftables` and `flush ruleset`. A one-minute integrity check
-  repairs drift.
+  from learned endpoints), reboots, Docker restarts, `systemctl restart nftables` and `flush ruleset`. New Docker
+  networks work within seconds. A one-minute integrity check repairs drift.
 - **Diagnosable.** `meshly status` and `meshly doctor` print human-readable reports, or stable JSON with `--json`.
   Exit codes are stable, and every finding says whether it was observed or inferred.
 - **Signed self-upgrade.** `meshly upgrade` installs the latest GitHub release after checking an Ed25519 signature and
@@ -244,7 +246,8 @@ details. The full reference, including exit codes and JSON schemas, is in [docs/
 - **Transactions**: each change is a plan of steps that is journaled, applied, verified and then committed. Failure
   rolls back, and an unknown state ends in safe mode (the tunnel closed). [Architecture](docs/architecture.md).
 - **systemd**: `meshly.service` (oneshot) brings the link up at boot after the system firewall. `meshly-check.timer`
-  re-applies the policy if something removed it. A drop-in re-applies it after `nftables.service` starts.
+  re-applies the policy if something removed it, and `meshly-watch.service` applies new Docker networks within
+  seconds. Drop-ins re-apply the policy after `nftables.service` or `docker.service` starts.
 
 ## Security
 
@@ -275,8 +278,9 @@ details. The full reference, including exit codes and JSON schemas, is in [docs/
 
 ## FAQ
 
-**Why not just `wg-quick`?** `wg-quick` sets up a tunnel. It does not decide what may cross it, it does not stop
-Docker or forwarding from leaking your LAN, and it cannot roll back a half-applied change. meshly does all three.
+**Why not just `wg-quick`?** `wg-quick` sets up a tunnel. It does not decide what may cross it, it does not keep your
+LAN closed to the other server when your server forwards packets (as every Docker host does), and it cannot roll back
+a half-applied change. meshly does all three.
 
 **`meshly join` says the VPS did not answer.** Either the invite is no longer open (it expired, was cancelled or was
 already used), or UDP 51820 does not reach the VPS: check its cloud firewall. Nothing was changed on home. Run
@@ -285,15 +289,23 @@ already used), or UDP 51820 does not reach the VPS: check its cloud firewall. No
 **Can I connect more than two servers?** Not yet. A network has exactly two nodes in 0.0.x. See the
 [roadmap](docs/roadmap.md).
 
-**Does it work with UFW, iptables or fail2ban?** Yes, with nothing to configure. meshly keeps one rule at the top of the
-`INPUT` and `OUTPUT` chains that accepts only what meshly's own policy accepted, including the WireGuard port, and
-puts it back when a reload of the rules removes it. UFW keeps deciding all other traffic. fail2ban's bans stay in
-force; if one hits the other node, meshly warns and shows how to lift it. firewalld and the legacy iptables backend
-are not supported: meshly detects them and changes nothing. See the [firewall docs](docs/firewall.md#iptables-and-ufw).
+**Does it work with UFW, iptables or fail2ban?** Yes, with nothing to configure. meshly keeps one rule at the top of
+the `INPUT` and `OUTPUT` chains (and `FORWARD` on a Docker host) that accepts only what meshly's own policy accepted,
+including the WireGuard port, and puts it back when a reload of the rules removes it. UFW keeps deciding all other
+traffic. fail2ban's bans stay in force; if one hits the other node, meshly warns and shows how to lift it. firewalld
+and the legacy iptables backend are not supported: meshly detects them and changes nothing. See the
+[firewall docs](docs/firewall.md#iptables-and-ufw).
 
-**Are my Docker containers reachable through the VPN?** No. Published ports work through DNAT, and meshly drops
-DNAT and forwarding for tunnel traffic. To expose a container service, publish it on the host and allow that port.
-The [firewall docs](docs/firewall.md#docker) explain the details.
+**Are my Docker containers reachable through the VPN?** Yes, like programs on the server. A port published with
+`-p 9104:9104` (or `ports:` in compose) opens to home with `sudo meshly allow 9104/tcp from home` on the VPS: the
+port in `allow` is the host port, the left number. Containers connect to the other server by themselves, to the ports
+it allows. There is nothing to configure in Docker or compose, and new networks work within seconds. The LAN,
+container addresses and ports without `meshly allow` stay closed.
+
+Note that `-p 9104:9104` also opens the port to the internet, because Docker bypasses UFW. To publish it only to the
+VPN, bind it to this node's VPN address, which `meshly status` shows: `-p 10.100.0.1:9104:9104`. Such a container
+does not start while the meshly link is stopped (Docker reports `cannot assign requested address`); start it again
+once the link is up. The [firewall docs](docs/firewall.md#docker) explain the details.
 
 **What happens if the VPS reboots?** The home node re-handshakes as soon as the VPS is back. Both sides send
 keepalives, and meshly remembers the last authenticated endpoint.

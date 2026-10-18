@@ -21,9 +21,14 @@ meshly connects exactly two Linux nodes:
 
 They are connected over kernel WireGuard, and meshly manages the interface,
 address, routes, per-interface sysctls, one nftables table (`inet meshly`)
-and its systemd units. The VPN gives each node access only to the services
-the *other* node explicitly allows. It is not a site-to-site VPN: there is no
-LAN access and no forwarding in either direction.
+and its systemd units, and on a node with Docker networks one policy routing
+rule and its routing table. The VPN gives each node access only to the
+services the *other* node explicitly allows. It is not a site-to-site VPN:
+there is no LAN access. The only forwarding is between the tunnel and the
+node's own Docker networks, because meshly treats a container like a program
+on the node: from the peer to a port that Docker publishes on the node and
+the peer is allowed, and from containers to the peer, which sees them as the
+node. Nothing else is forwarded in either direction.
 
 ## Assets
 
@@ -31,7 +36,7 @@ LAN access and no forwarding in either direction.
 |---|---|---|
 | WireGuard private key | `/etc/meshly/keys/wireguard.key` (0600, dir 0700) | impersonation of the node inside the tunnel |
 | Policy (allow rules, peer, addresses) | `/etc/meshly/meshly.json`, kernel `inet meshly` table | decides what the peer can reach |
-| Services on each node | local sockets, often bound to `0.0.0.0` | the thing being protected |
+| Services on each node | local sockets, often bound to `0.0.0.0`, and container ports that Docker publishes | the thing being protected |
 | LAN behind each node | e.g. the home network | must never be reachable through the VPN |
 | Invite code | printed by `meshly invite`, valid once and for 10 minutes by default; then on screens, in clipboards, in whatever it is pasted into | whoever uses it first while the invite is open becomes the peer |
 | Transaction state | `/var/lib/meshly/` (0700) | recovery |
@@ -99,15 +104,27 @@ addresses, try to use the node as a router into the VPN.
   dropped in `guard_pre`. *Integration:* `TestCompromisedPeerContained`
   (a LAN host with `10.100.0.1` configured and a route to `10.100.0.2`
   cannot reach the allowed service).
-- No forwarding into the VPN:
+- No forwarding into the VPN from the LAN, or from any interface but the
+  node's Docker networks:
   - `guard_fwd` (forward hook, priority -300) drops everything with
-    `oifname` set to the meshly interface;
-  - the interface has `forwarding=0`, strict `rp_filter`, no redirects, no
-    source routing and IPv6 disabled.
+    `oifname` set to the meshly interface, except connections from a Docker
+    bridge to a peer and the replies of published container ports;
+  - on a node with Docker networks, `guard_post` drops, after NAT, anything
+    that would leave through the interface with another source than the
+    node's VPN address;
+  - on a node with Docker networks and `rp_filter` on (Ubuntu's default),
+    the kernel drops packets from the LAN to the tunnel even before the
+    forward hook: it looks up their reverse path in meshly's routing table
+    109, which has no route to the LAN (see
+    [firewall.md](firewall.md#policy-routing-table-109)).
 
-  *Unit only:* `TestRenderPolicyShape` checks that the rule is rendered.
-  No integration test routes a LAN host's traffic into the VPN through the
-  node.
+  *Integration:* `TestDockerHostContained/lan-into-vpn` (a LAN host routes
+  the peer's VPN address through a Docker host that forwards, with
+  `rp_filter` off so that `guard_fwd` alone decides: nothing reaches the
+  peer, over TCP or UDP, and the drop counter grows). *Unit:*
+  `TestRenderPolicyShape` checks that the rule is rendered. On a node
+  without Docker networks, no integration test routes a LAN host's traffic
+  into the VPN through the node.
 
 **Not protected:** services of the node itself on its LAN address. They are
 the host firewall's business, not meshly's.
@@ -123,32 +140,70 @@ peer's configuration does not matter):
 
 - **Only explicitly allowed services.** `from_vpn` accepts a new flow only if
   `(peer address, protocol, port)` is in `allow_in`, or for ping in
-  `allow_ping`. Everything else hits `default deny`. *Integration:*
+  `allow_ping`. Everything else hits `default deny`. A port that Docker
+  publishes is a service of the node like any other: closed until `allow`.
+  A container port that is not published stays closed even with an allow
+  rule, and so does a port published on `127.0.0.1` only. *Integration:*
   `TestPolicy` (exact port, protocol and direction; the reverse direction
   stays closed), `TestCompromisedPeerContained` (an unlisted port stays
-  closed after the compromise).
+  closed after the compromise), `TestDockerPublishedPort`
+  (`closed-without-allow`, `allowed`, `unpublished-port`, `localhost-only`).
 - **Policy per packet, not per connection.** Removing a rule also cuts
-  established flows. *Integration:* `TestDenyStopsEstablishedFlow`.
+  established flows, those to a published container port too: `from_vpn`
+  drops the peer's packets, and `guard_post` drops the container's replies.
+  *Integration:* `TestDenyStopsEstablishedFlow`,
+  `TestDockerPublishedPort/deny-stops-established-flow` (a TCP stream into
+  a container) and `TestDockerPublishedPort/udp` (a UDP flow).
 - **No source spoofing.** WireGuard cryptokey routing on the attacked node
   accepts only the peer's `/32`, and `from_vpn` requires `ip saddr` in
   `@peers`. *Integration:* `TestCompromisedPeerContained` (a source
   address `10.100.0.9` is not accepted).
-- **No LAN access and no forwarding**, even if the attacked node forwards for
-  other reasons, as a Docker host does:
-  - `guard_fwd` drops all forwarding from the interface;
-  - `forwarding=0` on the interface;
+- **No LAN access, and forwarding only to published container ports**,
+  even if the attacked node forwards for other reasons, as a Docker host
+  does:
+  - `from_vpn` accepts only packets for the node's own VPN address, so the
+    peer cannot address a LAN host or a container directly;
+  - `guard_fwd` forwards from the interface only connections whose original
+    destination is the node's VPN address and that Docker's DNAT sent into
+    a Docker network, and the replies to connections that containers
+    started; it drops all other forwarding from the interface;
+  - without Docker networks, `forwarding=0` on the interface; with them,
+    policy routing: whatever comes from the interface is routed with table
+    109, which knows only the Docker networks, so the LAN has no route from
+    the tunnel, also while the meshly table is missing;
   - cryptokey routing.
 
-  *Integration:* `TestCompromisedPeerContained` (LAN host unreachable
-  directly and via the LAN address, also after the `forwarding` sysctl is
-  turned on behind meshly's back; the drop counters increase; the drift is
-  reported by `status` and repaired by `service check`).
+  *Integration:* `TestCompromisedPeerContained`, on a node without Docker
+  (LAN host unreachable directly and via the LAN address, also after the
+  `forwarding` sysctl is turned on behind meshly's back; the drop counters
+  increase; the drift is reported by `status` and repaired by `service
+  check`). `TestDockerHostContained`, on a Docker host that already
+  forwarded before Docker started, so that the `FORWARD` policy stays
+  `ACCEPT` and only meshly keeps the tunnel apart from the LAN; the hostile
+  peer also routes the node's Docker network into the tunnel: the LAN host
+  is unreachable (`lan`), container addresses and an allowed but
+  unpublished port stay closed (`containers`), policy routing refuses the
+  LAN with the meshly table deleted (`without-table`), and there is exactly
+  one routing rule (`one-routing-rule`). `TestDockerPublishedPort/container-address`:
+  a peer that routes a container's address into the tunnel is dropped by
+  `from_vpn`. For the container addresses, Docker's own guard (its raw
+  `PREROUTING` rules) is removed first. Each check makes sure that meshly
+  drops: the counter of a meshly rule grows, or the route lookup fails.
 - **No DNAT or redirect bypass.** Decisions are taken at priority -180,
   before DNAT (-100), against the original destination. `guard_in` then
   drops anything from the VPN whose destination was rewritten or whose
-  conntrack entry has `dnat` status. *Integration:*
+  conntrack entry has `dnat` status. A DNAT to another host is forwarded
+  traffic: without Docker networks `guard_fwd` drops it; with them, policy
+  routing refuses every destination outside the Docker networks before the
+  forward hook, and `guard_fwd` forwards only into a Docker network and only
+  for the node's VPN address. *Integration:*
   `TestCompromisedPeerContained`, using a Docker-style `dnat to <LAN host>`
   and a local `redirect`, both on ports with an allow rule.
+  `TestDockerHostContained`, with a foreign `dnat to <LAN host>` on an
+  allowed port: refused by routing, it never reaches the forward hook
+  (`lan`); without the routing rule, `guard_fwd` drops it and the check
+  restores the rule (`lan-without-routing-rule`); a local `redirect` on an
+  allowed port is dropped by `guard_in` (`local-redirect`).
 - **Revoke ends all access.** Rules are removed first, then the key and the
   route. *Integration:* `TestPolicy`.
 
@@ -159,8 +214,9 @@ peer's configuration does not matter):
 - DoS of the tunnel;
 - the attacker learning the node's public endpoint and VPN address;
 - outbound access: allow rules are per node, not per user, so on the
-  attacked node any local process can still open connections to the
-  services the *compromised* peer allows.
+  attacked node any local process, and any container on its Docker
+  networks, can still open connections to the services the *compromised*
+  peer allows.
 
 ### 4. Attacker who obtains or substitutes an invite code
 
@@ -282,8 +338,9 @@ in shared directories such as `/tmp`.
 
 - users with `sudo` or root;
 - local processes using the tunnel: any local user can connect to the
-  services the peer allows for this node. Rules are per node, not per
-  user or process.
+  services the peer allows for this node, and so can every container on
+  the node's Docker networks. Rules are per node, not per user, process or
+  container.
 
 ### 6. Malicious release, mirror or network during install/upgrade
 
@@ -346,9 +403,12 @@ an admin's `nft flush ruleset` can interfere with meshly's table.
   checks that foreign state is unchanged after the refusal. Note that
   firewalld is simulated by its pid file, not by the real daemon. *Unit:*
   `TestAnalyzeFixtures` over rulesets recorded from nft 1.0.6 and 1.0.9
-  (UFW and fail2ban also from 1.1.3).
+  (UFW and fail2ban also from 1.1.3), `TestAnalyzeDockerCE` over rulesets
+  of a real Docker CE 29.9.1 on nft 1.0.6, 1.0.9 and 1.1.3 (on 1.0.9 also
+  with UFW and with Docker's nftables firewall backend).
 - **UFW and iptables.** meshly keeps one rule at the top of the iptables
-  `filter` chains `INPUT` and `OUTPUT`; it accepts only packets that carry
+  `filter` chains `INPUT` and `OUTPUT` (and `ip filter FORWARD` on a node
+  with Docker networks); it accepts only packets that carry
   meshly's mark, which meshly sets only on packets its own policy accepted
   and clears on every other packet. UFW's and the administrator's rules
   still decide everything else, and a port they open to the internet stays
@@ -381,22 +441,63 @@ an admin's `nft flush ruleset` can interfere with meshly's table.
   *Integration:* `TestForeignStatePreserved` (foreign tables, routes,
   interfaces and public SSH unchanged over the whole lifecycle including
   `reset`). *Unit:* fake-kernel assertions in `TestFlowAndSecrets`.
-- **Docker.** Published ports are not reachable through the VPN, and DNAT
-  from the VPN is dropped (see 3). This is verified with Docker-style nft
-  rules (`TestCompromisedPeerContained`), *not with a running Docker
-  daemon*.
+- **Docker: a container is a program on the node.** A port that Docker
+  publishes on all addresses or on the VPN address opens to the peer only
+  with `meshly allow`, and closes with `deny`; a container connects to the
+  peer like a program on the node, to what the peer allows the node. The
+  LAN, container addresses and ports without `allow` stay closed (see 2
+  and 3). All of this is verified with a real Docker daemon on Debian 12
+  and Ubuntu 24.04. *Integration:* `TestDockerPublishedPort`,
+  `TestDockerClient`, `TestDockerHostContained`, and with Docker's own
+  firewall rules changing: `TestDockerNetworkLifecycle` (a new network works
+  within seconds, a removed one is gone, and with the last one forwarding
+  and routing go), `TestDockerAfterMeshly` (Docker started after meshly,
+  restarted, and after a reboot), `TestDockerUFW`,
+  `TestDockerNftablesBackend` (Docker's nftables firewall backend).
+- **Containers leave the tunnel only as the node.** Everything sent into
+  the tunnel has the node's VPN address as its source: meshly translates
+  the source of container traffic itself (`nat_out`), and `guard_post`
+  drops any other source after NAT. The peer never sees a container's
+  address. *Integration:* `TestDockerClient/allowed` (vps sees home's VPN
+  address in conntrack, never a container's),
+  `TestDockerHostContained/container-source` (with meshly's SNAT and
+  Docker's masquerade removed, nothing reaches vps from a container, and
+  `guard_post`'s counter grows).
+- **Problems on the containers' path never block the tunnel.** A chain on
+  the forward hook that may drop container traffic (a native nftables
+  chain, a drop in another iptables table) is a warning with the fix, never
+  a refusal, in both profiles; Docker's own chains of its nftables backend
+  are information. The forward hook is analysed only on a node with Docker
+  networks. *Integration:* `TestDockerNativeForwardChain` (with a native
+  forward chain `policy drop`, the tunnel between the hosts works and
+  `doctor` prints the rule to add). *Unit:* `TestEvaluateFirewallForward`.
+- **Nothing changes without Docker networks.** The table, the sysctls and
+  the routing of a node without Docker networks are the same as before
+  Docker support: no `docker_ifs`, no forwarding rules, `forwarding=0`, no
+  routing rule. *Unit:* `TestRenderWithoutDockerUnchanged`,
+  `TestMarkerRoundTripRealNft` (the table rendered without Docker networks
+  has the hash of the table captured from real nft before),
+  `TestForwardingDriftWithoutDocker`. *Integration:*
+  `TestDockerNetworkLifecycle/docker-gone` (when the last bridge goes, so do
+  forwarding, the routing rule, the rule in `FORWARD` and `docker_ifs`).
 - **Restoration after external changes:**
   - `nftables.service` reloads propagate to meshly (`ReloadPropagatedFrom`),
     so the table is re-applied;
   - after a start or restart of `nftables.service`, a drop-in re-applies
     the table;
+  - after a start or restart of `docker.service`, a drop-in re-applies
+    meshly, which puts its rule back at the top of `FORWARD`;
+  - `meshly-watch.service` runs the check seconds after the network
+    interfaces or nftables change, which applies a new Docker network and
+    puts meshly's rule back at the top of `FORWARD` after Docker moved it;
   - a timer runs `meshly service check` every minute and re-applies a
     missing or modified table;
   - `doctor` reports when `/etc/nftables.conf` contains `flush ruleset`.
 
   *Integration:* `TestSystemdLifecycle/nftables-reload` (reload and restart
   of `nftables.service`; table and service are back within 15 s),
-  `TestSystemdLifecycle/check-timer`.
+  `TestSystemdLifecycle/check-timer`, `TestDockerNetworkLifecycle` and
+  `TestDockerAfterMeshly` (within 10 s each).
 
 **Not protected:**
 
@@ -408,13 +509,33 @@ an admin's `nft flush ruleset` can interfere with meshly's table.
   - In profile `nftables`, the peer can reach what the host firewall itself
     accepts on all interfaces, such as `tcp/22`, exactly like any internet
     host.
+  - On a node with Docker networks, in either profile, the peer can also
+    reach the ports that Docker publishes on all addresses or on the VPN
+    address, without `allow`, unless a forward chain of the host firewall
+    drops them: Docker's own rules let them through, as they let the former
+    through from the internet. This is the same class as the host services
+    on `0.0.0.0` in profile `none`. The LAN stays closed: policy routing
+    does not depend on the table (`TestDockerHostContained/without-table`).
+    Container addresses do have a route then, and only Docker's own rules
+    keep them closed (the tested Docker drops packets for a container that
+    arrive on another interface, in its raw `PREROUTING` rules).
 
-  The window is not measured by the tests; only the restoration is. See
-  [firewall.md](firewall.md).
+  `meshly-watch.service` usually re-applies the table within seconds of the
+  change. The window is not measured by the tests; only the restoration is.
+  See [firewall.md](firewall.md).
+- **Docker's first start, before meshly follows it.** On its first start
+  Docker writes `net.ipv4.ip_forward=1`, which turns `forwarding` on for
+  every interface, the meshly interface included. Until
+  `meshly-watch.service` applies the new Docker network (about 1 to 5
+  seconds), there is no routing rule yet, so the second layer is missing.
+  `guard_fwd` in table `inet meshly` keeps dropping all forwarding from and
+  into the interface meanwhile, since the table has no Docker network yet.
+  The window is not measured by the tests.
 - **Cloud firewalls and security groups.** meshly does not manage them. The
   WireGuard UDP port must be opened there by the admin.
 - **Rules in hooks that run before meshly.** For example, `netdev` ingress
-  chains are reported as warnings, not prevented.
+  chains are reported as warnings, not prevented, and so are forward chains
+  at priority -300 or lower on a node with Docker networks.
 - **Firewall managers without an adapter.** firewalld must be disabled to
   use meshly. UFW and iptables must use the default `iptables-nft` backend.
 - **meshly's mark set outside meshly.** While table `inet meshly` exists,
@@ -468,4 +589,5 @@ Integration tests run in privileged containers with their own network
 namespaces on a real Linux kernel. They do not run in full virtual machines.
 "Reboot" is a container restart, which recreates the network namespace (the
 interface and all nftables tables are gone) and boots systemd again; the
-kernel itself is not rebooted.
+kernel itself is not rebooted. The Docker tests run Docker CE inside these
+containers, with the `vfs` storage driver.

@@ -3,7 +3,8 @@
 meshly is a single static Go binary that turns a small declarative
 configuration (`/etc/meshly/meshly.json`) into kernel state on one Linux host:
 a WireGuard interface, its address and host routes, a few per-interface
-sysctls, and one nftables table. Every change runs as a journaled transaction
+sysctls, and one nftables table; on a host with Docker networks also one
+policy routing rule and its routing table. Every change runs as a journaled transaction
 that either completes, rolls back, or closes the VPN path (safe mode). This
 document describes how that works and why it was built that way. Related
 documents: [pairing protocol](pairing-protocol.md),
@@ -35,7 +36,7 @@ documents: [pairing protocol](pairing-protocol.md),
 | `internal/lock` | `flock(2)` serialisation of mutating operations. |
 | `internal/engine` | Observe → plan → apply → verify; transactions, recovery, safe mode, drift detection, temporary overlays. |
 | `internal/engine/enginetest` | In-memory fake kernel (links, WireGuard, nft) for unit tests. |
-| `internal/netstack` | Interface, address, routes and per-interface sysctls over rtnetlink. |
+| `internal/netstack` | Interface, address, routes and per-interface sysctls over rtnetlink; Docker bridges, the policy routing to them, and the link and nftables events that `meshly service watch` follows. |
 | `internal/wg` | WireGuard configuration over generic netlink (wgctrl). |
 | `internal/nft` | Renders the meshly table, runs `nft`, parses `nft -j list ruleset`, analyses foreign chains. |
 | `internal/preflight` | Capability and compatibility checks before any change. |
@@ -85,9 +86,15 @@ meshly never runs a shell and never executes user-supplied commands.
   `wireguard` with the alias `meshly:<network-id>`, and routes carry the
   routing protocol number 109. Objects without these markers are never
   modified or removed; a name clash is reported as a conflict (exit 5).
-  Sysctls are per-interface only (`forwarding=0`, `rp_filter=1`, no
-  redirects or source routing, `disable_ipv6=1`); no global sysctl is
-  changed.
+  Sysctls are per-interface only (`forwarding=0`, or `1` while the host has
+  Docker networks, `rp_filter=1`, no redirects or source routing,
+  `disable_ipv6=1`); no global sysctl is changed.
+- **Policy routing** (only while the host has Docker networks): the rule
+  `iif meshly0 lookup 109` at priority 109 and routing table 109 with a
+  route to each IPv4 subnet of the Docker bridges and `unreachable default`,
+  all with routing protocol 109, over rtnetlink. Routes of another protocol
+  in table 109 are a conflict (exit 5), and only on a host with Docker
+  networks. See [firewall.md](firewall.md#policy-routing-table-109).
 - **WireGuard**: generic netlink via `wgctrl`. The private key travels only
   over netlink. Each peer gets exactly its `/32` as allowed IP.
 - **nftables**: the fixed binary `/usr/sbin/nft` with fixed argument vectors
@@ -114,18 +121,32 @@ meshly never runs a shell and never executes user-supplied commands.
 ## Engine: plan, transaction, verify
 
 `engine.DesiredFrom` derives the desired kernel state from a configuration
-(nothing at all for a missing configuration or admin state `down`).
+(nothing at all for a missing configuration or admin state `down`) and from
+the part of it that belongs to the node, `engine.Env`: the Docker bridges
+found on the host (interfaces of kind `bridge` named `docker0` or `br-` and
+12 hex digits, read over netlink; meshly never asks Docker). With Docker
+bridges, the desired state has them in the table, `forwarding=1` and the
+policy routing; without them, it is what it would be without Docker support.
+So the desired state changes when a Docker network comes or goes, with no
+change to the configuration: that is drift, and the check repairs it in a
+journaled `check-repair` transaction whose first drift line names the change
+(`Docker networks changed: +br-3f1c2a9b7d01`).
 `Observe` reads the current state, and `Plan` produces an ordered list of
 steps, each with a name (used by the journal and by fault injection) and a
 human description (printed while applying and by `--dry-run`).
 
 Ordering invariants:
 
-- Bring-up: `firewall.apply` → `link.create` (down) → `link.alias` /
-  `link.mtu` → `link.sysctl` → `link.address` → `wireguard.configure` →
-  `link.up` → `routes.sync`. Protection exists before any traffic path.
+- Bring-up: `firewall.apply` → `iptables.integrate` → `docker.routing` →
+  `link.create` (down) → `link.alias` / `link.mtu` → `link.sysctl` →
+  `link.address` → `wireguard.configure` → `link.up` → `routes.sync`.
+  Protection exists before any traffic path.
 - Tear-down: `link.down` → `link.delete` (with its peers and routes) →
-  `firewall.remove`. The traffic path goes first, the protective table last.
+  `iptables.remove` → `docker.routing` → `firewall.remove`. The traffic path
+  goes first, the protective table last.
+- `forwarding` is on only while the routing rule exists: `docker.routing`
+  comes before `link.sysctl` when the rule is added, and is the last step
+  when the last Docker network goes and `link.sysctl` turns `forwarding` off.
 
 Only the steps needed for the difference are planned, so repeating a command
 is a no-op ("kernel state already matches").
@@ -210,7 +231,9 @@ Mutating commands take an exclusive `flock` on `/run/meshly/lock`, waiting
 up to 30 seconds, otherwise exit 6. Read-only commands (`status`, `doctor`,
 `rules`, `logs`) take no lock; `status` reports `operation_in_progress` from
 a non-blocking probe. The check timer never waits: if the lock is held it
-does nothing. `upgrade` holds the lock while replacing the binary.
+does nothing. `meshly service watch` tries again every 2 seconds while the
+lock is held, so it applies a change right after the operation, or an open
+invite, ends. `upgrade` holds the lock while replacing the binary.
 `invite` holds it for its whole wait, so the check timer cannot "repair"
 the invite's temporary state away; other changing commands then exit 6 with
 a message that names the open invite and its expiry.
@@ -229,26 +252,49 @@ disables and removes them.
   system ruleset usually starts with `flush ruleset`. `PartOf=` and
   `ReloadPropagatedFrom=nftables.service`, so restarting or reloading the
   system firewall restarts or reloads meshly, which re-applies its table.
-  `ConditionPathExists=/etc/meshly/meshly.json`.
+  `ConditionPathExists=/etc/meshly/meshly.json`. `Wants=meshly-watch.service`
+  starts the watch on every start and restart, `meshly upgrade` included,
+  with no `enable`.
 - `nftables.service.d/50-meshly.conf`: `ExecStartPost=-/usr/bin/systemctl
   --no-block try-reload-or-restart meshly.service`, which covers *starting*
   nftables (not covered by `PartOf`/`ReloadPropagatedFrom`). It does
   nothing when meshly is not active.
+- `docker.service.d/50-meshly.conf`: the same line for Docker, which puts
+  its own jumps at the top of the iptables `FORWARD` chain when it starts;
+  the reload re-applies meshly and puts its rule back on top.
+- `meshly-watch.service`: `Type=simple`, running `meshly service watch`. It
+  subscribes to netlink link events and nftables events, and after a change
+  runs the same check as `meshly-check.service`: once no other change came
+  for a second, at most 5 seconds after the first. A new Docker network thus
+  works through the tunnel within seconds, and meshly's rule is first in
+  `FORWARD` again soon after Docker moved it (Docker does so whenever it
+  creates a network). The check is the journaled `check-repair`; a change
+  that leaves nothing to repair writes nothing. While another operation or
+  an open invite holds the lock, the watch tries again every 2 seconds and
+  applies right after. After a failed check it ignores changes for a minute,
+  the interval of the timer: the changes that follow a failure are mostly
+  its own rollback or safe mode, and the timer retries meanwhile.
+  `PartOf=`, `Requisite=` and `After=meshly.service`: it stops with meshly
+  and never starts the link. `Restart=always` (`RestartSec=5`) covers
+  unintended exits; systemd does not restart it after an explicit stop or
+  the stop propagated from `meshly.service`. It has no `[Install]` section.
 - `meshly-check.timer` (2 min after boot, then every minute) runs
   `meshly-check.service` → `meshly service check`: it records learned peer
   endpoints, computes drift, and repairs it in a journaled `check-repair`
   transaction (for example a deleted or modified meshly table, a changed
-  sysctl, or the temporary peer of an invite that was killed).
+  sysctl, a Docker network that appeared or went, or the temporary peer of
+  an invite that was killed).
   `Requisite=meshly.service` means the check never starts the link when the
   service is stopped.
 - `systemctl stop meshly` tears the link down without changing the
-  configuration; `meshly stop` additionally saves admin state `down`, so the
-  link stays down across reboots until `meshly start`.
+  configuration and stops the watch with it; `meshly stop` additionally
+  saves admin state `down`, so the link stays down across reboots until
+  `meshly start`.
 - `/etc/systemd/network/10-meshly-unmanaged.network` and
   `/etc/NetworkManager/conf.d/meshly.conf` (each only if that directory
   exists) tell systemd-networkd and NetworkManager to leave the interface
   alone.
-- Hardening of both services: `CapabilityBoundingSet=CAP_NET_ADMIN`,
+- Hardening of all three services: `CapabilityBoundingSet=CAP_NET_ADMIN`,
   `NoNewPrivileges`, `ProtectSystem=strict` with write access only to the
   meshly directories, `ProtectHome`, `PrivateTmp`, `PrivateDevices`,
   `ProtectKernelModules`, `ProtectControlGroups`, `ProtectClock`,
@@ -319,8 +365,8 @@ Each entry: context, decision, consequences.
 - **Decision.** meshly owns exactly one table, `inet meshly`, marked by a
   comment rule, and always replaces it as a whole in one nft transaction. It
   never flushes or deletes other tables, and never uses `flush ruleset`. The
-  only object it adds elsewhere is its rule in the iptables chains (D6). A
-  table with the same name but without the marker is a conflict.
+  only object it adds to other tables is its rule in the iptables chains
+  (D6). A table with the same name but without the marker is a conflict.
 - **Consequences.** Packets see either the old or the new policy, never a
   partial one. Removing meshly removes only its own objects. A native
   nftables firewall that drops traffic in its own base chains needs one
@@ -369,7 +415,9 @@ Each entry: context, decision, consequences.
   before anything is changed, including with `--dry-run`. Operations that
   only reduce access are never blocked; they print a warning instead.
 - **Consequences.** meshly does not run on such hosts until the
-  administrator changes the setup. No automatic firewall migration.
+  administrator changes the setup. No automatic firewall migration. Chains
+  on the forward hook only ever carry the traffic of Docker containers, so
+  problems there are warnings and never block the tunnel (D12).
 
 ### D6. meshly keeps its own rule in the iptables chains (UFW, iptables)
 
@@ -383,7 +431,8 @@ Each entry: context, decision, consequences.
 - **Decision.** In every `filter` chain `INPUT` and `OUTPUT` of the
   iptables tables (IPv4 and IPv6) that has a drop policy or any rule, meshly
   keeps the integration rule as the first rule, with the comment
-  `meshly:v1 integration`. It is a step of the normal reconcile
+  `meshly:v1 integration`; while Docker networks exist, also in
+  `ip filter FORWARD`, where Docker keeps its own rules (D12). It is a step of the normal reconcile
   (`iptables.integrate` after `firewall.apply`, `iptables.remove` on tear-down),
   so the check timer repairs it like any other drift, and a duplicated or
   misplaced rule is replaced by one at the top. The rule is written with
@@ -497,3 +546,53 @@ project owner.
 - **Consequences.** After any interruption, an access-granting change is
   either fully in effect or not at all, an access-reducing change is always
   completed, or the node is in safe mode with the VPN path closed.
+
+### D12. Docker containers are programs on the server
+
+- **Context.** On servers that run everything in Docker, a port published
+  with `-p` is the service, and the programs that connect to the other node
+  run in containers. Both paths are forwarded by the kernel, not delivered
+  to or sent by a local process: a published port is DNATed by Docker to the
+  container's address, and a container's connection is routed from its
+  bridge into the tunnel. A node that only lets local processes through the
+  VPN therefore leaves both of them broken, and the usual workaround,
+  running containers on the host's network, means rewriting every compose
+  file.
+- **Decision.** A running container with a published port is a program
+  installed on the server with an open port, and `meshly allow` of the host
+  port is the only thing the user does. It is always on, with no flag or
+  setting. meshly recognises Docker networks from the kernel alone (a bridge
+  named `docker0` or `br-` with 12 hex digits), never through the Docker API
+  or `docker.sock`, and does not need Docker running. While such networks
+  exist, the desired state (`engine.Env`) adds:
+  - in the table, forwarding only between `meshly0` and those bridges: to a
+    published port in `allow_in` (decided before Docker's DNAT, by the
+    original destination), replies to it, connections from containers and
+    their replies; replies of a denied port are dropped per packet (D2);
+  - SNAT of container traffic to this node's VPN address, so the peer sees
+    nothing else;
+  - a second layer that does not depend on the table: policy routing that
+    sends everything forwarded from the tunnel to table `109`, with only the
+    Docker subnets and `unreachable default`;
+  - `forwarding=1` on `meshly0`, set only after the routing rule exists;
+  - meshly's rule in `ip filter FORWARD` (D6), a drop-in that re-applies
+    after Docker starts, and `meshly-watch.service`, which applies a new
+    Docker network within seconds.
+  A forward chain of the host firewall that may drop container traffic is
+  a warning in preflight and `doctor`, with the fix, and never blocks
+  `init`, `allow` or `service start`; the chains of Docker's nftables
+  backend are information.
+- **Consequences.** Containers need no configuration in compose or
+  `daemon.json`, and `docker compose up`, `down` or a Docker restart need no
+  command. The peer reaches containers only through published ports it is
+  allowed, never by container address. The LAN behind the node stays
+  unreachable from the tunnel, also while the table is missing, and a host
+  on the LAN cannot route through the node into the tunnel. While the table
+  is missing, ports that Docker publishes on all addresses are open to the
+  peer, as they are to the internet. Containers cannot reach
+  their own node's VPN address (`guard_pre`): letting them would open every
+  host port to them past UFW. Bridges with custom names, macvlan, ipvlan and
+  overlay networks, Podman and VM bridges are not covered. A host without
+  Docker networks gets exactly the table, sysctls and routes it had before.
+  Details: [firewall.md](firewall.md#docker),
+  [threat model](threat-model.md).

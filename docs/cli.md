@@ -42,7 +42,9 @@ port is reachable from the internet. Keys are generated locally.
 Preflight runs first. If the environment is unsupported (no kernel WireGuard, nftables older than 1.0.6,
 firewalld, iptables-legacy rules, a native nftables drop chain without integration, a CIDR conflict or a busy port),
 init stops with exit code 3 and changes nothing. UFW and iptables rules need nothing: meshly puts its rule at the
-top of their `INPUT` and `OUTPUT` chains, and init names the chains.
+top of their `INPUT` and `OUTPUT` chains (and of `FORWARD` while the node has Docker networks), and init names the
+chains. Docker needs nothing either; a forward chain that may drop container traffic is a warning, never a reason
+to stop (see [firewall.md](firewall.md#docker)).
 
 init ends with what to do next: `sudo meshly invite` on this node and `sudo meshly join` on the other. Without an
 endpoint it says that no other node can join until this node has one (`meshly set endpoint IP`).
@@ -188,6 +190,10 @@ meshly allow ping from home
 Running the same `allow` twice is a no-op ("Already allowed"). An unknown peer gives exit code 5. A malformed rule
 gives exit code 2.
 
+A port that a Docker container publishes (`-p`, `ports:`) on all addresses or on the VPN address is a port of this
+node: `allow` takes the host port, the left number of `-p 9104:8080`. The rule can be added before the container
+exists, and survives `docker compose down` and `up` (see [firewall.md](firewall.md#docker)).
+
 ### `meshly deny <port>/<tcp|udp> from <peer>` · `meshly deny ping from <peer>`
 
 Removes the rule. Policy is evaluated per packet, so packets of connections that are already established are
@@ -237,7 +243,9 @@ Shows the saved configuration, the service state, the interface, the firewall ta
 traffic counters, endpoint, the rules it may use), interrupted operations and drift between configuration and
 kernel. The systemd state is shown separately and says nothing about connectivity. Without root, kernel and key
 details are omitted. While `meshly invite` waits, status shows `Invite open until …` instead of the drift, and the
-firewall table as `present, with the open invite's temporary rules`.
+firewall table as `present, with the open invite's temporary rules`. Under the firewall table, `iptables chains`
+names the iptables chains that carry meshly's rule and whether it is first, and on a node with Docker networks
+`docker networks` lists them (see [diagnostics-and-recovery.md](diagnostics-and-recovery.md#meshly-status)).
 
 ### `meshly nodes [--json]`
 
@@ -299,7 +307,7 @@ nothing locally. Check ids and runbooks are in
 
 Shows the operation journal: who (uid, sudo user) did what, begin/commit/rollback/recovery/safe-mode events, and
 audit records such as an invite opened and closed.
-`-n` must be ≥ 1 (default 30). Service output is in `journalctl -u meshly -u meshly-check`.
+`-n` must be ≥ 1 (default 30). Service output is in `journalctl -u meshly -u meshly-check -u meshly-watch`.
 
 ### `meshly version [--short] [--json]`
 
@@ -336,10 +344,12 @@ rule (saved with `netfilter-persistent save`), `reset` warns: run `sudo netfilte
 Finishes or rolls back an operation interrupted by a crash or power loss. Every command does this first, so this
 command is rarely needed by hand.
 
-### `meshly service start|stop|reload|check|install`
+### `meshly service start|stop|reload|check|install|watch`
 
-Entry points for `meshly.service` and `meshly-check.service`. They are not meant to be run by hand. `install`
-rewrites the unit files for the current binary path.
+Entry points for `meshly.service`, `meshly-check.service` and `meshly-watch.service`. They are not meant to be run
+by hand. `install` rewrites the unit files for the current binary path. `watch` runs until it is stopped: it follows
+interface and nftables changes and runs the same check as `check` a few seconds after each (see
+[diagnostics-and-recovery.md](diagnostics-and-recovery.md#drift-and-the-check-timer)).
 
 ## Exit codes
 
@@ -407,7 +417,10 @@ An abridged `meshly.status/v1` example:
 ```
 
 `config.wg_public_key` and `peers[].wg_public_key` are the WireGuard public keys; compare them across the two nodes
-to check that each knows the other's key. `peers[].connectivity` is one of `handshake-recent`, `handshake-stale`,
+to check that each knows the other's key. On a host with UFW, iptables rules or Docker, `firewall.iptables_chains`
+lists the chains that carry meshly's rule (`chain`, `meshly_rule_present`, `meshly_rule_first`). On a node with
+Docker networks, `firewall.docker_networks` lists them, for example `["br-3f1c2a9b7d01", "docker0"]`; without them
+the field is absent. `peers[].connectivity` is one of `handshake-recent`, `handshake-stale`,
 `no-handshake` or `unknown`.
 
 While `meshly invite` waits, the document has `"invite": {"expires_at": "2026-10-18T20:40:00Z"}` and
@@ -442,6 +455,7 @@ A `meshly.doctor/v1` document has `findings[]`, each with `id`, `status` (`ok`, 
 | `/var/lib/meshly/` | `0700` | `journal.jsonl`, `runtime.json` (applied table hash, learned peer endpoints), `history/` |
 | `/run/meshly/` | `0700` | Operation lock; `invite.json` (`0600`) while `meshly invite` waits, holding only its expiry |
 | `/etc/systemd/system/meshly*.{service,timer}` | `0644` | Units installed by meshly |
+| `/etc/systemd/system/{nftables,netfilter-persistent,docker}.service.d/50-meshly.conf` | `0644` | Drop-ins that re-apply meshly after these services start |
 
 meshly reads no configuration from the environment. Under `sudo`, `SUDO_USER` is recorded in the journal.
 `install.sh` honours `MESHLY_VERSION` and `MESHLY_BASE_URL` (a mirror of the GitHub releases).
