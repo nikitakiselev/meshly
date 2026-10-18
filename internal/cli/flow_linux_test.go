@@ -1550,15 +1550,25 @@ func TestOpenInviteIsVisible(t *testing.T) {
 	if !strings.Contains(out, "Invite open until") || strings.Contains(out, "Drift") {
 		t.Errorf("status:\n%s", out)
 	}
+	// The table carries the invite's temporary rules: said so, not flagged.
+	if !strings.Contains(out, "table inet meshly  present, with the open invite's temporary rules\n") || strings.Contains(out, "OUTDATED") {
+		t.Errorf("status firewall line:\n%s", out)
+	}
 	var st struct {
 		Invite *struct {
 			ExpiresAt time.Time `json:"expires_at"`
 		} `json:"invite"`
+		Firewall struct {
+			MatchesConfig bool `json:"matches_config"`
+		} `json:"firewall"`
 		Drift []string `json:"drift"`
 	}
 	js := vps2.expect(0, "status", "--json")
 	if err := json.Unmarshal([]byte(js), &st); err != nil || st.Invite == nil || len(st.Drift) != 0 {
 		t.Errorf("status --json: %v\n%s", err, js)
+	}
+	if st.Firewall.MatchesConfig {
+		t.Errorf("status --json: matches_config must stay literal (false) while the invite's rules are in the table:\n%s", js)
 	}
 	if strings.Contains(js+out, inv.code) {
 		t.Error("the invite code is shown")
@@ -1566,6 +1576,11 @@ func TestOpenInviteIsVisible(t *testing.T) {
 	_, doc, _ := vps2.run("doctor")
 	if strings.Contains(doc, "✗") || strings.Contains(doc, " drift  ") || !strings.Contains(doc, "an invite is open until") {
 		t.Errorf("doctor:\n%s", doc)
+	}
+	for _, line := range strings.Split(doc, "\n") {
+		if f := strings.Fields(line); len(f) > 1 && f[0] == "!" && strings.Contains(f[1], "firewall") {
+			t.Errorf("doctor warns about the firewall while the invite is open:\n%s", doc)
+		}
 	}
 	if out := vps2.expect(ExitBusy, "allow", "22/tcp", "from", "home"); !strings.Contains(out, "meshly invite is waiting") {
 		t.Errorf("allow: %s", out)

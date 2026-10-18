@@ -79,6 +79,11 @@ func (a *App) renderStatus(st *diag.Status) {
 			p("ABSENT\n")
 		case !f.Owned:
 			p("NOT OWNED BY MESHLY\n")
+		case !f.MatchesConfig && st.Invite != nil:
+			// Not an alarm: the invite adds its temporary rules on top of
+			// the saved configuration (--json stays literal: matches_config
+			// false, explained by the invite object).
+			p("present, with the open invite's temporary rules%s\n", yesno(f.ModifiedOutside, ", MODIFIED OUTSIDE MESHLY", ""))
 		default:
 			p("present, %s%s\n", yesno(f.MatchesConfig, "matches config", "OUTDATED"), yesno(f.ModifiedOutside, ", MODIFIED OUTSIDE MESHLY", ""))
 		}
