@@ -41,10 +41,14 @@ tar -C "$d" -c . | docker import -c 'ENTRYPOINT ["/busybox"]' - it-busybox
 rm -rf "$d"`
 
 // DockerStart starts Docker on a node of newDockerLab, waits until it
-// answers and, the first time, imports it-busybox.
+// answers and, the first time, imports it-busybox. Lab nodes inherit
+// net.ipv4.ip_forward=1 from the outer host; as on a fresh server, Docker
+// finds forwarding off, enables it itself and then sets the policy of the
+// iptables FORWARD chain to drop. Docker already running (its nftables
+// backend refuses to start without forwarding) is left alone.
 func (n *Node) DockerStart() {
 	n.lab.t.Helper()
-	n.MustSh("systemctl start docker")
+	n.MustSh("systemctl is-active -q docker || { sysctl -qw net.ipv4.ip_forward=0 && systemctl start docker; }")
 	n.WaitFor("docker info", 30*time.Second, func() bool { return n.Docker("info").Code == 0 })
 	if n.Docker("image", "inspect", "it-busybox").Code != 0 {
 		n.MustSh(importBusybox)
@@ -117,9 +121,6 @@ func TestCaptureDockerRuleset(t *testing.T) {
 			// them, and the lab needs no DNS.
 			home.MustSh("nft delete table ip nat")
 			vps.MustSh("nft delete table ip nat")
-			// As on a fresh host, Docker enables forwarding itself and then
-			// sets the policy of FORWARD to drop.
-			home.MustSh("sysctl -qw net.ipv4.ip_forward=0")
 			home.DockerStart()
 			home.MustDocker("network", "create", "it-net")
 			ip := home.ServeHTTP("web", "9104:8080")

@@ -1,8 +1,9 @@
 # Test node with systemd as PID 1, for service/reboot/upgrade/install tests.
 # A container restart stands in for a reboot: the network namespace (and
 # with it the interface and every nftables table) is recreated empty.
-# With --build-arg DOCKER=1 the node also has Docker CE (vfs storage) and
-# busybox-static; Docker is not started at boot: tests start it themselves.
+# With --build-arg DOCKER=1 the node also has Docker CE (vfs storage),
+# busybox-static and conntrack; Docker is not started at boot: tests start it
+# themselves.
 ARG BASE=debian:12
 FROM ${BASE}
 # UFW is installed but not enabled; the tests that need it turn it on.
@@ -19,7 +20,7 @@ RUN test -z "$DOCKER" || { . /etc/os-release \
  && curl -fsSL "https://download.docker.com/linux/$ID/gpg" -o /etc/apt/keyrings/docker.asc \
  && echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$ID $VERSION_CODENAME stable" > /etc/apt/sources.list.d/docker.list \
  && apt-get update -qq \
- && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends docker-ce docker-ce-cli containerd.io busybox-static \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends docker-ce docker-ce-cli containerd.io busybox-static conntrack \
  && rm -rf /var/lib/apt/lists/* \
  && echo '{"storage-driver":"vfs"}' > /etc/docker/daemon.json \
  && systemctl disable docker.service docker.socket containerd.service; }
