@@ -127,9 +127,10 @@ Images: `node.Dockerfile` on Debian 12 and Ubuntu 24.04 (nftables,
 iptables, UFW, fail2ban, iproute2, wireguard-tools, conntrack, netcat), and
 `systemd.Dockerfile` on Debian 12 with systemd as PID 1 (also with
 iptables and UFW). The Docker tests run on `systemd.Dockerfile` built with
-`DOCKER=1` on Debian 12 and Ubuntu 24.04: Docker CE from download.docker.com
-(29.9.1 when this was written) with the `vfs` storage driver, not started at
-boot. Each test starts Docker itself and imports the image `it-busybox`
+`DOCKER=1` on Debian 12 and Ubuntu 24.04: Docker CE from download.docker.com,
+pinned to 29.9.1 with containerd 2.4.2 (build arguments `DOCKER_VERSION` and
+`CONTAINERD_VERSION`; `MESHLY_IT_DOCKER_VERSION=latest` installs the newest
+of both), with the `vfs` storage driver, not started at boot. Each test starts Docker itself and imports the image `it-busybox`
 offline from the node's busybox; nothing is pulled from a registry. UFW and
 fail2ban are installed but run only in the tests that need them. A container
 restart stands in for a reboot: the network namespace, interface and all
@@ -190,7 +191,12 @@ to expire.
 - `fuzz`: every fuzz target for 15 s;
 - `build`: `make dist` for both architectures, uploaded as an artifact;
 - `integration`: `make integration` on `ubuntu-24.04` after loading the
-  `wireguard` and `nf_tables` modules.
+  `wireguard` and `nf_tables` modules, with the pinned Docker CE.
+
+`.github/workflows/docker-latest.yml` runs every Monday (or manually): the
+Docker tests (`-run TestDocker`) with the newest Docker CE, so that a Docker
+release that changes its rules or its nftables backend shows up there and
+not on a server.
 
 `.github/workflows/release-verify.yml` runs when a release is published (or
 manually for a tag). It verifies the Ed25519 signature of `SHA256SUMS` with
@@ -276,12 +282,13 @@ care, and please report results from real systems.
 - **Real networks.** One Linux masquerading NAT with short timeouts; no
   carrier-grade or symmetric NAT, no real cloud firewalls or security groups,
   no path-MTU problems.
-- **Docker** is tested with a real Docker CE daemon (29.9.1 when this was
-  written) with its iptables rules, on Debian 12 and Ubuntu 24.04. Its
+- **Docker** is tested with a real Docker CE daemon (29.9.1, pinned) with
+  its iptables rules, on Debian 12 and Ubuntu 24.04. Once a week the Docker
+  tests also run with the newest Docker CE (`docker-latest.yml`). Its
   nftables firewall backend is covered only by `TestDockerNftablesBackend`
   (closed until `allow`, reachable after it, containers reach the other
-  node), not by the deny and containment tests. Other Docker versions,
-  rootless Docker, Docker Desktop, swarm and the network drivers other than
+  node), not by the deny and containment tests. Other Docker versions than
+  these two, rootless Docker, Docker Desktop, swarm and the network drivers other than
   `bridge` are not tested.
 - **install.sh over GitHub.** Tests serve the release tree over local HTTP
   (`MESHLY_BASE_URL`); downloads from github.com over HTTPS are not part of

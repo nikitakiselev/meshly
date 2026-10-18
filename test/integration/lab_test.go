@@ -150,7 +150,9 @@ func buildTool(name string) error {
 
 // buildImage builds image d: a distro (node.Dockerfile), systemd-<distro>
 // (systemd.Dockerfile) or docker-<distro> (systemd.Dockerfile with Docker
-// CE). deb13 is used only to capture fixtures (TestCaptureDockerRuleset).
+// CE, of the version pinned there or MESHLY_IT_DOCKER_VERSION, which may
+// be "latest"). deb13 is used only to capture fixtures
+// (TestCaptureDockerRuleset).
 func buildImage(here, d string) error {
 	base := map[string]string{"deb12": "debian:12", "u2404": "ubuntu:24.04", "deb13": "debian:13"}
 	file, flavor := "node.Dockerfile", d
@@ -161,6 +163,9 @@ func buildImage(here, d string) error {
 	if s, ok := strings.CutPrefix(d, "docker-"); ok {
 		file, flavor = "systemd.Dockerfile", s
 		args = append(args, "--build-arg", "DOCKER=1")
+		if v := os.Getenv("MESHLY_IT_DOCKER_VERSION"); v != "" {
+			args = append(args, "--build-arg", "DOCKER_VERSION="+v)
+		}
 	}
 	if base[flavor] == "" {
 		return fmt.Errorf("unknown distro %q", d)

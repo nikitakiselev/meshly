@@ -1,0 +1,33 @@
+name: Docker latest
+
+# The integration tests pin Docker CE (test/integration/images/
+# systemd.Dockerfile). Once a week the Docker tests run with the newest
+# Docker CE, so that a release that changes Docker's rules or its nftables
+# backend shows up here and not on a user's server.
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-latest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Kernel modules
+        run: |
+          uname -r
+          sudo modprobe wireguard
+          sudo modprobe nf_tables
+      - name: Docker tests with the newest Docker CE
+        env:
+          MESHLY_IT_DOCKER_VERSION: latest
+        run: go test -tags integration -count=1 -timeout 40m -run 'TestDocker' -v ./test/integration/...
