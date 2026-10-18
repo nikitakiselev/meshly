@@ -14,11 +14,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/netip"
-	"regexp"
 	"slices"
 	"strings"
 
 	"github.com/nikitakiselev/meshly/internal/model"
+	"github.com/nikitakiselev/meshly/internal/netstack"
 )
 
 const (
@@ -38,10 +38,6 @@ const (
 	NATPriority  = 99
 	PostPriority = 101
 )
-
-// bridgeNameRe admits docker0 and br-<12 hex>; model.ValidateInterfaceName
-// refuses the hyphen.
-var bridgeNameRe = regexp.MustCompile(`^[a-z][a-z0-9-]{0,14}$`)
 
 // AllowEntry is one rendered allow rule.
 type AllowEntry struct {
@@ -136,7 +132,9 @@ func (in Input) validate() error {
 		}
 	}
 	for _, n := range in.Docker {
-		if !bridgeNameRe.MatchString(n) {
+		// Only Docker's names (docker0, br-<12 hex>): the table forwards
+		// between them and the interface.
+		if !netstack.IsDockerBridge(n, "bridge") || n == in.Interface {
 			return fmt.Errorf("invalid docker bridge name %q", n)
 		}
 	}

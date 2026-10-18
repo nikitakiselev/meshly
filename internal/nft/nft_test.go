@@ -243,6 +243,11 @@ func TestRenderRejectsBadInput(t *testing.T) {
 		"ipv6 local":           func(i *Input) { i.LocalAddr = netip.MustParseAddr("fd00::1") },
 		"docker name space":    func(i *Input) { i.Docker = []string{"br x"} },
 		"docker name quote":    func(i *Input) { i.Docker = []string{`a"b`} },
+		// Only Docker's bridge names: forwarding to eth0 would reach the LAN.
+		"docker name eth0":      func(i *Input) { i.Docker = []string{"eth0"} },
+		"docker name lo":        func(i *Input) { i.Docker = []string{"lo"} },
+		"docker name interface": func(i *Input) { i.Docker = []string{i.Interface} },
+		"docker name br-lan":    func(i *Input) { i.Docker = []string{"br-lan"} },
 	} {
 		i := fixtureInput()
 		mutate(&i)
