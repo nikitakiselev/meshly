@@ -271,13 +271,19 @@ disables and removes them.
   creates a network). The check is the journaled `check-repair`; a change
   that leaves nothing to repair writes nothing. While another operation or
   an open invite holds the lock, the watch tries again every 2 seconds and
-  applies right after. After a failed check it ignores changes for a minute,
-  the interval of the timer: the changes that follow a failure are mostly
-  its own rollback or safe mode, and the timer retries meanwhile.
+  applies right after; so it does after an error before any transaction,
+  such as a read of the links that changes interrupted. After a failed
+  repair (the transaction failed, or it was completed only without the
+  Docker networks) it ignores changes for a minute, the interval of the
+  timer: the changes that follow are mostly its own rollback, safe mode or
+  table without the Docker networks, and the timer retries meanwhile.
   `PartOf=`, `Requisite=` and `After=meshly.service`: it stops with meshly
   and never starts the link. `Restart=always` (`RestartSec=5`) covers
   unintended exits; systemd does not restart it after an explicit stop or
-  the stop propagated from `meshly.service`. It has no `[Install]` section.
+  the stop propagated from `meshly.service`, nor after exit code 2
+  (`RestartPreventExitStatus=2`): a binary without `service watch`, after
+  `meshly upgrade` rolled back or downgraded, would loop. It has no
+  `[Install]` section.
 - `meshly-check.timer` (2 min after boot, then every minute) runs
   `meshly-check.service` → `meshly service check`: it records learned peer
   endpoints, computes drift, and repairs it in a journaled `check-repair`

@@ -64,6 +64,9 @@ func TestUnitFiles(t *testing.T) {
 		"After=meshly.service",
 		"Restart=always",
 		"RestartSec=5",
+		// A binary without `service watch` (a rollback or downgrade of
+		// `meshly upgrade`) exits with usage (2): no restart loop.
+		"RestartPreventExitStatus=2",
 	} {
 		if !strings.Contains(watch, line+"\n") {
 			t.Errorf("meshly-watch.service lacks %q", line)

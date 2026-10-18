@@ -17,6 +17,9 @@ ExecStart=@EXE@ service watch
 # propagated from meshly.service), so this only covers unintended exits.
 Restart=always
 RestartSec=5
+# Exit 2 (usage): a binary without `service watch`, after `meshly upgrade`
+# rolled back or downgraded. Restarting it would loop every 5 seconds.
+RestartPreventExitStatus=2
 UMask=0077
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=yes
