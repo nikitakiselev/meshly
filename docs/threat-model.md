@@ -179,6 +179,17 @@ administrator of the joining node a code of their own.
   (the code of a closed invite gets no answer). *Unit:*
   `TestOverlayPeerAndAllow` (the temporary peer, its preshared key and its
   single allow entry, and their removal).
+- **Not from the inviting node either.** Its own processes reach the VPN
+  address over loopback, so the pairing port has two more layers. The
+  invite's firewall rule drops every packet for the port that does not
+  arrive through the tunnel from the joining node's address, loopback
+  included, and the listener closes every connection from another source
+  without an answer. A process on the inviting node, even one of root's,
+  gets no connection. *Integration:* `TestPairingClosedToLocalUsers`
+  (refused as `nobody` and as root while the rule's counter grows; with the
+  rule deleted, the listener still does not answer). *CLI:*
+  `TestInviteIgnoresForeignSource`. *Unit:* `TestRenderExclusive` (the rule
+  exists only with the invite's temporary state).
 - **A code works once, for a short time.** Once a node has joined, the
   invite answers a second `hello` with `used` (exit 4), and once the invite
   has closed, a second `join` gets no answer at all (exit 13). The invite
@@ -207,9 +218,11 @@ administrator of the joining node a code of their own.
   `TestPairingCleanup`, `TestPairing`. *CLI:* `TestPairFlow`.
 - **The code is kept out of everything else.** `join` refuses it as an
   argument (exit 2), and neither the code nor the keys derived from it are
-  saved, journaled or shown by `status`, `doctor` or `logs`. *Integration:*
-  `TestPairing` (process list, journal, `status`, `doctor` and `logs`, also
-  `--json`), `TestPairingRefusals`.
+  saved, journaled or shown by `status`, `doctor` or `logs`. A code that a
+  paste broke across lines is read whole, so no part of it is left over for
+  the shell and its history. *Integration:* `TestPairing` (process list,
+  journal, `status`, `doctor` and `logs`, also `--json`),
+  `TestPairingRefusals`. *CLI:* `TestJoinCodeWrapped`.
 
 **Not protected:**
 
@@ -255,6 +268,13 @@ in shared directories such as `/tmp`.
   world-writable, and a FIFO planted at their path does not block it.
   *Unit:* `internal/store` tests (`fs_test.go`, `keys_test.go`,
   `config_test.go`, `invite_test.go`).
+- **No way into an open invite.** The pairing port listens on the VPN
+  address, which a local process reaches over loopback. The invite's
+  firewall rule admits it only from the joining node's address through the
+  tunnel, and the listener answers no other source, so a local user can
+  neither join without the code nor take the peer slot or block the real
+  node. *Integration:* `TestPairingClosedToLocalUsers`. *CLI:*
+  `TestInviteIgnoresForeignSource`.
 
 **Not protected:**
 

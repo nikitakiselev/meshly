@@ -320,7 +320,8 @@ By exit code:
   node the two cases look the same.
 - **4, invalid invite code.** The code is damaged or incomplete (copy the
   whole line again: whitespace and line breaks do not matter), it expired
-  (open a new invite), it was made by another meshly version (upgrade both
+  (open a new invite; if the new code is refused as expired too, check this
+  node's clock), it was made by another meshly version (upgrade both
   nodes), or another node already used it.
 - **5, conflict.** The name is taken by the inviting node (`--name`), or
   this node is already a member of a network (`meshly status`; `meshly

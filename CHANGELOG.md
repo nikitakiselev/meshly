@@ -15,9 +15,9 @@ First public release.
 
 - Point-to-point network of two Linux nodes over kernel WireGuard: `init` creates it, `invite` prints a one-time
   code and waits, and `join` on the other node takes the code and pairs the two nodes through the WireGuard port,
-  with no server and nothing new reachable from the internet. The code works once, expires after 10 minutes by
-  default (`--ttl`, at most 1 hour) and is read from a prompt or stdin, never from the command line. The joining
-  node is named after its host name unless `--name` is given.
+  with no server and nothing new reachable from the internet or by local users. The code works once, expires after
+  10 minutes by default (`--ttl`, at most 1 hour) and is read from a prompt or stdin, never from the command line,
+  also when a paste broke it across lines. The joining node is named after its host name unless `--name` is given.
 - Endpoint detection: `init` takes the public IPv4 address of the interface with the default route, so
   `meshly init homelab --name vps` needs no address; `join --endpoint auto` does the same for the joining node.
   Endpoints accept a bare IP, with the listen port (by default 51820).

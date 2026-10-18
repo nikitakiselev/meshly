@@ -80,16 +80,20 @@ Node "home" (10.100.0.2) joined. The invite is closed.
 - **Output.** stdout gets the code, alone on one line, and at the end the `Node … joined` line. The code is `m1`
   followed by lowercase letters and digits, 111 characters for an IPv4 endpoint (130 for IPv6); it is printed once
   and nowhere else. Everything else goes to stderr, including the engine's steps, which the sample leaves out.
-- **While it waits**, a temporary WireGuard peer that only the code unlocks and a firewall rule that lets just the
-  joining node's VPN address reach TCP port 51820 on this node's VPN address are in place. They are never saved in
-  the configuration. Nothing new is reachable from the internet. The invite holds meshly's lock: other changing
-  commands exit with code 6 (`meshly invite is waiting for a node to join until …; let it finish or cancel it with
-  Ctrl+C`), the check timer leaves the temporary state alone, and `status` and `doctor` show the open invite.
+- **While it waits**, a temporary WireGuard peer that only the code unlocks and firewall rules that let just the
+  joining node's VPN address, through the tunnel, reach TCP port 51820 on this node's VPN address are in place. They
+  are never saved in the configuration. Nothing new is reachable, from the internet or by local users: the rules
+  drop what comes over loopback too, and the listener answers only the joining node's address. The invite holds
+  meshly's lock: other changing commands exit with code 6 (`meshly invite is waiting for a node to join until …; let
+  it finish or cancel it with Ctrl+C`), the check timer leaves the temporary state alone, and `status` and `doctor`
+  show the open invite.
 - **It ends** when a node has joined and confirmed the connection (exit code 0, `Node "home" (10.100.0.2) joined.
-  The invite is closed.`), on Ctrl+C, SIGTERM or when the terminal hangs up, for example a closed SSH session (exit
-  code 10; under `nohup` the hang-up is ignored), or when the code expires and no node joined (exit code 13).
+  The invite is closed.`), on Ctrl+C, SIGTERM, when the terminal hangs up, for example a closed SSH session, or when
+  its output pipe breaks, for example `| tee` killed by the same Ctrl+C (exit code 10; under `nohup` the hang-up is
+  ignored), or when the code expires and no node joined (exit code 13).
 - **If the node that joined cannot confirm** within a minute, its membership is undone (`Node "home" did not
-  confirm the connection; its membership was undone.`), and the invite waits again while the code is valid.
+  confirm the connection; its membership was undone.`), and the invite waits again while the code is valid. Until
+  then the invite counts as open, for `status` and the busy message, even past the code's expiry.
 - **Every way out removes the temporary state.** If the process is killed (`kill -9`), `meshly-check.timer` removes
   it within a minute, and `sudo meshly start` at once.
 
@@ -98,7 +102,9 @@ Node "home" (10.100.0.2) joined. The invite is closed.
 Joins the network of the node where `meshly invite` waits. On a terminal it asks `Invite code: `; otherwise it reads
 the code from the first line of stdin. **The code is never accepted as an argument** (exit code 2): other users
 could see it in the process list, and it would stay in the shell history. Whitespace and letter case in the code
-do not matter.
+do not matter. A code that a paste broke across lines is read whole: while the input is the start of a code, join
+reads the next line too (on a terminal after the prompt `> `), until the code is complete, a blank line or the end
+of the input. A first line that cannot become a code is refused at once with exit code 4.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -128,11 +134,12 @@ to stdout; everything else goes to stderr, including the engine's steps, which t
 | 5 | This node is already a member of a network, or the name is taken (it is the inviting node's) | unchanged |
 | 13 | The inviting node did not answer within 30 seconds: its invite is closed (expired, cancelled or already used), or UDP to its port does not get through | unchanged |
 | 7 | The connection through the new tunnel could not be confirmed. Run `sudo meshly join` again while the invite is open | rolled back |
-| 10 | Ctrl+C, SIGTERM or a hang-up | unchanged or rolled back |
+| 10 | Ctrl+C, SIGTERM or a hang-up from the temporary tunnel on (before it, Ctrl+C exits 130 as usual) | unchanged or rolled back |
 | 1 | The tunnel works (a WireGuard handshake happened), but the inviting node did not acknowledge the connection. Check `meshly status` on both nodes | configuration kept |
 
 A code is accepted up to 5 minutes past its expiry, in case the two clocks differ. A join shortly after the invite
-ended therefore usually gets exit code 13, not 4.
+ended therefore usually gets exit code 13, not 4. If a fresh code is refused as expired too, the clock of the joining
+node is wrong; the message says so.
 
 #### Pairing from a script
 
@@ -301,7 +308,7 @@ Exit codes are stable and safe to use in scripts.
 | 7 | rolled-back | Apply failed and the previous configuration is active again (also: upgrade rolled back; `join` rolled back because the new tunnel could not be confirmed) |
 | 8 | safe-mode | Apply and rollback failed: the VPN interface was removed and VPN access is closed |
 | 9 | not-initialized | meshly is not initialized on this node |
-| 10 | declined | Confirmation missing (no terminal and no `--yes`) or answered "no"; Ctrl+C, SIGTERM or a hang-up of the terminal during `invite` or `join` |
+| 10 | declined | Confirmation missing (no terminal and no `--yes`) or answered "no"; Ctrl+C, SIGTERM or a hang-up of the terminal during `invite` or `join`. Ctrl+C before they change anything (while waiting for the lock, during the preflight or at the `Invite code:` prompt) ends them as usual, with 130 |
 | 11 | warnings | `doctor`: warnings only |
 | 12 | problems | `doctor`: at least one problem |
 | 13 | unreachable | The other node did not come: `join` got no answer from the inviting node (nothing was changed), or the invite expired before a node joined |

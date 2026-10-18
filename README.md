@@ -60,8 +60,8 @@ flowchart LR
   VPN. Docker port publishing (DNAT) cannot be used to bypass the policy. Spoofed sources are dropped.
 - **Secure pairing without a server.** `meshly invite` prints a one-time code, and `meshly join` on the other server
   asks for it. The servers exchange their keys through the WireGuard port that is already open, so nothing new is
-  reachable from the internet, even while the invite waits. The code works once, expires after 10 minutes and never
-  passes through command-line arguments.
+  reachable from the internet or by other users of the server, even while the invite waits. The code works once,
+  expires after 10 minutes and never passes through command-line arguments.
 - **Safe changes.** Every change is a journaled transaction with verification and rollback. If a failure leaves the
   tunnel in an unknown state, meshly closes it (*safe mode*) rather than leaving it open. An operation interrupted by
   a crash or power loss is finished or rolled back on the next start.

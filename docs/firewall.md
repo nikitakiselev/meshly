@@ -116,7 +116,8 @@ The sets are condensed here for reading. `meshly allow … --dry-run` prints the
    Everything else is dropped. The allow check runs on **every packet**, not only on the first one of a
    connection, so `meshly deny` stops established flows immediately.
 3. `guard_in` (input) drops anything whose destination was rewritten on the way: DNAT or REDIRECT from the
-   tunnel is refused.
+   tunnel is refused. While an invite waits, it also guards the pairing port (see
+   [During an invite](#during-an-invite)).
 4. `guard_fwd` (forward, priority −300) drops all forwarding from or into `meshly0`. The peer can never reach the
    LAN, Docker networks or anything behind this node.
 
@@ -142,27 +143,49 @@ change it.
 
 ## During an invite
 
-While `meshly invite` waits, the table of the inviting node carries two temporary elements for the address the
-joining node will get (here `10.100.0.2`). With no peer yet, the sets look like this:
+While `meshly invite` waits, the table of the inviting node carries temporary elements and one temporary rule for
+the address the joining node will get (here `10.100.0.2`). With no peer yet, the sets and `guard_in` look like
+this:
 
 ```nft
 	set peers      { type ipv4_addr; elements = { 10.100.0.2 } }
 	set allow_in   { type ipv4_addr . inet_proto . inet_service; elements = { 10.100.0.2 . tcp . 51820 } }
+
+	chain guard_in {
+		type filter hook input priority -180; policy accept;
+		iifname "meshly0" ip daddr != 10.100.0.1 counter drop comment "rewritten destination"
+		iifname "meshly0" ct status dnat counter drop comment "dnat from the vpn is not supported"
+		ip daddr 10.100.0.1 tcp dport 51820 iifname . ip saddr != { "meshly0" . 10.100.0.2 } counter drop comment "reachable only from its peer through the vpn"
+	}
 ```
 
-They let the joining node reach the pairing port, TCP 51820 on this node's VPN address, through the temporary
-WireGuard tunnel, and nothing else. Only a node that has the invite code can send from `10.100.0.2` through
-`meshly0`, and `guard_pre` drops packets for the VPN address from any other interface, so the port is not
-reachable from the internet or the LAN. In profile `nftables` these packets carry the mark like any other allowed
-VPN traffic.
+The set elements let the joining node reach the pairing port, TCP 51820 on this node's VPN address, through the
+temporary WireGuard tunnel, and nothing else. Only a node that has the invite code can send from `10.100.0.2`
+through `meshly0`, and `guard_pre` drops packets for the VPN address that arrive on any other interface but `lo`,
+so the port is not reachable from the internet or the LAN. In profile `nftables` these packets carry the mark like
+any other allowed VPN traffic.
+
+The last rule of `guard_in` closes the port to the processes of this node, root's included. They reach the VPN
+address over `lo`, which `guard_pre` lets through as local traffic. The rule drops every packet for TCP 51820 on
+the VPN address unless it arrives on `meshly0` from `10.100.0.2`: from `lo`, from any other interface, after DNAT,
+and also with a forged source `10.100.0.2` that did not come through the tunnel. It is in `guard_in` because the
+input hook sees local traffic too, and sees the destination after DNAT. The listener is a second layer: it closes
+every connection whose source is not `10.100.0.2` without reading or answering it.
+
+`TestPairingClosedToLocalUsers` checks this on a real kernel. As `nobody` and as root on the inviting node, a
+connection to `10.100.0.1:51820` fails, and the rule's counter grows with each attempt. With the rule deleted, the
+same connection succeeds, so the rule alone keeps the port closed; a `hello` sent then gets no answer, and the
+invite keeps waiting. `TestRenderExclusive` and `TestOverlayPeerAndAllow` check that the rule exists only while
+the invite's temporary state is applied, and that without it the table is exactly the table of the saved
+configuration.
 
 The joining node's own temporary table has the inviting node's address in `@peers` and no allow rule: its
 connection to the pairing port is locally initiated, and the replies come back as such.
 
-The temporary elements are never saved in the configuration. They go when the invite ends, in every way it can
-end. If the invite was killed, `meshly-check.timer` removes them within a minute, and `sudo meshly start` removes
-them at once. `meshly status` shows the table as present *with the open invite's temporary rules* while the invite
-waits.
+The temporary elements and the rule are never saved in the configuration. They go when the invite ends, in every
+way it can end. If the invite was killed, `meshly-check.timer` removes them within a minute, and `sudo meshly
+start` removes them at once. `meshly status` shows the table as present *with the open invite's temporary rules*
+while the invite waits.
 
 ## Per-interface sysctls
 

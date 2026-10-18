@@ -7,7 +7,8 @@ example a home server) runs `meshly join` and is given the code. The two
 nodes then exchange everything they need through the WireGuard UDP port that
 is already open, inside a temporary WireGuard tunnel that only the code
 unlocks. There is no server, nothing to copy but the code, and nothing new
-is reachable from the internet, even while the invite waits.
+is reachable from the internet or by local users, even while the invite
+waits.
 
 The implementation is in `internal/pairing` (the code, key derivation and
 messages), `internal/cli/cmd_invite.go` and `internal/cli/cmd_join.go` (the
@@ -30,7 +31,7 @@ sequenceDiagram
     participant B as Joiner (home)
     Note over A: meshly invite
     A->>A: secret S; temporary key K_t and preshared key from S
-    A->>A: temporary peer K_t for 10.100.0.2/32,<br/>allow tcp/51820 from 10.100.0.2,<br/>listen on 10.100.0.1:51820
+    A->>A: temporary peer K_t for 10.100.0.2/32,<br/>allow tcp/51820 only from 10.100.0.2 on meshly0,<br/>listen on 10.100.0.1:51820
     A-->>B: invite code (copied by the administrator)
     Note over B: meshly join
     B->>B: check the code, preflight,<br/>derive K_t and the preshared key
@@ -111,8 +112,9 @@ of the inviter's key must be in it.
 
 `meshly join` parses the code as follows:
 
-- whitespace anywhere and letter case are ignored, so a code that wrapped
-  across lines still works;
+- whitespace anywhere and letter case are ignored, and `join` reads a code
+  that a paste broke across lines whole (see
+  [the joiner](#the-joiner-meshly-join), step 3);
 - `m` followed by a digit other than `1` is a code of another format
   version: *"the invite code was made by another meshly version; upgrade
   meshly on both nodes"*;
@@ -125,7 +127,10 @@ of the inviter's key must be in it.
 - the code is refused as *expired* once the joiner's clock is more than
   5 minutes (`ClockSkew`) past the expiry. The tolerance covers clocks that
   differ between the nodes. Within it the joiner tries, and an invite that
-  has already ended does not answer (exit 13).
+  has already ended does not answer (exit 13). The refusal says to run
+  `meshly invite` again, and to check the joiner's clock if the new code is
+  refused as expired too: a clock that is wrong by more than the tolerance
+  refuses every code.
 
 Each of these refusals exits with code 4, before anything is changed.
 
@@ -167,13 +172,17 @@ derivation (`TestSecrets`).
    *overlay*; it is never saved in `meshly.json` and never journaled):
    - a WireGuard peer with the public key of `K_t`, the PSK and allowed IP
      `10.100.0.2/32`, without an endpoint;
-   - in the firewall table, `10.100.0.2` in `@peers` and
-     `10.100.0.2 . tcp . 51820` in `allow_in` (see
+   - in the firewall table, `10.100.0.2` in `@peers`,
+     `10.100.0.2 . tcp . 51820` in `allow_in`, and a rule in `guard_in`
+     that drops every packet for TCP 51820 on the VPN address unless it
+     arrives on `meshly0` from `10.100.0.2`, loopback included (see
      [firewall.md](firewall.md#during-an-invite)).
-5. Write `/run/meshly/invite.json` (mode `0600`). It holds only the expiry
-   and lets `status`, `doctor` and the busy message show the open invite.
-   Journal `invite` `opened, expires <time>`.
-6. Listen on TCP `10.100.0.1:51820`, the VPN address only.
+5. Write `/run/meshly/invite.json` (mode `0600`). It holds only the time
+   until which the invite is open, and lets `status`, `doctor` and the busy
+   message show the open invite. Journal `invite` `opened, expires <time>`.
+6. Listen on TCP `10.100.0.1:51820`, the VPN address only, and serve only
+   connections from `10.100.0.2`: one from any other source is closed
+   before it is read, without an answer.
 7. Print the instructions to stderr and the code to stdout, alone on one
    line, then wait for requests, the expiry, or Ctrl+C.
 
@@ -182,6 +191,7 @@ Each request is one TCP connection carrying one message (see
 
 | State | Request | Answer |
 |---|---|---|
+| any | a connection from another address than `10.100.0.2` | none: closed before it is read |
 | waiting | `hello` with the inviter's own name | `reject` `name-taken` |
 | waiting | `hello` with the inviter's key or the public key of `K_t` | `reject` `invalid` |
 | waiting | `hello`, valid | `welcome`; then the joiner is added (below) |
@@ -205,17 +215,22 @@ again, the invite prints *"Node "home" did not confirm the connection; its
 membership was undone."* and, while the code is valid, puts the temporary
 peer back and prints *"The code stays valid until …"*. Requests that
 arrived before the deadline are answered first, so a confirmation at the
-last moment counts.
+last moment counts. Until the deadline, `/run/meshly/invite.json` holds the
+later of the code's expiry and the deadline, so `status` and other commands
+show the open invite even when a node joined just before the code expired.
+When the invite waits again, the marker holds the code's expiry again.
 
 **End.** The invite ends when:
 
 - the joined node confirmed: *"Node "home" (10.100.0.2) joined. The
   invite is closed."*, exit 0, and the systemd units are installed if they
   are not yet;
-- Ctrl+C, SIGTERM or a hang-up of the terminal (SIGHUP, for example a
-  closed SSH session) arrives: a node that joined but has not confirmed is
-  undone first; exit 10. A SIGHUP that was ignored at start, as under
-  `nohup`, stays ignored;
+- Ctrl+C, SIGTERM, a hang-up of the terminal (SIGHUP, for example a
+  closed SSH session) or a broken pipe on its output (SIGPIPE, for example
+  `| tee` killed by the same Ctrl+C) arrives: a node that joined but has not
+  confirmed is undone first; exit 10. While the invite cleans up, a write
+  that fails does not stop it. A SIGHUP or SIGPIPE that was ignored at
+  start, as under `nohup`, stays ignored;
 - the code expired while no node had joined: exit 13. A node that joined in
   time may still confirm after the expiry; if it does not, the undo ends the
   invite with exit 13.
@@ -234,7 +249,13 @@ joined <name>`, `cancelled`, `expired` or `failed`.
 2. Require root (exit 3) **before** reading the code, so the code is not
    pasted for nothing.
 3. Read the code: after the prompt `Invite code: ` when stdin and stderr
-   are terminals, otherwise the first line of stdin (at most 1 KiB). A code
+   are terminals, otherwise from stdin, the first line. While the input so
+   far is the start of a code (`m1`, base32, and fewer characters than its
+   family byte implies), `join` reads the next line too, after the prompt
+   `> ` on a terminal: a console, a web terminal, a chat or a mail client
+   may break the code, and the rest must not end up in the shell. It stops
+   at a complete code, a blank line, the end of the input or 1 KiB in all.
+   A first line that cannot become a code is refused at once (exit 4). A code
    given as an argument is refused with exit 2: other users could see it in
    the process list, and it would stay in the shell history. Parse it (see
    [Text form](#text-form)); derive `K_t` and the PSK.
@@ -244,7 +265,7 @@ joined <name>`, `cancelled`, `expired` or `failed`.
 5. Detect the endpoint if `--endpoint auto` was given, pick the listen port,
    resolve the firewall profile and run the preflight for the network of
    the code (CIDR conflicts, interface, port, firewall; exit 3). **Nothing
-   has been changed or sent yet.**
+   has been sent yet, and nothing changed but the leftovers of step 4.**
 6. Load this node's WireGuard key, or generate it. If it equals the
    inviter's key in the code, the code was made on this node: exit 4.
 7. Bring up the temporary tunnel through the engine (an overlay, never
@@ -411,22 +432,24 @@ before the inviter's minute is over. If it gets no `ok`:
 | The `join` transaction fails | undoes the joiner after 1 minute, keeps waiting | rolled back to nothing; exit 7 (8 if the rollback failed too: safe mode) |
 | No confirmation, no new handshake | undoes the joiner after 1 minute, keeps waiting while the code is valid | `join-undo`; exit 7 |
 | Ctrl+C, SIGTERM or hang-up of `invite` | undoes a joiner that has not confirmed; exit 10 | no answer (exit 13) or no confirmation (exit 7) |
+| Ctrl+C, SIGTERM or hang-up of `invite` after the joiner's handshake with its real key | undoes the joiner; exit 10 | keeps its configuration: a handshake but no `ok`; exit 1. Run `sudo meshly reset` and pair again |
 | Ctrl+C, SIGTERM or hang-up of `join` | if the joiner was added: undoes it after 1 minute | temporary tunnel removed, or `join-undo`; exit 10 |
 | The code expires | exit 13 if no node joined | refuses the code 5 minutes after the expiry (exit 4); before that, no answer (exit 13) |
 | `invite` killed (`kill -9`) | the temporary state and `/run/meshly/invite.json` stay until the next command that takes the lock: see below | no answer (exit 13); exit 1 if it had already been added |
 | `join` killed | if the joiner was added: undoes it after 1 minute | an interrupted `join` transaction is rolled back by the next command that takes the lock (or `meshly recover`); a temporary tunnel is removed by the next `join` |
+| `join` killed after its `join` transaction committed, before it confirmed | undoes the joiner after 1 minute | keeps its configuration, without a peer on the other side. Run `sudo meshly reset` and pair again |
 
 **A killed invite.** Its lock goes with the process. The next meshly
 command that takes the lock finds the marker, removes it and journals
-`invite` `closed: interrupted`. The temporary peer and allow rule go with
-the next application of the saved configuration: `meshly-check.timer` does
-this within a minute (it sees them as drift), and `sudo meshly start` does
-it at once. A joiner that the invite had already added stays, because its
+`invite` `closed: interrupted`. The temporary peer and firewall rules go
+with the next application of the saved configuration: `meshly-check.timer`
+does this within a minute (it sees them as drift), and `sudo meshly start`
+does it at once. A joiner that the invite had already added stays, because its
 transaction had committed. `/run` is emptied at boot, and the kernel state
 is rebuilt from the saved configuration, so a reboot also removes all of
 it.
 
-## What the internet sees
+## What the internet and local users see
 
 While `meshly invite` waits:
 
@@ -434,18 +457,32 @@ While `meshly invite` waits:
   answers nothing to packets without valid keys, so it does not reveal the
   invite.
 - The TCP listener is bound to the VPN address only. A packet for the VPN
-  address that arrives on any other interface is dropped by `guard_pre`,
-  and the allow rule admits only the source `10.100.0.2`. WireGuard accepts
-  that source only from the temporary peer, that is, from a holder of `K_t`
-  and the PSK, which only the code yields.
+  address that arrives on any interface but `meshly0` and `lo` is dropped by
+  `guard_pre`, and the allow rule admits only the source `10.100.0.2`.
+  WireGuard accepts that source only from the temporary peer, that is, from
+  a holder of `K_t` and the PSK, which only the code yields.
+- Local processes reach the VPN address over `lo`, which `guard_pre` lets
+  through. Two layers keep them out of the pairing port, root's processes
+  included. In `guard_in`, the invite's rule drops every packet for TCP
+  51820 on the VPN address that does not arrive on `meshly0` from
+  `10.100.0.2`. The listener closes, unread and unanswered, every
+  connection whose source is not `10.100.0.2`. So a local user can neither
+  join without the code nor keep the real node out.
 - Guessing does not help: the secret has 128 bits, and a failed WireGuard
   handshake gets no answer.
 
-`TestPairingNothingExposed` checks this with real packets: the only new
-socket is TCP `10.100.0.1:51820`; the public address does not accept TCP
-51820; an outside host with a route to the VPN address through the VPS is
-dropped by the guard (its counter grows); and no new UDP socket appears.
-The threat model discusses the code itself, and who may hold it, in
+`TestPairingNothingExposed` checks the internet side with real packets: the
+only new socket is TCP `10.100.0.1:51820`; the public address does not
+accept TCP 51820; an outside host with a route to the VPN address through
+the VPS is dropped by the guard (its counter grows); and no new UDP socket
+appears. `TestPairingClosedToLocalUsers` checks the local side: as `nobody`
+and as root on the VPS, a connection to `10.100.0.1:51820` fails while the
+rule's counter grows; with the rule deleted the connection succeeds, so the
+rule alone closes the port, and a `hello` then gets no answer while the
+invite keeps waiting. On fake kernels, `TestInviteIgnoresForeignSource`
+sends `hello` and `confirm` from other source addresses, gets no answer,
+and then pairs the real node. The threat model discusses the code itself,
+and who may hold it, in
 [model 4](threat-model.md#4-attacker-who-obtains-or-substitutes-an-invite-code).
 
 ## Checks and exit codes
@@ -457,10 +494,11 @@ unreachable.
 | Side | Check | Exit | Tested by |
 |---|---|---|---|
 | code | whitespace and letter case ignored | — | unit `TestParseCodeTolerantInput` |
+| code | a code broken across lines is read whole; garbage on the first line is refused at once, a start of a code ended by a blank line or the end of input as incomplete | 4 | unit `TestPartial`, `FuzzParseCode`; CLI `TestJoinCodeWrapped` |
 | code | prefix, base32, length, family, checksum (typo, truncation) | 4 | unit `TestParseCodeErrors`, `FuzzParseCode`; CLI `TestJoinCodeInput`; integration `TestPairingRefusals` |
 | code | fields: endpoint, key, CIDR | 4 | unit `TestParseCodeErrors` |
 | code | another format version | 4 | unit `TestParseCodeErrors`; CLI `TestJoinCodeInput` |
-| code | expired, beyond 5 minutes of clock skew | 4 | unit `TestParseCodeErrors`; CLI `TestJoinCodeInput`; integration `TestPairingRefusals` |
+| code | expired, beyond 5 minutes of clock skew; the message points to this node's clock | 4 | unit `TestParseCodeErrors`; CLI `TestJoinCodeInput`; integration `TestPairingRefusals` |
 | code | round trip, IPv4 (111 characters) and IPv6 (130) | — | unit `TestCodeRoundTrip` |
 | code | derived keys: fixed test vectors, clamping | — | unit `TestSecrets` |
 | join | the code given as an argument | 2 | CLI `TestJoinCodeInput`; integration `TestPairingRefusals` |
@@ -474,7 +512,7 @@ unreachable.
 | join | name taken | 5 | CLI `TestJoinNameTaken` |
 | join | invite already used | 4 | CLI `TestJoinCodeUsed` |
 | join | malformed or hostile answer | 1 | unit `TestHostilePeer` |
-| join | `welcome` does not match the code | 1 | — |
+| join | `welcome` does not match the code | 1 | CLI `TestJoinWelcomeMismatch` |
 | join | no confirmation, no handshake since the switch | 7 | CLI `TestConfirmFailureRollsBackBoth`, `TestJoinIgnoresTemporaryHandshake` |
 | join | handshake, but no `ok` | 1 | CLI `TestJoinKeepsConfigAfterHandshake` |
 | join | hang-up while confirming | 10 | CLI `TestJoinCancelDuringConfirm` |
@@ -484,11 +522,13 @@ unreachable.
 | invite | arguments, `--ttl` outside 1 minute to 1 hour, no endpoint | 2 | CLI `TestInviteRefusals` |
 | invite | a peer exists; the link is stopped | 5 | CLI `TestInviteRefusals` |
 | invite | message size, framing, strict JSON, fields | — | unit `TestHostilePeer`, `TestMessageSizeBoundary`, `FuzzReadRequest` |
+| invite | a connection from another source than the joining node's address, local processes and root included: no answer, the invite waits on | — | unit `TestRenderExclusive`, `TestOverlayPeerAndAllow`, `TestMemoryNetwork`; CLI `TestInviteIgnoresForeignSource`; integration `TestPairingClosedToLocalUsers` |
 | invite | answers per state (name taken, keys of the invite, used, wrong key) | — | CLI `TestInviteSessionAnswers` |
 | invite | a confirmation at the deadline counts | — | CLI `TestInviteConfirmAtDeadline` |
 | invite | no confirmation: undo, wait again | — | CLI `TestConfirmFailureRollsBackBoth`; integration `TestFaultJoin` |
 | invite | Ctrl+C | 10 | CLI `TestInviteCancelAndExpiry`; integration `TestPairingCleanup` |
-| invite | hang-up; SIGHUP ignored under `nohup` | 10 | CLI `TestInviteHangUp`, `TestInterruptibleHangUp` |
+| invite | hang-up or broken pipe; SIGHUP or SIGPIPE ignored at start stays ignored | 10 | CLI `TestInviteHangUp`, `TestInterruptibleHangUp` |
+| invite | a joined node confirms after the code's expiry: the invite shows as open until the confirmation deadline | — | CLI `TestInviteOpenUntilConfirmDeadline` |
 | invite | expiry, also with a joined node that did not confirm | 13 | CLI `TestInviteCancelAndExpiry`, `TestInviteExpiresWhileUnconfirmed`; integration `TestPairingRefusals` |
 | invite | killed: closed by the next command, removed by the check | — | CLI `TestLeftoverInviteClosed`; integration `TestPairingCleanup` |
 | both | full pairing; no PSK, temporary peer or allow rule left; journal records | 0 | CLI `TestPairFlow`; integration `TestPairing` |

@@ -66,7 +66,7 @@ and the directory is fsync'ed.
 | `/var/lib/meshly/history/meshly-<rev>.json` | 0600 | Copy of each saved configuration revision; the newest 20 are kept. |
 | `/var/lib/meshly/runtime.json` | 0600 | Non-authoritative runtime state: hash of the meshly table as read back after the last apply, and `peer_endpoints` (endpoint hints, see below). |
 | `/run/meshly/lock` | 0600 | Operation lock (`/run/meshly` is 0700). |
-| `/run/meshly/invite.json` | 0600 | Marker of an open `meshly invite`: only its expiry, never the code. Removed when the invite ends; a marker left by a killed invite is removed by the next command that takes the lock. `/run` is emptied at boot. |
+| `/run/meshly/invite.json` | 0600 | Marker of an open `meshly invite`: only until when it is open (the code's expiry, or a joined node's confirmation deadline if later), never the code. Removed when the invite ends; a marker left by a killed invite is removed by the next command that takes the lock. `/run` is emptied at boot. |
 | `/usr/local/bin/meshly` (+ `.prev`) | 0755 | Binary, installed by `install.sh`; `.prev` is kept by `meshly upgrade`. |
 
 Private keys are read only when needed, wiped from memory afterwards, never
@@ -275,7 +275,10 @@ journaled transaction (`invite` and `join`), the joining node switches to its
 own key and confirms the connection through the real tunnel, and the invite
 closes. If the confirmation does not come, both sides undo the join
 (`invite-undo`, `join-undo`). Every way out of `invite` removes its temporary
-state. Details: [pairing-protocol.md](pairing-protocol.md).
+state. While it waits, only the joining node's address, through the tunnel,
+reaches the pairing port: the invite's firewall rule drops everything else,
+loopback included, and the listener answers no other source. Details:
+[pairing-protocol.md](pairing-protocol.md).
 
 ## Upgrade
 
@@ -408,12 +411,12 @@ Each entry: context, decision, consequences.
   address. The code is the only thing the administrator copies, from one
   terminal to the other.
 - **Consequences.** No server, no third party, and nothing new reachable
-  from the internet, even while the invite waits. Pairing needs the same UDP
-  path as the link itself, so a blocked port shows up at `join` (exit 13)
-  rather than later. The code is a bearer secret: whoever uses it first while
-  the invite is open joins, and the channel it is copied over is a trust
-  boundary ([threat model](threat-model.md)). It is long (111 characters for
-  an IPv4 endpoint) because it carries a 32-byte key.
+  from the internet or by local users, even while the invite waits. Pairing
+  needs the same UDP path as the link itself, so a blocked port shows up at
+  `join` (exit 13) rather than later. The code is a bearer secret: whoever
+  uses it first while the invite is open joins, and the channel it is copied
+  over is a trust boundary ([threat model](threat-model.md)). It is long (111
+  characters for an IPv4 endpoint) because it carries a 32-byte key.
 
 ### D8. `start`/`stop`/`restart` and `upgrade` from GitHub releases
 
