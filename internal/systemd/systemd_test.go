@@ -24,8 +24,8 @@ func TestUnitFiles(t *testing.T) {
 	}
 	slices.Sort(names)
 	want := []string{
-		"10-meshly-unmanaged.network", "meshly-check.service", "meshly-check.timer",
-		"meshly.service", "netfilter-persistent-meshly.conf", "networkmanager-meshly.conf", "nftables-meshly.conf",
+		"10-meshly-unmanaged.network", "docker-meshly.conf", "meshly-check.service", "meshly-check.timer",
+		"meshly-watch.service", "meshly.service", "netfilter-persistent-meshly.conf", "networkmanager-meshly.conf", "nftables-meshly.conf",
 	}
 	if !slices.Equal(names, want) {
 		t.Fatalf("unit files = %v, want %v", names, want)
@@ -47,6 +47,7 @@ func TestUnitFiles(t *testing.T) {
 		"NoNewPrivileges=yes",
 		"After=nftables.service ufw.service netfilter-persistent.service network-pre.target",
 		"Also=meshly-check.timer",
+		"Wants=meshly-watch.service",
 	} {
 		if !strings.Contains(svc, line+"\n") {
 			t.Errorf("meshly.service lacks %q", line)
@@ -55,13 +56,43 @@ func TestUnitFiles(t *testing.T) {
 	if !strings.Contains(string(files["meshly-check.service"]), "ExecStart=/usr/local/bin/meshly service check\n") {
 		t.Error("meshly-check.service ExecStart not substituted")
 	}
+	watch := string(files["meshly-watch.service"])
+	for _, line := range []string{
+		"ExecStart=/usr/local/bin/meshly service watch",
+		"PartOf=meshly.service",
+		"Requisite=meshly.service",
+		"After=meshly.service",
+		"Restart=always",
+		"RestartSec=5",
+	} {
+		if !strings.Contains(watch, line+"\n") {
+			t.Errorf("meshly-watch.service lacks %q", line)
+		}
+	}
+	if strings.Contains(watch, "[Install]") {
+		t.Error("meshly-watch.service must have no [Install] section")
+	}
+	hardening := func(unit string) string {
+		_, rest, ok := strings.Cut(unit, "CapabilityBoundingSet=")
+		if !ok {
+			t.Fatal("no hardening block")
+		}
+		block, _, ok := strings.Cut(rest, "SystemCallArchitectures=native")
+		if !ok {
+			t.Fatal("hardening block not terminated")
+		}
+		return block
+	}
+	if hardening(watch) != hardening(string(files["meshly-check.service"])) {
+		t.Error("meshly-watch.service hardening differs from meshly-check.service")
+	}
 	if !strings.Contains(string(files["10-meshly-unmanaged.network"]), "Name=meshly0\n") {
 		t.Error("networkd file does not match the interface")
 	}
 	if !strings.Contains(string(files["networkmanager-meshly.conf"]), "unmanaged-devices=interface-name:meshly0\n") {
 		t.Error("NetworkManager file does not match the interface")
 	}
-	for _, f := range []string{"nftables-meshly.conf", "netfilter-persistent-meshly.conf"} {
+	for _, f := range []string{"nftables-meshly.conf", "netfilter-persistent-meshly.conf", "docker-meshly.conf"} {
 		if !strings.Contains(string(files[f]), "\nExecStartPost=-/usr/bin/systemctl --no-block try-reload-or-restart meshly.service\n") {
 			t.Errorf("%s: drop-in content unexpected", f)
 		}
@@ -132,6 +163,9 @@ func (m *Manager) nftDropIn() string {
 func (m *Manager) netfilterDropIn() string {
 	return filepath.Join(m.UnitDir, "netfilter-persistent.service.d", "50-meshly.conf")
 }
+func (m *Manager) dockerDropIn() string {
+	return filepath.Join(m.UnitDir, "docker.service.d", "50-meshly.conf")
+}
 func (m *Manager) networkdFile() string {
 	return filepath.Join(m.Root, "etc/systemd/network/10-meshly-unmanaged.network")
 }
@@ -156,6 +190,8 @@ func TestInstall(t *testing.T) {
 		"meshly-check.timer":               filepath.Join(m.UnitDir, TimerUnit),
 		"nftables-meshly.conf":             m.nftDropIn(),
 		"netfilter-persistent-meshly.conf": m.netfilterDropIn(),
+		"meshly-watch.service":             filepath.Join(m.UnitDir, WatchUnit),
+		"docker-meshly.conf":               m.dockerDropIn(),
 	} {
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -332,6 +368,7 @@ func TestUninstall(t *testing.T) {
 	}
 	for _, p := range []string{
 		filepath.Join(m.UnitDir, Unit), filepath.Join(m.UnitDir, CheckUnit), filepath.Join(m.UnitDir, TimerUnit),
+		filepath.Join(m.UnitDir, WatchUnit), m.dockerDropIn(), filepath.Join(m.UnitDir, "docker.service.d"),
 		m.nftDropIn(), filepath.Join(m.UnitDir, "nftables.service.d"), m.networkdFile(), m.nmFile(),
 		m.netfilterDropIn(), filepath.Join(m.UnitDir, "netfilter-persistent.service.d"),
 	} {
@@ -383,7 +420,7 @@ func TestControlArgv(t *testing.T) {
 		{"Enable", (*Manager).Enable, []string{"enable", "--quiet", "meshly.service", "meshly-check.timer"}},
 		{"Disable", (*Manager).Disable, []string{"disable", "--quiet", "meshly.service", "meshly-check.timer"}},
 		{"Start", (*Manager).Start, []string{"start", "meshly.service", "meshly-check.timer"}},
-		{"Stop", (*Manager).Stop, []string{"stop", "meshly-check.timer", "meshly.service"}},
+		{"Stop", (*Manager).Stop, []string{"stop", "meshly-check.timer", "meshly-watch.service", "meshly.service"}},
 		{"Restart", (*Manager).Restart, []string{"restart", "meshly.service"}},
 	}
 	for _, tt := range tests {

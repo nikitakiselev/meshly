@@ -1,0 +1,38 @@
+# Managed by meshly. Watches netlink link and nftables events (Docker
+# networks come and go) and runs the same check as meshly-check.service.
+# Starts and stops with meshly.service.
+[Unit]
+Description=Meshly watch for Docker networks
+Documentation=https://github.com/nikitakiselev/meshly
+ConditionPathExists=/etc/meshly/meshly.json
+PartOf=meshly.service
+Requisite=meshly.service
+After=meshly.service
+
+[Service]
+Type=simple
+ExecStart=@EXE@ service watch
+# always, not on-failure: the watcher exits 0 on SIGHUP/SIGPIPE. systemd never
+# restarts a unit after an explicit stop job (systemctl stop, or the stop
+# propagated from meshly.service), so this only covers unintended exits.
+Restart=always
+RestartSec=5
+UMask=0077
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=-/etc/meshly -/var/lib/meshly -/run/meshly
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native

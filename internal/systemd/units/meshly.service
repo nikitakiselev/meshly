@@ -15,6 +15,9 @@ Before=network-online.target
 PartOf=nftables.service
 ReloadPropagatedFrom=nftables.service
 ConditionPathExists=/etc/meshly/meshly.json
+# Pulled in on every start and restart (also after `meshly upgrade`), no
+# enable needed.
+Wants=meshly-watch.service
 
 [Service]
 Type=oneshot

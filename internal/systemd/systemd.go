@@ -27,6 +27,7 @@ const (
 	Unit      = "meshly.service"
 	CheckUnit = "meshly-check.service"
 	TimerUnit = "meshly-check.timer"
+	WatchUnit = "meshly-watch.service"
 	systemctl = "/usr/bin/systemctl"
 )
 
@@ -98,8 +99,8 @@ func Executable() (string, error) {
 	return filepath.EvalSymlinks(exe)
 }
 
-// Install writes the unit files and the drop-ins for nftables.service and
-// netfilter-persistent.service (only when content differs) and reloads
+// Install writes the unit files and the drop-ins for nftables.service,
+// netfilter-persistent.service and docker.service (only when content differs) and reloads
 // systemd. It also tells systemd-networkd and NetworkManager, when
 // installed, to leave the interface alone. Returns whether anything
 // changed.
@@ -112,12 +113,14 @@ func (m *Manager) Install(ctx context.Context, exe, iface string) (bool, error) 
 		"meshly.service":       filepath.Join(m.UnitDir, Unit),
 		"meshly-check.service": filepath.Join(m.UnitDir, CheckUnit),
 		"meshly-check.timer":   filepath.Join(m.UnitDir, TimerUnit),
+		"meshly-watch.service": filepath.Join(m.UnitDir, WatchUnit),
 	}
 	if dirExists(filepath.Join(m.Root, "etc/systemd/network")) {
 		targets["10-meshly-unmanaged.network"] = filepath.Join(m.Root, "etc/systemd/network/10-meshly-unmanaged.network")
 	}
 	targets["nftables-meshly.conf"] = filepath.Join(m.UnitDir, "nftables.service.d", "50-meshly.conf")
 	targets["netfilter-persistent-meshly.conf"] = filepath.Join(m.UnitDir, "netfilter-persistent.service.d", "50-meshly.conf")
+	targets["docker-meshly.conf"] = filepath.Join(m.UnitDir, "docker.service.d", "50-meshly.conf")
 	if dirExists(filepath.Join(m.Root, "etc/NetworkManager/conf.d")) {
 		targets["networkmanager-meshly.conf"] = filepath.Join(m.Root, "etc/NetworkManager/conf.d/meshly.conf")
 	}
@@ -151,10 +154,12 @@ func (m *Manager) Uninstall(ctx context.Context) error {
 	var errs []error
 	for _, p := range []string{
 		filepath.Join(m.UnitDir, Unit), filepath.Join(m.UnitDir, CheckUnit), filepath.Join(m.UnitDir, TimerUnit),
+		filepath.Join(m.UnitDir, WatchUnit),
 		filepath.Join(m.Root, "etc/systemd/network/10-meshly-unmanaged.network"),
 		filepath.Join(m.Root, "etc/NetworkManager/conf.d/meshly.conf"),
 		filepath.Join(m.UnitDir, "nftables.service.d", "50-meshly.conf"),
 		filepath.Join(m.UnitDir, "netfilter-persistent.service.d", "50-meshly.conf"),
+		filepath.Join(m.UnitDir, "docker.service.d", "50-meshly.conf"),
 	} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, err)
@@ -163,6 +168,7 @@ func (m *Manager) Uninstall(ctx context.Context) error {
 	// Only if empty.
 	_ = os.Remove(filepath.Join(m.UnitDir, "nftables.service.d"))
 	_ = os.Remove(filepath.Join(m.UnitDir, "netfilter-persistent.service.d"))
+	_ = os.Remove(filepath.Join(m.UnitDir, "docker.service.d"))
 	if m.Available {
 		if _, err := m.Run(ctx, "daemon-reload"); err != nil {
 			errs = append(errs, err)
@@ -200,9 +206,10 @@ func (m *Manager) Start(ctx context.Context) error {
 	return err
 }
 
-// Stop stops the service (its ExecStop tears the link down) and timer.
+// Stop stops the service (its ExecStop tears the link down), the watch
+// unit and the timer.
 func (m *Manager) Stop(ctx context.Context) error {
-	_, err := m.Run(ctx, "stop", TimerUnit, Unit)
+	_, err := m.Run(ctx, "stop", TimerUnit, WatchUnit, Unit)
 	return err
 }
 
