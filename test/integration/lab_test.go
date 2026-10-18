@@ -10,6 +10,7 @@
 //	make integration                        # all tests
 //	MESHLY_IT_DISTROS=deb12 make integration
 //	MESHLY_IT_KEEP=1 ...                    # keep containers of failed tests
+//	MESHLY_IT_CAPTURE=...                   # see TestCaptureDockerRuleset
 //
 // Topology (newLab):
 //
@@ -94,7 +95,11 @@ func setup() error {
 	if err := buildTool("fileserver"); err != nil {
 		return err
 	}
-	for _, d := range append([]string{"systemd-deb12"}, distros...) {
+	builds := append([]string{"systemd-deb12"}, distros...)
+	for _, d := range distros {
+		builds = append(builds, "docker-"+d)
+	}
+	for _, d := range builds {
 		if err := buildImage(here, d); err != nil {
 			return err
 		}
@@ -143,18 +148,27 @@ func buildTool(name string) error {
 	return nil
 }
 
+// buildImage builds image d: a distro (node.Dockerfile), systemd-<distro>
+// (systemd.Dockerfile) or docker-<distro> (systemd.Dockerfile with Docker
+// CE). deb13 is used only to capture fixtures (TestCaptureDockerRuleset).
 func buildImage(here, d string) error {
-	base := map[string]string{"deb12": "debian:12", "u2404": "ubuntu:24.04"}
+	base := map[string]string{"deb12": "debian:12", "u2404": "ubuntu:24.04", "deb13": "debian:13"}
 	file, flavor := "node.Dockerfile", d
-	if strings.HasPrefix(d, "systemd-") {
-		file, flavor = "systemd.Dockerfile", strings.TrimPrefix(d, "systemd-")
+	args := []string{"build", "-q"}
+	if s, ok := strings.CutPrefix(d, "systemd-"); ok {
+		file, flavor = "systemd.Dockerfile", s
+	}
+	if s, ok := strings.CutPrefix(d, "docker-"); ok {
+		file, flavor = "systemd.Dockerfile", s
+		args = append(args, "--build-arg", "DOCKER=1")
 	}
 	if base[flavor] == "" {
 		return fmt.Errorf("unknown distro %q", d)
 	}
 	tag := "meshly-it-" + d
 	images[d] = tag
-	cmd := exec.Command("docker", "build", "-q", "-t", tag, "--build-arg", "BASE="+base[flavor], "-f", filepath.Join(here, "images", file), filepath.Join(here, "images"))
+	args = append(args, "-t", tag, "--build-arg", "BASE="+base[flavor], "-f", filepath.Join(here, "images", file), filepath.Join(here, "images"))
+	cmd := exec.Command("docker", args...)
 	if b, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("docker build %s: %v\n%s", tag, err, b)
 	}
@@ -262,23 +276,25 @@ func randHex(n int) string {
 
 // newLab creates the NAT topology (wan 198.51.100.0/24, lan 192.168.77.0/24).
 // Labs run one at a time; leftovers from an aborted run are removed by label.
-func newLab(t *testing.T, distro string) *Lab { return newLabWith(t, distro, false) }
+func newLab(t *testing.T, distro string) *Lab { return newLabWith(t, distro, "") }
 
 // newSystemdLab runs vps and home with systemd as PID 1.
-func newSystemdLab(t *testing.T) *Lab { return newLabWith(t, distros[0], true) }
+func newSystemdLab(t *testing.T) *Lab { return newLabWith(t, distros[0], images["systemd-deb12"]) }
 
-func newLabWith(t *testing.T, distro string, withSystemd bool) *Lab {
+// newLabWith runs vps and home on serverImage, a systemd image ("" for
+// the distro's plain image).
+func newLabWith(t *testing.T, distro, serverImage string) *Lab {
 	t.Helper()
 	l := &Lab{t: t, id: randHex(3), image: images[distro], Distro: distro}
 	t.Cleanup(l.destroy)
 	wan := l.network("wan", "198.51.100.0/24")
 	lan := l.network("lan", "192.168.77.0/24")
 	server := func(name, network, ip, gw string) {
-		if !withSystemd {
+		if serverImage == "" {
 			l.node(name, network, ip, gw)
 			return
 		}
-		n := l.nodeImage(name, network, ip, "", images["systemd-deb12"], nil)
+		n := l.nodeImage(name, network, ip, "", serverImage, nil)
 		n.WaitBoot()
 		if gw != "" {
 			n.MustSh("echo " + gw + " > /etc/it-gateway && systemctl start it-route.service")
@@ -495,6 +511,18 @@ func (n *Node) Probe(proto, addr string, port int) bool {
 
 func (n *Node) Ping(addr string) bool {
 	return n.Sh("ping -c1 -W2 "+addr).Code == 0
+}
+
+// WaitFor polls cond until it holds and fails the test after timeout.
+func (n *Node) WaitFor(desc string, timeout time.Duration, cond func() bool) {
+	n.lab.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			n.lab.t.Fatalf("%s: %s: not within %s", n.Name, desc, timeout)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // ---------------------------------------------------------------- meshly helpers

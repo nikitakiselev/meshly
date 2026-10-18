@@ -417,7 +417,7 @@ func (an *analyzer) rule(r Rule, family, hook string) (_ classes, ban *banMatch)
 		case hasKey(e, "drop"), hasKey(e, "reject"), hasKey(e, "queue"):
 			effect = classes{true, true}
 		case hasKey(e, "vmap"):
-			effect = classes{true, true}
+			effect = an.vmap(e, r.Family, r.Table, hook)
 		case hasKey(e, "jump"), hasKey(e, "goto"):
 			effect = an.target(e, r.Family, r.Table, hook)
 		case hasKey(e, "xt"):
@@ -472,6 +472,56 @@ func (an *analyzer) target(e json.RawMessage, family, table, hook string) classe
 		out.B = out.B || c.B
 	}
 	an.memo[key] = out
+	return out
+}
+
+// vmap returns which classes the verdicts of a verdict map may drop. A
+// jump or goto counts as in a rule of its own; accept, return and
+// continue drop nothing; anything else (drop, a map not in the ruleset)
+// may drop all.
+func (an *analyzer) vmap(e json.RawMessage, family, table, hook string) classes {
+	all := classes{true, true}
+	var v struct {
+		Vmap struct {
+			Data json.RawMessage `json:"data"`
+		} `json:"vmap"`
+	}
+	if json.Unmarshal(e, &v) != nil {
+		return all
+	}
+	var name string
+	var anon struct {
+		Set []json.RawMessage `json:"set"`
+	}
+	var elems []json.RawMessage
+	switch {
+	case json.Unmarshal(v.Vmap.Data, &name) == nil && strings.HasPrefix(name, "@"):
+		i := slices.IndexFunc(an.rs.Sets, func(s Set) bool { return s.Family == family && s.Table == table && s.Name == name[1:] })
+		if i < 0 {
+			return all
+		}
+		elems = an.rs.Sets[i].Elem
+	case json.Unmarshal(v.Vmap.Data, &anon) == nil && anon.Set != nil:
+		elems = anon.Set
+	default:
+		return all
+	}
+	var out classes
+	for _, el := range elems {
+		var kv []json.RawMessage // [key, verdict]
+		if json.Unmarshal(el, &kv) != nil || len(kv) != 2 {
+			return all
+		}
+		var c classes
+		switch {
+		case hasKey(kv[1], "jump"), hasKey(kv[1], "goto"):
+			c = an.target(kv[1], family, table, hook)
+		case hasKey(kv[1], "accept"), hasKey(kv[1], "return"), hasKey(kv[1], "continue"):
+		default:
+			c = all
+		}
+		out.A, out.B = out.A || c.A, out.B || c.B
+	}
 	return out
 }
 

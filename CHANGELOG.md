@@ -7,6 +7,13 @@ on-disk formats.
 
 ## [Unreleased]
 
+### Fixed
+
+- A verdict map in a foreign nftables chain (`iifname vmap @jumps`, `vmap { … : jump … }`) no longer counts as a rule
+  that may drop meshly traffic by itself: meshly follows its jumps as it does a rule's own and finds a drop only
+  where there is one. With Docker's nftables firewall backend, `init` stopped with exit 3 over Docker's NAT chains,
+  with a fix for `/etc/nftables.conf` that did not apply.
+
 ## [0.0.4] - 2026-10-18
 
 ### Added

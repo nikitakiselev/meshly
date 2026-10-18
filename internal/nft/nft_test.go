@@ -16,7 +16,7 @@ import (
 var nftVersions = []string{"nft-1.0.6", "nft-1.0.9"}
 
 // allVersions adds nft-1.1.3 (Debian 13, iptables 1.8.11), captured only
-// with UFW and fail2ban (newerCaptures).
+// with UFW and fail2ban (newerCaptures) and Docker CE (TestAnalyzeDockerCE).
 var allVersions = []string{"nft-1.0.6", "nft-1.0.9", "nft-1.1.3"}
 
 var newerCaptures = map[string]bool{"ufw": true, "ufw-integrated": true, "fail2ban": true, "fail2ban-peer": true}
@@ -908,5 +908,133 @@ func TestAnalyzeForwardOtherIptablesTable(t *testing.T) {
 	}
 	if len(Analyze(rs, testContext()).Chains) != 0 {
 		t.Fatal("forward hook analysed without Docker networks")
+	}
+}
+
+var dockerBridgeName = regexp.MustCompile(`"(docker0|br-[0-9a-f]{12})"`)
+
+// rulesetBridges returns the Docker bridges named in the rules of rs.
+func rulesetBridges(rs *Ruleset) []string {
+	var out []string
+	for _, r := range rs.Rules {
+		for _, e := range r.Expr {
+			for _, m := range dockerBridgeName.FindAllSubmatch(e, -1) {
+				if b := string(m[1]); !slices.Contains(out, b) {
+					out = append(out, b)
+				}
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// The rulesets of a real Docker CE 29.9.1 with a network besides the
+// default one and a published port, captured by TestCaptureDockerRuleset
+// (test/integration): docker-ce.json with iptables-nft on nft 1.0.6
+// (Debian 12, iptables 1.8.9), 1.0.9 (Ubuntu 24.04, iptables 1.8.10) and
+// 1.1.3 (Debian 13, iptables 1.8.11); on 1.0.9 also docker-ce-ufw.json
+// with UFW enabled and docker-ce-nftables.json with Docker's nftables
+// firewall backend. With iptables, meshly integrates Docker's FORWARD
+// itself and nothing else needs the administrator; with the nftables
+// backend, only Docker's forward chain is reported (a warning).
+func TestAnalyzeDockerCE(t *testing.T) {
+	files, err := filepath.Glob(filepath.Join("testdata", "nft-*", "docker-ce*.json"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no Docker CE captures: %v", err)
+	}
+	for _, p := range files {
+		v, name := filepath.Base(filepath.Dir(p)), strings.TrimSuffix(filepath.Base(p), ".json")
+		t.Run(v+"/"+name, func(t *testing.T) {
+			rs := loadFixture(t, v, name)
+			bridges := rulesetBridges(rs)
+			if len(bridges) != 2 || bridges[1] != "docker0" {
+				t.Fatalf("bridges %v, want docker0 and the bridge of it-net", bridges)
+			}
+			a := Analyze(rs, dockerContext(bridges...))
+			if len(a.Unsupported()) != 0 || len(a.NeedsIntegration()) != 0 {
+				t.Fatalf("unsupported %+v, needs integration %+v", a.Unsupported(), a.NeedsIntegration())
+			}
+			if name == "docker-ce-nftables" {
+				f := a.Forward()
+				if len(f) != 1 || f[0].Family != "ip" || f[0].Table != "docker-bridges" || f[0].Hook != "forward" {
+					t.Fatalf("Forward() = %+v, want Docker's ip docker-bridges forward chain", f)
+				}
+				return
+			}
+			if len(a.Forward()) != 0 {
+				t.Fatalf("forward %+v", a.Forward())
+			}
+			forward, raw := false, 0
+			for _, c := range a.Chains {
+				switch {
+				case c.Family == "ip" && c.Table == "filter" && c.Chain == "FORWARD":
+					forward = true
+					if !c.ByMeshly {
+						t.Fatalf("ip filter FORWARD not integrated by meshly: %+v", c)
+					}
+				case c.Table == "raw":
+					raw++
+					if c.Status != "compatible" {
+						t.Fatalf("%s raw %s: %+v", c.Family, c.Chain, c)
+					}
+				}
+			}
+			// Docker 28 and later drop direct access to containers in
+			// raw PREROUTING.
+			if !forward || raw == 0 {
+				t.Fatalf("ip filter FORWARD found %v, %d raw chains: %+v", forward, raw, a.Chains)
+			}
+			i := slices.IndexFunc(rs.IptablesChains(model.DefaultFirewallMark, true), func(c IptablesChain) bool {
+				return c.Family == "ip" && c.Chain == "FORWARD" && c.Needed
+			})
+			if i < 0 {
+				t.Fatalf("ip filter FORWARD not needed: %+v", rs.IptablesChains(model.DefaultFirewallMark, true))
+			}
+		})
+	}
+}
+
+// A verdict map may drop only through its verdicts: jumps are followed
+// like a rule's own, accept and return drop nothing (Docker's nftables
+// backend jumps to the chains of each network through named maps).
+func TestAnalyzeVerdictMaps(t *testing.T) {
+	ruleset := func(m, vmap string) *Ruleset {
+		t.Helper()
+		js := `{"nftables":[{"metainfo":{"json_schema_version":1}},{"table":{"family":"ip","name":"t","handle":1}},` +
+			`{"map":{"family":"ip","name":"jumps","table":"t","type":"ifname","handle":2,"map":"verdict","elem":[` + m + `]}},` +
+			`{"chain":{"family":"ip","table":"t","name":"post","handle":3,"type":"nat","hook":"postrouting","prio":100,"policy":"accept"}},` +
+			`{"chain":{"family":"ip","table":"t","name":"masq","handle":4}},` +
+			`{"chain":{"family":"ip","table":"t","name":"block","handle":5}},` +
+			`{"rule":{"family":"ip","table":"t","chain":"post","handle":6,"expr":[{"vmap":{"key":{"meta":{"key":"iifname"}},"data":` + vmap + `}}]}},` +
+			`{"rule":{"family":"ip","table":"t","chain":"masq","handle":7,"expr":[{"masquerade":null}]}},` +
+			`{"rule":{"family":"ip","table":"t","chain":"block","handle":8,"expr":[{"drop":null}]}}]}`
+		rs, err := ParseRuleset([]byte(js))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rs
+	}
+	const (
+		masq   = `{"jump":{"target":"masq"}}`
+		block  = `{"goto":{"target":"block"}}`
+		accept = `{"accept":null}`
+	)
+	pair := func(k, v string) string { return `["` + k + `",` + v + `]` }
+	cases := []struct {
+		name, m, vmap, status string
+	}{
+		{"named, harmless jumps", pair("docker0", masq) + "," + pair("eth0", accept), `"@jumps"`, "compatible"},
+		{"named, empty", "", `"@jumps"`, "compatible"},
+		{"named, jump to a drop", pair("docker0", masq) + "," + pair("eth0", block), `"@jumps"`, "needs-integration"},
+		{"named, drop", pair("eth0", `{"drop":null}`), `"@jumps"`, "needs-integration"},
+		{"unknown map", "", `"@other"`, "needs-integration"},
+		{"anonymous, harmless", "", `{"set":[` + pair("docker0", masq) + "," + pair("lo", `{"return":null}`) + `]}`, "compatible"},
+		{"anonymous, jump to a drop", "", `{"set":[` + pair("eth0", block) + `]}`, "needs-integration"},
+	}
+	for _, c := range cases {
+		if got := onlyChain(t, Analyze(ruleset(c.m, c.vmap), testContext())); got.Status != c.status {
+			t.Errorf("%s: %+v, want %s", c.name, got, c.status)
+		}
 	}
 }
