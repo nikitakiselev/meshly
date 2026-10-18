@@ -4,8 +4,10 @@ package integration
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -53,6 +55,19 @@ func (n *Node) ServeToken(name, proto string, hostPort, port int) {
 // iptables FORWARD chain.
 func (n *Node) forwardFirst() bool { return n.iptablesFirst("iptables -S FORWARD") }
 
+// counted returns the packets counted by the rule with comment in chain of
+// table inet meshly.
+func (n *Node) counted(chain, comment string) int {
+	n.lab.t.Helper()
+	out := n.MustSh("nft list chain inet meshly " + chain)
+	m := regexp.MustCompile(`counter packets (\d+) bytes \d+ [^\n]*comment "` + regexp.QuoteMeta(comment) + `"`).FindStringSubmatch(out)
+	if m == nil {
+		n.lab.t.Fatalf("%s: no counter %q in chain %s:\n%s", n.Name, comment, chain, out)
+	}
+	c, _ := strconv.Atoi(m[1])
+	return c
+}
+
 // A port published by Docker on the vps: closed until allow, then open to
 // home and to nothing else; deny closes it, an established flow too.
 func TestDockerPublishedPort(t *testing.T) {
@@ -90,27 +105,49 @@ func TestDockerPublishedPort(t *testing.T) {
 
 		// home routes the container's address into the tunnel, past its own
 		// meshly table (with the watch and the check timer stopped, which
-		// would repair it): vps does not let the packets through.
+		// would repair it). Docker's own guard comes first on vps: raw
+		// PREROUTING drops packets for a container that arrive on another
+		// interface. Without it, meshly's from_vpn is what drops them.
 		l.Run("container-address", func(t *testing.T) {
 			pub := strings.TrimSpace(vps.MustSh("wg show meshly0 public-key"))
+			var removed []string
+			t.Cleanup(func() {
+				for _, r := range removed {
+					if res := vps.Sh("iptables -t raw " + r); res.Code != 0 {
+						t.Errorf("vps: restore Docker's rule %s: %s", r, res)
+					}
+				}
+			})
+			if out := strings.TrimSpace(vps.MustSh("iptables -t raw -S PREROUTING | grep -F -- '-d " + web + "/32 ' || true")); out != "" {
+				for _, r := range strings.Split(out, "\n") {
+					vps.MustSh("iptables -t raw " + strings.Replace(r, "-A ", "-D ", 1))
+					removed = append(removed, r)
+				}
+			}
+			repair := sync.OnceFunc(func() {
+				for _, c := range []string{"ip route del " + web + "/32 dev meshly0 2>/dev/null || true", "meshly service check", "systemctl start meshly-watch.service meshly-check.timer"} {
+					if r := home.Sh(c); r.Code != 0 {
+						t.Errorf("home: repair: %s: %s", c, r)
+					}
+				}
+			})
+			t.Cleanup(repair)
 			home.MustSh("systemctl stop meshly-watch.service meshly-check.timer && nft delete table inet meshly")
 			home.MustSh(fmt.Sprintf("wg set meshly0 peer %s allowed-ips 10.100.0.1/32,%s/32 && ip route replace %s/32 dev meshly0", pub, web, web))
-			rx := func() int {
-				n, _ := strconv.Atoi(strings.TrimSpace(vps.MustSh("cat /sys/class/net/meshly0/statistics/rx_packets")))
-				return n
-			}
-			before := rx()
+			before := vps.counted("from_vpn", "only the local vpn address")
 			if home.Connects(web, 8080) || home.Connects(web, 8081) {
 				t.Fatal("container address reachable through the VPN")
 			}
-			if rx() <= before {
-				t.Fatal("the packets to the container address did not reach vps")
+			if after := vps.counted("from_vpn", "only the local vpn address"); after <= before {
+				t.Fatalf("meshly did not drop the packets to the container address: counter %d -> %d", before, after)
 			}
-			home.MustSh(fmt.Sprintf("ip route del %s/32 dev meshly0", web))
-			home.MustMeshly("service", "check")
-			home.MustSh("systemctl start meshly-watch.service meshly-check.timer")
+
+			repair()
 			if out := strings.TrimSpace(home.MustSh("wg show meshly0 allowed-ips")); out != pub+"\t10.100.0.1/32" {
 				t.Fatalf("allowed-ips not repaired: %q", out)
+			}
+			if out := home.MustSh("ip route show " + web + "/32"); strings.TrimSpace(out) != "" {
+				t.Fatalf("route to the container left on home: %s", out)
 			}
 			if !home.FetchOK(url) {
 				t.Fatal("published port unreachable after home was repaired")
@@ -383,8 +420,8 @@ func TestDockerUFW(t *testing.T) {
 	})
 }
 
-// Docker's nftables firewall backend: the tunnel between the hosts works;
-// a published port either works or doctor says why not.
+// Docker's nftables firewall backend: meshly works with it like with its
+// iptables rules, and doctor only informs about Docker's chains.
 func TestDockerNftablesBackend(t *testing.T) {
 	forDistros(t, func(t *testing.T, distro string) {
 		l := newDockerLab(t, distro)
@@ -396,6 +433,7 @@ func TestDockerNftablesBackend(t *testing.T) {
 			t.Skipf("%s does not start with its nftables firewall backend: %s", version, vps.Sh("journalctl -u docker --no-pager | tail -n 3").Out)
 		}
 		vps.DockerStart()
+		vps.MustDocker("network", "create", "it-net")
 		vps, home := l.Pair()
 		vps.Listen("tcp", 22)
 		vps.MustMeshly("allow", "22/tcp", "from", "home")
@@ -403,20 +441,25 @@ func TestDockerNftablesBackend(t *testing.T) {
 			t.Fatal("allowed port of the host unreachable with Docker's nftables backend")
 		}
 		vps.ServeHTTP("web", "9104:8080")
+		if home.Connects("10.100.0.1", 9104) {
+			t.Fatalf("%s, nftables backend: published port reachable without allow", version)
+		}
 		vps.MustMeshly("allow", "9104/tcp", "from", "home")
-		reachable := home.FetchOK("http://10.100.0.1:9104/")
-		doc := vps.Meshly("doctor")
-		warned := strings.Contains(doc.Out, "firewall-forward") && strings.Contains(doc.Out, "firewall-backend")
-		var findings []string
-		for _, line := range strings.Split(doc.Out, "\n") {
-			if strings.Contains(strings.ToLower(line), "docker") {
-				findings = append(findings, line)
+		if !home.FetchOK("http://10.100.0.1:9104/") {
+			t.Fatalf("%s, nftables backend: published port unreachable after allow", version)
+		}
+		home.ServeHTTPHost(8080)
+		home.MustMeshly("allow", "8080/tcp", "from", "vps")
+		for _, network := range []string{"", "it-net"} {
+			if r := vps.FetchFromContainer(network, "http://10.100.0.2:8080/"); strings.TrimSpace(r.Out) != "ok" {
+				t.Fatalf("%s, nftables backend: container on network %q cannot reach an allowed port of home: %s", version, network, r)
 			}
 		}
-		t.Logf("%s, nftables backend: published port reachable %v, doctor warns %v (exit %d):\n%s", version, reachable, warned, doc.Code, strings.Join(findings, "\n"))
-		if !reachable && !warned {
-			t.Fatal("published port unreachable and doctor does not name Docker's firewall backend")
+		doc := vps.Meshly("doctor")
+		if !strings.Contains(doc.Out, "· firewall-forward ") || strings.Contains(doc.Out, "! firewall-forward ") {
+			t.Fatalf("doctor does not report Docker's chains as information:\n%s", doc.Out)
 		}
+		t.Logf("%s, nftables backend: published ports and container connections work", version)
 	})
 }
 
