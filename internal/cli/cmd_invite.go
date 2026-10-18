@@ -102,12 +102,13 @@ func (a *App) runInvite(ctx context.Context, cfg *model.Config, code *pairing.Co
 	a.audit("invite", "", "opened, expires "+code.ExpiresAt.Format(time.RFC3339))
 	opened = true
 	// The VPN address only: from outside, the port is behind WireGuard, and
-	// the firewall lets in just the joining node's address.
+	// the firewall lets in just the joining node's address through the
+	// tunnel, not even local processes. The server checks the source too.
 	l, err := a.Pairing.Listen(netip.AddrPortFrom(inviter, pairing.Port))
 	if err != nil {
 		return nil, fmt.Errorf("cannot listen for the joining node: %w", err)
 	}
-	srv = servePairing(l, a.pairTimeouts().Exchange)
+	srv = servePairing(l, joiner, a.pairTimeouts().Exchange)
 	expired := a.after(code.ExpiresAt.Sub(a.Now()))
 
 	fmt.Fprintf(a.Stderr, "Waiting for a node to join network %q until %s (%s). Ctrl+C cancels.\n", cfg.Network.Name, clockTime(code.ExpiresAt), humanDuration(ttl))
@@ -369,9 +370,11 @@ type inbound struct {
 
 // pairServer accepts pairing connections for the whole invite and reads one
 // request from each in its own goroutine, so that a silent client never
-// holds up the invite.
+// holds up the invite. Only connections from the joining node's address are
+// read; any other is closed unanswered.
 type pairServer struct {
 	l        net.Listener
+	from     netip.Addr // the joining node's VPN address
 	exchange time.Duration
 	requests chan inbound
 	done     chan struct{}
@@ -380,8 +383,8 @@ type pairServer struct {
 	conns    map[net.Conn]struct{} // nil once closed
 }
 
-func servePairing(l net.Listener, exchange time.Duration) *pairServer {
-	s := &pairServer{l: l, exchange: exchange, requests: make(chan inbound), done: make(chan struct{}), conns: map[net.Conn]struct{}{}}
+func servePairing(l net.Listener, from netip.Addr, exchange time.Duration) *pairServer {
+	s := &pairServer{l: l, from: from, exchange: exchange, requests: make(chan inbound), done: make(chan struct{}), conns: map[net.Conn]struct{}{}}
 	s.wg.Add(1)
 	go s.accept()
 	return s
@@ -401,6 +404,10 @@ func (s *pairServer) accept() {
 			case <-time.After(100 * time.Millisecond):
 				continue
 			}
+		}
+		if remoteAddr(c) != s.from {
+			_ = c.Close()
+			continue
 		}
 		s.mu.Lock()
 		open := s.conns != nil
@@ -425,6 +432,15 @@ func (s *pairServer) read(c net.Conn) {
 	case <-s.done:
 		s.drop(c)
 	}
+}
+
+// remoteAddr returns the source address of c, or the zero Addr. Kernel
+// TCP connections report a *net.TCPAddr.
+func remoteAddr(c net.Conn) netip.Addr {
+	if a, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+		return a.AddrPort().Addr().Unmap()
+	}
+	return netip.Addr{}
 }
 
 // drop closes a connection the invite is done with.

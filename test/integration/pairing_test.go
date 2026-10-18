@@ -4,6 +4,7 @@ package integration
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"regexp"
 	"slices"
@@ -325,14 +326,19 @@ func drops(t *testing.T, n *Node, chain, comment string) int {
 }
 
 // The pairing port is closed to the processes of the inviting node, root's
-// included: loopback reaches the VPN address, so the firewall lets in only
-// the joining node's address through the tunnel.
+// included. Loopback reaches the VPN address, so two layers keep them out:
+// the firewall lets in only the joining node's address through the tunnel,
+// and the listener answers only that address.
 func TestPairingClosedToLocalUsers(t *testing.T) {
 	l := newLab(t, distros[0])
 	vps := l.Node("vps")
 	vps.MustMeshly("init", "homelab", "--name", "vps", "--endpoint", "198.51.100.10:51820")
 	before := vps.KernelSnapshot()
-	vps.Invite()
+	code := vps.Invite()
+	c, err := pairing.ParseCode(code, time.Now())
+	must(t, err)
+	sec, err := c.Secrets()
+	must(t, err)
 	connect := func(user string) bool {
 		return vps.Sh("runuser -u "+user+" -- /opt/it/fileserver -connect -tcp-dial 10.100.0.1:51820 -timeout 2s").Code == 0
 	}
@@ -352,6 +358,23 @@ func TestPairingClosedToLocalUsers(t *testing.T) {
 	vps.MustSh(`nft delete rule inet meshly guard_in handle $(nft -a list chain inet meshly guard_in | awk '/reachable only from its peer/{print $NF}')`)
 	if !connect("nobody") {
 		t.Fatal("control: without the invite's rule the pairing port is not reachable over loopback either")
+	}
+	// The listener itself serves only the joining node's address: a request
+	// over loopback, without the code, gets no answer, and the invite waits
+	// on with nothing but its temporary peer.
+	key := strings.TrimSpace(vps.MustSh("wg genkey | wg pubkey"))
+	hello := fmt.Sprintf(`{"type":"hello","hello":{"protocol":%q,"name":"home","wg_public_key":%q}}`, pairing.Protocol, key)
+	for _, user := range []string{"nobody", "root"} {
+		r := vps.Sh("echo '" + hello + "' | runuser -u " + user + " -- timeout 10 nc -q 2 10.100.0.1 51820")
+		if out := strings.TrimSpace(r.Out); out != "" {
+			t.Fatalf("%s got an answer from the pairing port without the code: %s", user, out)
+		}
+	}
+	if peers := strings.TrimSpace(vps.MustSh("wg show meshly0 peers")); peers != sec.TempPublicKey() {
+		t.Fatalf("vps peers %q, want only the invite's temporary peer", peers)
+	}
+	if inv := vps.Sh("cat /root/invite.err").Out; strings.Contains(inv, "joined") || strings.Contains(inv, "did not confirm") {
+		t.Fatalf("the invite took a request from a local process:\n%s", inv)
 	}
 	interrupt(t, vps, "INT")
 	if c, inv := vps.InviteExit(30 * time.Second); c != 10 {

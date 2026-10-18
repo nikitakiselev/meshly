@@ -71,7 +71,7 @@ func newTestNode(t *testing.T, start time.Time) *testNode {
 		Stdin: strings.NewReader(""), Paths: paths, Now: clock,
 		Journal: journal.Open(paths.JournalFile(), clock), Sys: sys, Euid: 0, LockTimeout: time.Second, Arch: "amd64",
 		// A network of its own until a test connects two nodes.
-		Pairing:  pairing.NewMemory().View(nil),
+		Pairing:  pairing.NewMemory().View(netip.Addr{}, nil),
 		Hostname: func() (string, error) { return "testhost", nil },
 	}
 	n.app.Engine = &engine.Engine{Links: n.k.LinkOps(), WG: n.k.WGOps(), FW: n.k.NFT(), Paths: paths, LoadKeys: paths.LoadKeys, Now: clock,
@@ -137,15 +137,23 @@ func (n *testNode) secrets() []string {
 
 var start = time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
 
+// The VPN addresses of vps and home in the default network: the source of
+// their connections through the tunnel.
+var (
+	vpsVPN  = netip.MustParseAddr("10.100.0.1")
+	homeVPN = netip.MustParseAddr("10.100.0.2")
+)
+
 // newPair returns two nodes on one in-memory pairing network: vps,
 // initialized with a public endpoint, and an empty home. Dials from home
-// pass only through a working tunnel (see tunnelUp).
+// pass only through a working tunnel (see tunnelUp) and come from its VPN
+// address.
 func newPair(t *testing.T) (vps, home *testNode, mem *pairing.Memory) {
 	t.Helper()
 	vps, home = newTestNode(t, start), newTestNode(t, start)
 	mem = pairing.NewMemory()
-	vps.app.Pairing = mem.View(nil)
-	home.app.Pairing = mem.View(tunnelUp(vps, home))
+	vps.app.Pairing = mem.View(vpsVPN, nil)
+	home.app.Pairing = mem.View(homeVPN, tunnelUp(vps, home))
 	vps.must("init", "homelab", "--name", "vps", "--endpoint", "203.0.113.10:51820")
 	return vps, home, mem
 }
@@ -886,7 +894,7 @@ func TestJoinUnreachable(t *testing.T) {
 	vps, home, mem := newPair(t)
 	inv := startInvite(t, vps)
 	tempPub, _ := tempKeys(t, inv.code)
-	home.app.Pairing = mem.View(func(netip.AddrPort) error { return errors.New("udp blocked") })
+	home.app.Pairing = mem.View(homeVPN, func(netip.AddrPort) error { return errors.New("udp blocked") })
 	code, out, errOut := joinWith(home, inv.code, "--name", "home")
 	if code != ExitUnreachable {
 		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
@@ -899,7 +907,7 @@ func TestJoinUnreachable(t *testing.T) {
 	home.untouched()
 	vps.armed(tempPub)
 
-	home.app.Pairing = mem.View(tunnelUp(vps, home))
+	home.app.Pairing = mem.View(homeVPN, tunnelUp(vps, home))
 	if code, out, errOut := joinWith(home, inv.code, "--name", "home"); code != 0 {
 		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
 	}
@@ -926,7 +934,7 @@ func TestJoinPreflightConflictBeforeContact(t *testing.T) {
 	tempPub, _ := tempKeys(t, inv.code)
 	dials := 0
 	up := tunnelUp(vps, home)
-	home.app.Pairing = mem.View(func(to netip.AddrPort) error {
+	home.app.Pairing = mem.View(homeVPN, func(to netip.AddrPort) error {
 		dials++
 		return up(to)
 	})
@@ -1070,7 +1078,7 @@ func TestInviteHangUp(t *testing.T) {
 	tempPub, _ := tempKeys(t, inv.code)
 	var blocked atomic.Bool
 	blocked.Store(true)
-	home.app.Pairing = mem.View(blockReal(vps, home, tempPub, &blocked, inv.hangUp))
+	home.app.Pairing = mem.View(homeVPN, blockReal(vps, home, tempPub, &blocked, inv.hangUp))
 	if code, out, errOut := joinWith(home, inv.code, "--name", "home"); code != ExitRolledBack {
 		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
 	}
@@ -1095,7 +1103,7 @@ func TestInviteExpiresWhileUnconfirmed(t *testing.T) {
 	tempPub, _ := tempKeys(t, inv.code)
 	var blocked atomic.Bool
 	blocked.Store(true)
-	home.app.Pairing = mem.View(blockReal(vps, home, tempPub, &blocked, inv.expire))
+	home.app.Pairing = mem.View(homeVPN, blockReal(vps, home, tempPub, &blocked, inv.expire))
 	if code, out, errOut := joinWith(home, inv.code, "--name", "home"); code != ExitRolledBack {
 		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
 	}
@@ -1141,7 +1149,7 @@ func TestConfirmFailureRollsBackBoth(t *testing.T) {
 	tempPub, _ := tempKeys(t, inv.code)
 	var blocked atomic.Bool
 	blocked.Store(true)
-	home.app.Pairing = mem.View(blockReal(vps, home, tempPub, &blocked, nil))
+	home.app.Pairing = mem.View(homeVPN, blockReal(vps, home, tempPub, &blocked, nil))
 	code, out, errOut := joinWith(home, inv.code, "--name", "home")
 	if code != ExitRolledBack || !strings.Contains(errOut, "sudo meshly join") {
 		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
@@ -1182,7 +1190,7 @@ func TestJoinCancelDuringConfirm(t *testing.T) {
 	}
 	var blocked, gone atomic.Bool
 	blocked.Store(true)
-	home.app.Pairing = mem.View(blockReal(vps, home, tempPub, &blocked, func() {
+	home.app.Pairing = mem.View(homeVPN, blockReal(vps, home, tempPub, &blocked, func() {
 		// The SSH session closes: SIGHUP, and writes to the terminal fail.
 		gone.Store(true)
 		interrupt()
@@ -1259,7 +1267,7 @@ func TestJoinKeepsConfigAfterHandshake(t *testing.T) {
 	var blocked atomic.Bool
 	blocked.Store(true)
 	vpsKey := vps.config().Self.WGPublicKey
-	home.app.Pairing = mem.View(blockReal(vps, home, tempPub, &blocked, func() {
+	home.app.Pairing = mem.View(homeVPN, blockReal(vps, home, tempPub, &blocked, func() {
 		// The real tunnel is up, only the pairing exchange is lost.
 		home.k.Handshake("meshly0", vpsKey, time.Now())
 	}))
@@ -1292,7 +1300,7 @@ func TestJoinIgnoresTemporaryHandshake(t *testing.T) {
 	blocked.Store(true)
 	vpsKey := vps.config().Self.WGPublicKey
 	gate := blockReal(vps, home, tempPub, &blocked, nil)
-	home.app.Pairing = mem.View(func(to netip.AddrPort) error {
+	home.app.Pairing = mem.View(homeVPN, func(to netip.AddrPort) error {
 		if d, _ := home.k.WGOps().Observe("meshly0"); d != nil && d.PublicKey == tempPub {
 			home.k.Handshake("meshly0", vpsKey, time.Now())
 		}
@@ -1321,7 +1329,7 @@ func TestJoinCodeUsed(t *testing.T) {
 		t.Fatal(err)
 	}
 	inviter, _ := c.Addresses()
-	l, err := mem.View(nil).Listen(netip.AddrPortFrom(inviter, pairing.Port))
+	l, err := mem.View(inviter, nil).Listen(netip.AddrPortFrom(inviter, pairing.Port))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1337,7 +1345,7 @@ func TestJoinCodeUsed(t *testing.T) {
 			_ = pairing.WriteReject(conn, deadline, pairing.Reject{Reason: pairing.ReasonUsed, Message: "this invite was already used by another node"})
 		}
 	}()
-	home.app.Pairing = mem.View(nil)
+	home.app.Pairing = mem.View(homeVPN, nil)
 	code, out, errOut := joinWith(home, c.String(), "--name", "home")
 	if code != ExitInvalidCode || !strings.Contains(errOut, "already used") {
 		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
@@ -1349,6 +1357,42 @@ func TestJoinCodeUsed(t *testing.T) {
 		if got := codeOf(err); got != want {
 			t.Errorf("refusal %s: exit %d, want %d", reason, got, want)
 		}
+	}
+}
+
+// A connection to the pairing port from another address than the joining
+// node's, such as a local process over loopback, is closed unanswered: no
+// welcome, no refusal, and the invite waits on for the node with the code.
+func TestInviteIgnoresForeignSource(t *testing.T) {
+	vps, home, mem := newPair(t)
+	inv := startInvite(t, vps)
+	tempPub, _ := tempKeys(t, inv.code)
+	port := netip.AddrPortFrom(vpsVPN, pairing.Port)
+	stranger := testPublicKey(t)
+	for _, from := range []netip.Addr{vpsVPN, netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("10.100.0.3")} {
+		for _, client := range []pairClient{helloWith("home", stranger), confirmWith(stranger)} {
+			c, err := mem.View(from, nil).Dial(context.Background(), port)
+			if err != nil {
+				t.Fatalf("dial from %s: %v", from, err)
+			}
+			err = client(c, time.Now().Add(5*time.Second))
+			c.Close()
+			var rej *pairing.RejectError
+			if err == nil || errors.As(err, &rej) {
+				t.Fatalf("a request from %s was answered (%v); want the connection closed unanswered", from, err)
+			}
+		}
+	}
+	vps.armed(tempPub)
+
+	if code, out, errOut := joinWith(home, inv.code, "--name", "home"); code != 0 {
+		t.Fatalf("join: exit %d\n%s%s", code, out, errOut)
+	}
+	if code, out := inv.wait(); code != 0 {
+		t.Fatalf("invite: exit %d\n%s", code, out)
+	}
+	if cfg := vps.config(); len(cfg.Peers) != 1 || cfg.Peers[0].WGPublicKey != home.config().Self.WGPublicKey {
+		t.Errorf("vps peers %+v, want only home", cfg.Peers)
 	}
 }
 
