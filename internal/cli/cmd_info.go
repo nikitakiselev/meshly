@@ -272,7 +272,7 @@ func (a *App) cmdLogs(_ context.Context, args []string) error {
 		}
 		a.printf("%s\n", line)
 	}
-	a.printf("\nService output: journalctl -u meshly -u meshly-check\n")
+	a.printf("\nService output: journalctl -u meshly -u meshly-check -u meshly-watch\n")
 	return nil
 }
 

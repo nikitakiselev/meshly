@@ -108,7 +108,7 @@ Examples:
   meshly set mtu 1380
   meshly set endpoint auto
   meshly set peer-endpoint vps 198.51.100.7`,
-	"logs":    "meshly logs [-n N] [--json]\n\nShow the operation journal (who changed what, rollbacks, recoveries).\nService output is in: journalctl -u meshly",
+	"logs":    "meshly logs [-n N] [--json]\n\nShow the operation journal (who changed what, rollbacks, recoveries).\nService output is in: journalctl -u meshly -u meshly-check -u meshly-watch",
 	"upgrade": "meshly upgrade [--check] [--version X.Y.Z] [--force] [--yes]\n\nDownload a release from github.com/nikitakiselev/meshly, verify the Ed25519\nsignature of SHA256SUMS with the key built into this binary and the SHA-256\nof the binary, replace the executable atomically (previous one kept as\n<exe>.prev) and restart meshly.service. Downgrades need --force.",
 	"reset":   "meshly reset [--yes]\n\nStop the link and remove configuration, keys and units\nfrom this node. The operation journal is kept for audit.",
 	"version": "meshly version [--short] [--json]",

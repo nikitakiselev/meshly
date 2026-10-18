@@ -237,7 +237,7 @@ $ sudo meshly logs -n 6
 2026-10-18 20:31:40  begin        allow          22/tcp from home  (uid=0 sudo_user=admin)
 2026-10-18 20:31:40  commit       allow
 
-Service output: journalctl -u meshly -u meshly-check
+Service output: journalctl -u meshly -u meshly-check -u meshly-watch
 ```
 
 On the joining node the same pairing is one `join` transaction.

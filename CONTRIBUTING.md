@@ -38,7 +38,7 @@ make build      # bin/meshly for linux/$(go env GOARCH)
 | Race | `go test -race ./...` | CI runs this on amd64 and arm64 |
 | Fuzz | `make fuzz` (`FUZZTIME=30s` per target) | Invite codes, pairing messages, rules, endpoints, CIDRs, nft JSON, config |
 | Fault injection | `go test -tags meshly_faultinject ./...` | Builds with crash/error injection points; see [docs/testing.md](docs/testing.md) |
-| Integration | `make integration` | Docker, privileged containers, kernel with WireGuard and nf_tables. About 10 minutes |
+| Integration | `make integration` | Docker, privileged containers, kernel with WireGuard and nf_tables. About 13 minutes: 9, plus 2 per distribution for the Docker tests |
 
 On macOS, run the Linux-only tests in a container:
 

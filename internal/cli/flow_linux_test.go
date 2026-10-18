@@ -402,7 +402,9 @@ func TestFlowAndSecrets(t *testing.T) {
 		t.Fatalf("doctor --json: %v\n%s", err, out)
 	}
 	vps.must("logs", "--json")
-	vps.must("logs")
+	if out := vps.must("logs"); !strings.Contains(out, "journalctl -u meshly -u meshly-check -u meshly-watch\n") {
+		t.Fatalf("logs does not name every unit's journal:\n%s", out)
+	}
 	vps.must("status")
 	home.must("status")
 
