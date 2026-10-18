@@ -66,6 +66,7 @@ func TestRenderDeterministicAndHashed(t *testing.T) {
 		"port":   func(i *Input) { i.ListenPort = 51821 },
 		"mark":   func(i *Input) { i.Mark = 0x20000000 },
 		"ifname": func(i *Input) { i.Interface = "wg7" },
+		"docker": func(i *Input) { i.Docker = []string{"docker0"} },
 	} {
 		i := fixtureInput()
 		mutate(&i)
@@ -76,6 +77,14 @@ func TestRenderDeterministicAndHashed(t *testing.T) {
 		if r.Hash == a.Hash {
 			t.Fatalf("%s change does not change the hash", name)
 		}
+	}
+	d1, d2 := fixtureInput(), fixtureInput()
+	d1.Docker = []string{"br-3f1c2a9b7d01", "docker0"}
+	d2.Docker = []string{"docker0", "br-3f1c2a9b7d01", "docker0"}
+	r1, _ := Render(d1)
+	r2, _ := Render(d2)
+	if r1.Hash != r2.Hash {
+		t.Fatal("hash depends on the order of Docker bridges")
 	}
 	if !strings.Contains(a.Definition, MarkerPrefix+" net="+in.NetworkID+" hash="+a.Hash) {
 		t.Fatal("ownership marker missing")
@@ -232,6 +241,8 @@ func TestRenderRejectsBadInput(t *testing.T) {
 		"two-bit mark":         func(i *Input) { i.Mark = 0x30000000 },
 		"peer outside cidr":    func(i *Input) { i.Peers = []netip.Addr{netip.MustParseAddr("192.168.1.1")} },
 		"ipv6 local":           func(i *Input) { i.LocalAddr = netip.MustParseAddr("fd00::1") },
+		"docker name space":    func(i *Input) { i.Docker = []string{"br x"} },
+		"docker name quote":    func(i *Input) { i.Docker = []string{`a"b`} },
 	} {
 		i := fixtureInput()
 		mutate(&i)
@@ -574,4 +585,78 @@ func FuzzParseRuleset(f *testing.F) {
 			_ = tab.ContentHash()
 		}
 	})
+}
+
+func TestRenderWithoutDockerUnchanged(t *testing.T) {
+	r, err := Render(fixtureInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, no := range []string{"docker_ifs", "nat_out", "guard_post", "ct status snat"} {
+		if strings.Contains(r.Definition, no) {
+			t.Errorf("table without Docker contains %q", no)
+		}
+	}
+	if n := strings.Count(chainBody(t, r.Definition, "guard_fwd"), "counter drop"); n != 2 {
+		t.Fatalf("guard_fwd has %d drops, want 2", n)
+	}
+}
+
+func TestRenderDockerShape(t *testing.T) {
+	in := fixtureInput()
+	in.Docker = []string{"docker0", "br-3f1c2a9b7d01"}
+	r, err := Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := r.Definition
+	const mark = "meta mark set meta mark | 0x10000000"
+	for _, want := range []string{
+		`elements = { "br-3f1c2a9b7d01", "docker0" }`,
+		`iifname "meshly0" ct state invalid,untracked counter drop`,
+		`oifname "meshly0" ct state invalid,untracked counter drop`,
+		`iifname "meshly0" oifname @docker_ifs ct direction original ct status dnat ct original ip daddr 10.100.0.1 ` + mark + ` accept comment "published container port"`,
+		`iifname "meshly0" oifname @docker_ifs ct direction reply ct status snat ` + mark + ` accept comment "replies to containers"`,
+		`oifname "meshly0" iifname @docker_ifs ct direction original ip daddr @peers ` + mark + ` accept comment "connections from containers"`,
+		`oifname "meshly0" iifname @docker_ifs ct direction reply ct status dnat ` + mark + ` accept comment "replies of published container ports"`,
+		`type nat hook postrouting priority 99`,
+		`oifname "meshly0" ip saddr != 10.100.0.1 counter snat ip to 10.100.0.1 comment "containers appear as this node"`,
+		`type filter hook postrouting priority 101`,
+		`oifname "meshly0" ip saddr != 10.100.0.1 counter drop comment "only the vpn address into the vpn"`,
+		`oifname "meshly0" iifname @docker_ifs ct direction reply ct status dnat meta l4proto { tcp, udp } ip daddr . meta l4proto . th sport != @allow_in counter drop comment "replies of denied container ports"`,
+	} {
+		if !strings.Contains(d, want) {
+			t.Errorf("rendered table lacks %q", want)
+		}
+	}
+	fwd := chainBody(t, d, "guard_fwd")
+	for _, l := range strings.Split(fwd, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), "ct state invalid") {
+			t.Errorf("guard_fwd has an unscoped rule: %s", l)
+		}
+	}
+	drop := min(strings.Index(fwd, `comment "no forwarding from the vpn"`), strings.Index(fwd, `comment "no forwarding into the vpn"`))
+	for _, c := range []string{"published container port", "replies to containers", "connections from containers", "replies of published container ports"} {
+		if i := strings.Index(fwd, `comment "`+c+`"`); i < 0 || i > drop {
+			t.Errorf("accept %q is missing or after a drop", c)
+		}
+	}
+}
+
+// Lockdown closes forwarding completely, Docker bridges or not.
+func TestRenderLockdownHasNoDocker(t *testing.T) {
+	cfg := &model.Config{Network: model.Network{ID: fixtureInput().NetworkID, CIDR: fixtureInput().CIDR},
+		Self:      model.Self{Address: fixtureInput().LocalAddr, ListenPort: 51820},
+		Interface: model.Interface{Name: "meshly0"}, Firewall: model.Firewall{Mark: model.DefaultFirewallMark}}
+	in := InputFromConfig(cfg, true)
+	in.Docker = []string{"docker0"}
+	r, err := Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, no := range []string{"docker_ifs", "nat_out", "guard_post"} {
+		if strings.Contains(r.Definition, no) {
+			t.Errorf("lockdown table contains %q", no)
+		}
+	}
 }

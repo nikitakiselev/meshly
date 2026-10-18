@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/netip"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -31,7 +32,15 @@ const (
 	PolicyPriority = -180
 	// ForwardPriority runs the forward guard before ordinary filter chains.
 	ForwardPriority = -300
+	// NATPriority and PostPriority bracket srcnat (100): meshly's own SNAT
+	// runs just before it, the post-NAT check just after.
+	NATPriority  = 99
+	PostPriority = 101
 )
+
+// bridgeNameRe admits docker0 and br-<12 hex>; model.ValidateInterfaceName
+// refuses the hyphen.
+var bridgeNameRe = regexp.MustCompile(`^[a-z][a-z0-9-]{0,14}$`)
 
 // AllowEntry is one rendered allow rule.
 type AllowEntry struct {
@@ -59,6 +68,9 @@ type Input struct {
 	// interface is gone, and the integration rule must not keep the listen
 	// port open for whatever else binds it.
 	Lockdown bool
+	// Docker are the Docker bridge names. Not empty (and not Lockdown), the
+	// table forwards between them and the interface; see docs/firewall.md#docker.
+	Docker []string
 }
 
 // InputFromConfig derives the renderer input from a config. With lockdown
@@ -122,6 +134,11 @@ func (in Input) validate() error {
 			return fmt.Errorf("allow entry for unknown peer %s", a.Peer)
 		}
 	}
+	for _, n := range in.Docker {
+		if !bridgeNameRe.MatchString(n) {
+			return fmt.Errorf("invalid docker bridge name %q", n)
+		}
+	}
 	for _, x := range in.Exclusive {
 		if x.Proto != model.ProtoTCP && x.Proto != model.ProtoUDP {
 			return fmt.Errorf("exclusive entry for %s: only a TCP or UDP port can be exclusive", x.Peer)
@@ -162,6 +179,12 @@ func Render(in Input) (Rendered, error) {
 	setMark := "meta mark set meta mark | " + m
 	ifname := `"` + in.Interface + `"`
 	local := in.LocalAddr.String()
+	// Lockdown closes forwarding completely.
+	docker := in.Docker
+	if in.Lockdown {
+		docker = nil
+	}
+	docker = slices.Compact(slices.Sorted(slices.Values(docker)))
 	icmpErr := "icmp type { destination-unreachable, time-exceeded, parameter-problem }"
 
 	var b strings.Builder
@@ -191,6 +214,17 @@ func Render(in Input) (Rendered, error) {
 	}
 	w("\t}")
 	w("")
+	if len(docker) > 0 {
+		quoted := make([]string, len(docker))
+		for i, n := range docker {
+			quoted[i] = `"` + n + `"`
+		}
+		w("\tset docker_ifs {")
+		w("\t\ttype ifname")
+		w("\t\telements = { %s }", strings.Join(quoted, ", "))
+		w("\t}")
+		w("")
+	}
 	// Inbound guard, before DNAT.
 	w("\tchain guard_pre {")
 	w("\t\ttype filter hook prerouting priority %d; policy accept;", PolicyPriority)
@@ -229,10 +263,32 @@ func Render(in Input) (Rendered, error) {
 	w("")
 	w("\tchain guard_fwd {")
 	w("\t\ttype filter hook forward priority %d; policy accept;", ForwardPriority)
+	if len(docker) > 0 {
+		// Only tunnel traffic: this hook sees every packet the host forwards.
+		w("\t\tiifname %s ct state invalid,untracked counter drop", ifname)
+		w("\t\toifname %s ct state invalid,untracked counter drop", ifname)
+		w("\t\tiifname %s oifname @docker_ifs ct direction original ct status dnat ct original ip daddr %s %s accept comment \"published container port\"", ifname, local, setMark)
+		w("\t\tiifname %s oifname @docker_ifs ct direction reply ct status snat %s accept comment \"replies to containers\"", ifname, setMark)
+		w("\t\toifname %s iifname @docker_ifs ct direction original ip daddr @peers %s accept comment \"connections from containers\"", ifname, setMark)
+		w("\t\toifname %s iifname @docker_ifs ct direction reply ct status dnat %s accept comment \"replies of published container ports\"", ifname, setMark)
+	}
 	w("\t\tiifname %s counter drop comment \"no forwarding from the vpn\"", ifname)
 	w("\t\toifname %s counter drop comment \"no forwarding into the vpn\"", ifname)
 	w("\t}")
 	w("")
+	if len(docker) > 0 {
+		w("\tchain nat_out {")
+		w("\t\ttype nat hook postrouting priority %d; policy accept;", NATPriority)
+		w("\t\toifname %s ip saddr != %s counter snat ip to %s comment \"containers appear as this node\"", ifname, local, local)
+		w("\t}")
+		w("")
+		w("\tchain guard_post {")
+		w("\t\ttype filter hook postrouting priority %d; policy accept;", PostPriority)
+		w("\t\toifname %s ip saddr != %s counter drop comment \"only the vpn address into the vpn\"", ifname, local)
+		w("\t\toifname %s iifname @docker_ifs ct direction reply ct status dnat meta l4proto { tcp, udp } ip daddr . meta l4proto . th sport != @allow_in counter drop comment \"replies of denied container ports\"", ifname)
+		w("\t}")
+		w("")
+	}
 	w("\tchain guard_out {")
 	w("\t\ttype filter hook output priority %d; policy accept;", PolicyPriority)
 	w("\t\tmeta mark & %s == %s meta mark set meta mark & %s", m, m, nm)
