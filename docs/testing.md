@@ -176,18 +176,22 @@ tag and requires identical checksums.
 
 ## Reproducible builds
 
-Release builds use `CGO_ENABLED=0`, `-trimpath`, `-buildid=` and fixed
-`-ldflags`, with the Go version from `go.mod`. While preparing 0.0.1, `make
-dist VERSION=0.0.1` was run on macOS (arm64) and in a `golang:1.27.2` Linux
-container, and the two `SHA256SUMS` files were identical. To check a release
-yourself:
+Release builds use `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=false`,
+`-buildid=` and fixed `-ldflags`, with the Go version from `go.mod`. While
+preparing 0.0.1, `make dist VERSION=0.0.1` was run on macOS (arm64) and in a
+`golang:1.27.2` Linux container, and the two `SHA256SUMS` files were
+identical. To check a release yourself:
 
 ```
 git checkout v0.0.1
 make dist VERSION=0.0.1 COMMIT=$(git rev-parse --short=12 HEAD)
-gh release download v0.0.1 --dir released
-diff released/SHA256SUMS dist/SHA256SUMS
+gh release download v0.0.1 --dir /tmp/meshly-v0.0.1
+diff /tmp/meshly-v0.0.1/SHA256SUMS dist/SHA256SUMS
 ```
+
+0.0.1 was built before `-buildvcs=false`: Go stamped into it whether the
+checkout had changes, so rebuild it from a checkout where `git status
+--porcelain` prints nothing (untracked files count too).
 
 ## Not verified
 

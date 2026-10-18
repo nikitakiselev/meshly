@@ -1,5 +1,6 @@
 # meshly build targets. Release builds are reproducible: CGO off, -trimpath,
-# fixed build ID, version/commit/release key injected via -ldflags.
+# no VCS stamp (untracked files would change it), fixed build ID,
+# version/commit/release key injected via -ldflags.
 VERSION     ?= $(or $(shell git describe --tags --match 'v*' --exact-match 2>/dev/null | sed 's/^v//'),0.0.0-dev)
 COMMIT      ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 RELEASE_KEY ?= $(shell cat release-key.pub 2>/dev/null)
@@ -9,7 +10,7 @@ LDFLAGS      = -s -w -buildid= \
                -X $(PKG)/version.Version=$(VERSION) \
                -X $(PKG)/version.Commit=$(COMMIT) \
                -X $(PKG)/upgrade.ReleaseKey=$(RELEASE_KEY)
-GOFLAGS_REL  = -trimpath -ldflags '$(LDFLAGS)'
+GOFLAGS_REL  = -trimpath -buildvcs=false -ldflags '$(LDFLAGS)'
 export CGO_ENABLED = 0
 
 .PHONY: all build test vet fuzz integration dist sign clean

@@ -7,6 +7,12 @@ on-disk formats.
 
 ## [Unreleased]
 
+### Fixed
+
+- `install.sh` names `invite` and `join` with a code in its next steps, not an invite file.
+- Release builds no longer depend on untracked files in the checkout (`-buildvcs=false`), and the release check
+  downloads the release outside the checkout.
+
 ## [0.0.1] - 2026-10-18
 
 First public release.

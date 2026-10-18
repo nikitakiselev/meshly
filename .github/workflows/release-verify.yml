@@ -29,17 +29,22 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+      # Everything but the rebuild works outside the checkout: Go stamps
+      # untracked files there into the binaries (vcs.modified).
       - name: Download release assets
-        run: gh release download "$TAG" --dir released
+        run: gh release download "$TAG" --dir "$RUNNER_TEMP/released"
       - name: Verify the signature of SHA256SUMS
+        working-directory: ${{ runner.temp }}
         run: |
-          printf '%s\n' '-----BEGIN PUBLIC KEY-----' "MCowBQYDK2VwAyEA$(cat release-key.pub)" '-----END PUBLIC KEY-----' > key.pem
+          printf '%s\n' '-----BEGIN PUBLIC KEY-----' "MCowBQYDK2VwAyEA$(cat "$GITHUB_WORKSPACE/release-key.pub")" '-----END PUBLIC KEY-----' > key.pem
           { printf 'meshly-release/1\000'; cat released/SHA256SUMS; } > msg
           openssl base64 -d -A -in released/SHA256SUMS.sig -out sig
           openssl pkeyutl -verify -pubin -inkey key.pem -rawin -in msg -sigfile sig
       - name: Verify the released files against SHA256SUMS
-        run: cd released && sha256sum -c SHA256SUMS
+        working-directory: ${{ runner.temp }}/released
+        run: sha256sum -c SHA256SUMS
       - name: Rebuild from source and compare
         run: |
+          test -z "$(git status --porcelain)"
           make dist VERSION="${TAG#v}" COMMIT="$(git rev-parse --short=12 HEAD)"
-          diff -u released/SHA256SUMS dist/SHA256SUMS
+          diff -u "$RUNNER_TEMP/released/SHA256SUMS" dist/SHA256SUMS
