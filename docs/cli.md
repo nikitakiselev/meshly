@@ -2,14 +2,13 @@
 
 `meshly <command> [arguments]`. All commands that change the system require root. `status`, `rules`, `version`
 and `help` also work without root, with reduced detail. Every changing command takes a lock: a second meshly
-operation waits briefly and then fails with exit code 6. `init`, `join`, `approve`, `activate`, `allow`, `deny`,
-`revoke`, `start`, `stop` and `set` accept `--dry-run`, which prints the plan, the rendered nftables table and the
-config diff, and changes nothing.
+operation waits briefly and then fails with exit code 6. `init`, `allow`, `deny`, `revoke`, `start`, `stop` and
+`set` accept `--dry-run`, which prints the plan, the rendered nftables table and the config diff, and changes nothing.
 
-`meshly help <command>` prints the same help as below. Secrets are never accepted as arguments, never printed and
-never written to JSON output.
+`meshly help <command>` prints the same help as below. Secrets are never accepted as arguments and never written to
+logs or JSON output. Private keys are never printed; the invite code is printed once, by `meshly invite`.
 
-- [Network setup](#network-setup): `init`, `invite`, `join`, `approve`, `activate`
+- [Network setup](#network-setup): `init`, `invite`, `join`
 - [Access policy](#access-policy): `allow`, `deny`, `rules`, `revoke`
 - [Link lifecycle](#link-lifecycle): `start`, `stop`, `restart`, `set`
 - [Information](#information): `status`, `doctor`, `logs`, `version`
@@ -20,7 +19,9 @@ never written to JSON output.
 
 ## Network setup
 
-The protocol behind these commands is specified in [bootstrap-protocol.md](bootstrap-protocol.md).
+The second node joins with a one-time code: run `meshly invite` on the node with the public endpoint and
+`meshly join` on the other one. The protocol behind these commands is specified in
+[pairing-protocol.md](pairing-protocol.md).
 
 ### `meshly init <network> --name <node> [--endpoint IP[:PORT]|auto|none] [options]`
 
@@ -42,6 +43,9 @@ Preflight runs first. If the environment is unsupported (no kernel WireGuard, nf
 firewalld, iptables-legacy rules, a foreign drop chain without integration, a CIDR conflict or a busy port), init
 stops with exit code 3 and changes nothing.
 
+init ends with what to do next: `sudo meshly invite` on this node and `sudo meshly join` on the other. Without an
+endpoint it says that no other node can join until this node has one (`meshly set endpoint IP`).
+
 #### Endpoint detection
 
 With `--endpoint auto` (the default) meshly looks at the interfaces that carry the IPv4 default route and takes their
@@ -49,47 +53,114 @@ public IPv4 address, if there is exactly one. Private (RFC 1918), shared (RFC 65
 link-local addresses are skipped. meshly reads only the local network configuration and does not ask any service on the
 internet, so it cannot see a public address that the provider maps from outside: AWS, GCP and other clouds with 1:1 NAT
 give the server a private address only. In that case, or when there are several public addresses, init reports why and
-creates the network without an endpoint; set it with `meshly set endpoint IP`. The endpoint is only advertised in
-invites: the firewall accepts WireGuard on the listen port with or without one.
+creates the network without an endpoint; set it with `meshly set endpoint IP`. The endpoint goes into the invite
+code, so `invite` needs one; the firewall accepts WireGuard on the listen port with or without it. `join` detects
+its own address only with `--endpoint auto`.
 
-### `meshly invite [--out FILE] [--ttl DURATION] [--new] [--force]`
+### `meshly invite [--ttl DURATION]`
 
-Creates a one-time invite for the second node. It is valid for 1 hour by default (`--ttl` accepts `1m` to `24h`).
-Running it again returns the same unused invite. `--new` cancels it and creates a fresh one. The file defaults to
-`peer.invite`, `-` writes to stdout, and the file mode is `0600`: whoever holds the file can submit a join request
-until it expires. Under `sudo`, output files belong to the invoking user, so you can `scp` them without root.
-
-### `meshly join <invite-file> --name <node> [options]`
-
-Verifies the invite, shows the inviter's fingerprint and asks you to confirm it by typing `yes`. It then generates
-this node's keys and writes a signed join request. Nothing is trusted or changed in the network configuration yet.
+Waits for the second node to join this network. Run it on the node the other one reaches over UDP: it needs a
+public endpoint (exit code 2 otherwise, with a hint to `meshly set endpoint IP`), a running link (exit code 5 after
+`meshly stop`, with a hint to `meshly start`) and no peer yet (exit code 5; `meshly revoke` the old one first).
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--name NAME` | (required) | Name of this node |
-| `--out FILE` | `<name>.request` | Request file (`-` = stdout) |
-| `--expect-fingerprint FP` | | Inviter fingerprint. **Required when stdin is not a terminal** |
-| `--endpoint IP[:PORT]` | detected only if needed | Public address of this node, if it has one. Without the flag, an address is [detected](#endpoint-detection) only when the invite has no endpoint, so a node behind NAT advertises none. `auto` detects it anyway |
-| `--listen-port PORT` | `51820` or a free port | Local UDP port |
-| `--keepalive SECONDS` | `25` | Keepalive towards the inviter. The inviter always uses 25 towards this node |
+| `--ttl DURATION` | `10m` | How long the code is valid: `1m` to `1h` |
+
+```console
+$ sudo meshly invite
+Waiting for a node to join network "homelab" until 20:40 UTC (10 minutes). Ctrl+C cancels.
+On the other node run `sudo meshly join` and paste this code:
+
+m1atfqa4ikzjwg2zywqwljinoqqmmvkznfpk6kh55j6yhwhnxjtxndbo3gzdxpilqkmqaaagdk2uxkasjvuxzmxu2ljlylk2tq5xtgw2omnywbs
+
+Node "home" (10.100.0.2) joined. The invite is closed.
+```
+
+- **Output.** stdout gets the code, alone on one line, and at the end the `Node … joined` line. The code is `m1`
+  followed by lowercase letters and digits, 111 characters for an IPv4 endpoint (130 for IPv6); it is printed once
+  and nowhere else. Everything else goes to stderr, including the engine's steps, which the sample leaves out.
+- **While it waits**, a temporary WireGuard peer that only the code unlocks and a firewall rule that lets just the
+  joining node's VPN address reach TCP port 51820 on this node's VPN address are in place. They are never saved in
+  the configuration. Nothing new is reachable from the internet. The invite holds meshly's lock: other changing
+  commands exit with code 6 (`meshly invite is waiting for a node to join until …; let it finish or cancel it with
+  Ctrl+C`), the check timer leaves the temporary state alone, and `status` and `doctor` show the open invite.
+- **It ends** when a node has joined and confirmed the connection (exit code 0, `Node "home" (10.100.0.2) joined.
+  The invite is closed.`), on Ctrl+C, SIGTERM or when the terminal hangs up, for example a closed SSH session (exit
+  code 10; under `nohup` the hang-up is ignored), or when the code expires and no node joined (exit code 13).
+- **If the node that joined cannot confirm** within a minute, its membership is undone (`Node "home" did not
+  confirm the connection; its membership was undone.`), and the invite waits again while the code is valid.
+- **Every way out removes the temporary state.** If the process is killed (`kill -9`), `meshly-check.timer` removes
+  it within a minute, and `sudo meshly start` at once.
+
+### `meshly join [--name NAME] [--endpoint IP[:PORT]|auto|none] [options]`
+
+Joins the network of the node where `meshly invite` waits. On a terminal it asks `Invite code: `; otherwise it reads
+the code from the first line of stdin. **The code is never accepted as an argument** (exit code 2): other users
+could see it in the process list, and it would stay in the shell history. Whitespace and letter case in the code
+do not matter.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--name NAME` | the host name | Name of this node. The default is the first label of the host name, lowercased, with other characters than `a-z` and `0-9` turned into `-`, at most 32 characters. If that gives no valid name, join asks for `--name` |
+| `--endpoint ADDR` | `none` | Public address of this node, if it has one: `IP` or `IP:PORT` (the port defaults to `--listen-port`), `auto` ([detected](#endpoint-detection)) or `none`. Without one, the inviting node learns the address from authenticated packets |
+| `--listen-port PORT` | endpoint port, else `51820` or a free port | Local UDP port |
+| `--keepalive SECONDS` | `25` | Keepalive towards the inviting node (`0` = off). The inviting node always uses 25 towards this node |
 | `--interface NAME`, `--firewall PROFILE` | | As for `init` |
-| `--force` | | Replace an existing `--out` file that has different content |
 
-`<invite-file>` may be `-` to read from stdin. Input files must be regular files (symlinks and FIFOs are refused)
-of at most 64 KiB.
+```console
+$ sudo meshly join
+Invite code: m1atfqa4ikzjwg2zywqwljinoqqmmvkznfpk6kh55j6yhwhnxjtxndbo3gzdxpilqkmqaaagdk2uxkasjvuxzmxu2ljlylk2tq5xtgw2omnywbs
+Connecting to 203.0.113.10:51820...
+Joined network "homelab" as "home" (10.100.0.2).
+  peer:  vps 10.100.0.1 via 203.0.113.10:51820
+Inbound VPN traffic to this node is denied until you run `meshly allow` here.
+```
 
-### `meshly approve <request-file> [--out FILE] [--expect-fingerprint FP] [--force] [--dry-run]`
+join checks the code and runs the same preflight as `init` (exit code 3) before it contacts the other node. It
+then opens a temporary tunnel to it with keys derived from the code, exchanges names, keys and settings, switches to
+this node's own keys in one transaction and confirms the connection through the new tunnel. The last three lines go
+to stdout; everything else goes to stderr, including the engine's steps, which the sample leaves out.
 
-Shows the candidate's name, fingerprint, keys, assigned address and request id, and asks for an explicit `yes`.
-In non-interactive use, `--expect-fingerprint` is mandatory. On approval, the peer is added to WireGuard with one
-allowed IP (`/32`) and no service is opened. The command then writes `<name>.accept`. Running it again with the
-same request rewrites the same accept file until the request expires.
+| Exit code | When | This node |
+|---|---|---|
+| 4 | The code is damaged or incomplete, from another meshly version, expired, or was made on this node; or the invite was already used by another node | unchanged |
+| 5 | This node is already a member of a network, or the name is taken (it is the inviting node's) | unchanged |
+| 13 | The inviting node did not answer within 30 seconds: its invite is closed (expired, cancelled or already used), or UDP to its port does not get through | unchanged |
+| 7 | The connection through the new tunnel could not be confirmed. Run `sudo meshly join` again while the invite is open | rolled back |
+| 10 | Ctrl+C, SIGTERM or a hang-up | unchanged or rolled back |
+| 1 | The tunnel works (a WireGuard handshake happened), but the inviting node did not acknowledge the connection. Check `meshly status` on both nodes | configuration kept |
 
-### `meshly activate <accept-file> [--dry-run]`
+A code is accepted up to 5 minutes past its expiry, in case the two clocks differ. A join shortly after the invite
+ended therefore usually gets exit code 13, not 4.
 
-Activates the membership on the joining node. Only the accept that answers this node's own pending request is
-accepted. On success the link comes up, autostart is enabled, and inbound VPN traffic stays denied until
-`meshly allow`.
+#### Pairing from a script
+
+`invite` writes nothing but the code to stdout before it is done, and `join` reads the code from stdin, so a script
+can pass the code over SSH. This one runs as root on the VPS while `meshly invite` waits in the background:
+
+```sh
+#!/bin/sh
+# Run as root on the vps: pairs it with the node reachable as admin@home.
+# sudo on home must not ask for a password: stdin carries the code.
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+meshly invite >"$out" &
+invite=$!
+until [ -s "$out" ]; do                  # the code is the first line of stdout
+  kill -0 "$invite" 2>/dev/null || { wait "$invite"; exit; }   # refused, e.g. exit 5
+  sleep 1
+done
+if head -n 1 "$out" | ssh admin@home sudo meshly join --name home; then
+  wait "$invite"                         # 0: home joined and confirmed
+else
+  code=$?
+  kill "$invite"; wait "$invite"         # close the invite now, not at expiry
+  exit "$code"
+fi
+```
+
+The code never appears in a command line: it goes from the file through a pipe into the stdin of `ssh`.
 
 ## Access policy
 
@@ -156,7 +227,8 @@ for a running link: a link stopped with `meshly stop` is brought back with `mesh
 Shows the saved configuration, the service state, the interface, the firewall table, each peer (handshake age,
 traffic counters, endpoint, the rules it may use), interrupted operations and drift between configuration and
 kernel. The systemd state is shown separately and says nothing about connectivity. Without root, kernel and key
-details are omitted.
+details are omitted. While `meshly invite` waits, status shows `Invite open until …` instead of the drift, and the
+firewall table as `present, with the open invite's temporary rules`.
 
 ### `meshly doctor [--json] [--probe <port>/<tcp|udp>] [--peer NAME]`
 
@@ -170,7 +242,8 @@ nothing locally. Check ids and runbooks are in
 
 ### `meshly logs [-n N] [--json]`
 
-Shows the operation journal: who (uid, sudo user) did what, begin/commit/rollback/recovery/safe-mode events.
+Shows the operation journal: who (uid, sudo user) did what, begin/commit/rollback/recovery/safe-mode events, and
+audit records such as an invite opened and closed.
 `-n` must be ≥ 1 (default 30). Service output is in `journalctl -u meshly -u meshly-check`.
 
 ### `meshly version [--short] [--json]`
@@ -192,13 +265,15 @@ The upgrade runs these steps:
 6. Reinstall the units and restart `meshly.service`. If the service does not come back, the previous binary is
    restored and restarted, and the command exits with code 7.
 
-`--check` only reports whether a newer release exists. Downgrades are refused unless `--force` is given. The
-version is taken only from the signed `SHA256SUMS`, so an old signed release cannot be replayed as a new one.
+`--check` only reports whether a newer release exists. Downgrades are refused unless `--force` is given (exit code
+5). The version is taken only from the signed `SHA256SUMS`, so an old signed release cannot be replayed as a new
+one. A release that fails the signature or checksum verification is refused with exit code 1, and the binary stays
+unchanged.
 
 ### `meshly reset [--yes]`
 
-Stops the link and removes the configuration, keys, bootstrap state and units from this node. The binary and the
-operation journal stay.
+Stops the link and removes the configuration, keys, runtime state, configuration history and units from this node.
+The binary and the operation journal stay.
 
 ### `meshly recover`
 
@@ -220,15 +295,16 @@ Exit codes are stable and safe to use in scripts.
 | 1 | error | Unexpected error |
 | 2 | usage | Invalid command line |
 | 3 | preflight | Unsupported or unprepared environment. **Nothing was changed** |
-| 4 | invalid-file | Bootstrap file rejected: signature, binding, expiry, replay or schema |
-| 5 | conflict | Ownership, address or state conflict (e.g. unknown peer, existing output file). Nothing was changed |
-| 6 | busy | Another meshly operation holds the lock |
-| 7 | rolled-back | Apply failed and the previous configuration is active again (also: upgrade rolled back) |
+| 4 | invalid-code | Invite code rejected: damaged or incomplete, from another meshly version, expired, made on this node, or already used. Nothing was changed |
+| 5 | conflict | Ownership, address or state conflict (e.g. unknown peer, a peer already exists, the name is taken). Nothing was changed |
+| 6 | busy | Another meshly operation holds the lock, for example a waiting `meshly invite` |
+| 7 | rolled-back | Apply failed and the previous configuration is active again (also: upgrade rolled back; `join` rolled back because the new tunnel could not be confirmed) |
 | 8 | safe-mode | Apply and rollback failed: the VPN interface was removed and VPN access is closed |
 | 9 | not-initialized | meshly is not initialized on this node |
-| 10 | declined | Confirmation missing (no terminal and no `--yes`/`--expect-fingerprint`) or answered "no" |
+| 10 | declined | Confirmation missing (no terminal and no `--yes`) or answered "no"; Ctrl+C, SIGTERM or a hang-up of the terminal during `invite` or `join` |
 | 11 | warnings | `doctor`: warnings only |
 | 12 | problems | `doctor`: at least one problem |
+| 13 | unreachable | The other node did not come: `join` got no answer from the inviting node (nothing was changed), or the invite expired before a node joined |
 
 ## JSON output
 
@@ -253,7 +329,8 @@ An abridged `meshly.status/v1` example:
   "operation_in_progress": false,
   "config": {
     "revision": 4, "admin_state": "up", "network_name": "homelab", "cidr": "10.100.0.0/24",
-    "name": "vps", "address": "10.100.0.1", "listen_port": 51820, "interface": "meshly0", "mtu": 1420,
+    "name": "vps", "address": "10.100.0.1", "listen_port": 51820, "endpoint": "203.0.113.10:51820",
+    "wg_public_key": "bWcWhZaUNdCDGVVlpXq8o/ep9g9jtumd2jC7Zsju9C4=", "interface": "meshly0", "mtu": 1420,
     "firewall_profile": "none",
     "rules": [{"peer": "home", "proto": "tcp", "port": 22, "rule": "allow 22/tcp from home", "meaning": "…"}]
   },
@@ -261,7 +338,8 @@ An abridged `meshly.status/v1` example:
   "interface": {"name": "meshly0", "exists": true, "owned": true, "up": true, "public_key_matches_config": true},
   "firewall": {"profile": "none", "table_present": true, "owned": true, "matches_config": true, "modified_outside_meshly": false},
   "peers": [{
-    "name": "home", "address": "10.100.0.2", "in_wireguard": true, "allowed_ips_ok": true, "route_ok": true,
+    "name": "home", "address": "10.100.0.2", "wg_public_key": "Z4YzTt5wXZdSfsyoVJhIk0Q8KYaqf3moKZi95pr9DmA=",
+    "in_wireguard": true, "allowed_ips_ok": true, "route_ok": true,
     "handshake_age_seconds": 6, "rx_bytes": 180, "tx_bytes": 124,
     "connectivity": "handshake-recent", "services_it_may_use_here": ["ping", "22/tcp"]
   }],
@@ -270,8 +348,16 @@ An abridged `meshly.status/v1` example:
 }
 ```
 
-`peers[].connectivity` is one of `handshake-recent`, `handshake-stale`, `no-handshake` or `unknown`. A
-`meshly.doctor/v1` document has `findings[]`, each with `id`, `status` (`ok`, `info`, `warn`, `fail`),
+`config.wg_public_key` and `peers[].wg_public_key` are the WireGuard public keys; compare them across the two nodes
+to check that each knows the other's key. `peers[].connectivity` is one of `handshake-recent`, `handshake-stale`,
+`no-handshake` or `unknown`.
+
+While `meshly invite` waits, the document has `"invite": {"expires_at": "2026-10-18T20:40:00Z"}` and
+`operation_in_progress` is `true`. `drift` stays empty, because the drift check is skipped: the invite's temporary
+peer and firewall rule are not part of the saved configuration, so `firewall.matches_config` is `false` meanwhile.
+Without an open invite there is no `invite` field. The code is never in the document.
+
+A `meshly.doctor/v1` document has `findings[]`, each with `id`, `status` (`ok`, `info`, `warn`, `fail`),
 `certainty`, `detail` and `fix`, plus a `summary`.
 
 ## Files and environment
@@ -279,11 +365,10 @@ An abridged `meshly.status/v1` example:
 | Path | Mode | Contents |
 |---|---|---|
 | `/etc/meshly/meshly.json` | `0644` | Configuration (no secrets) |
-| `/etc/meshly/keys/` | `0700` | `wireguard.key`, `identity.key` (`0600`) |
-| `/var/lib/meshly/` | `0700` | `journal.jsonl`, `bootstrap.json`, `runtime.json` (applied table hash, learned peer endpoints), `history/` |
-| `/run/meshly/` | `0700` | Operation lock |
+| `/etc/meshly/keys/` | `0700` | `wireguard.key` (`0600`) |
+| `/var/lib/meshly/` | `0700` | `journal.jsonl`, `runtime.json` (applied table hash, learned peer endpoints), `history/` |
+| `/run/meshly/` | `0700` | Operation lock; `invite.json` (`0600`) while `meshly invite` waits, holding only its expiry |
 | `/etc/systemd/system/meshly*.{service,timer}` | `0644` | Units installed by meshly |
 
-meshly reads no configuration from the environment. Under `sudo`, `SUDO_UID`/`SUDO_GID` decide who owns the
-bootstrap files it writes, and `SUDO_USER` is recorded in the journal. `install.sh` honours `MESHLY_VERSION` and
-`MESHLY_BASE_URL` (a mirror of the GitHub releases).
+meshly reads no configuration from the environment. Under `sudo`, `SUDO_USER` is recorded in the journal.
+`install.sh` honours `MESHLY_VERSION` and `MESHLY_BASE_URL` (a mirror of the GitHub releases).

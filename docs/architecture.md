@@ -6,7 +6,7 @@ a WireGuard interface, its address and host routes, a few per-interface
 sysctls, and one nftables table. Every change runs as a journaled transaction
 that either completes, rolls back, or closes the VPN path (safe mode). This
 document describes how that works and why it was built that way. Related
-documents: [bootstrap protocol](bootstrap-protocol.md),
+documents: [pairing protocol](pairing-protocol.md),
 [threat model](threat-model.md), [firewall](firewall.md),
 [CLI reference](cli.md), [diagnostics and recovery](diagnostics-and-recovery.md),
 [testing](testing.md).
@@ -30,17 +30,17 @@ documents: [bootstrap protocol](bootstrap-protocol.md),
 | `cmd/meshly` | `main`: builds the application and calls `cli.App.Main`. |
 | `internal/cli` | Command parsing, user output, exit codes; wires preflight → engine → systemd. |
 | `internal/model` | Configuration types, validation, rule parsing, address allocation, CIDR conflict detection. |
-| `internal/store` | Files on disk: atomic fsync'ed writes, ownership/permission checks, config history, keys, runtime and bootstrap state. |
+| `internal/store` | Files on disk: atomic fsync'ed writes, ownership/permission checks, config history, keys, runtime state, the marker of an open invite. |
 | `internal/journal` | Append-only JSONL transaction log; also the audit trail shown by `meshly logs`. |
 | `internal/lock` | `flock(2)` serialisation of mutating operations. |
-| `internal/engine` | Observe → plan → apply → verify; transactions, recovery, safe mode, drift detection. |
+| `internal/engine` | Observe → plan → apply → verify; transactions, recovery, safe mode, drift detection, temporary overlays. |
 | `internal/engine/enginetest` | In-memory fake kernel (links, WireGuard, nft) for unit tests. |
 | `internal/netstack` | Interface, address, routes and per-interface sysctls over rtnetlink. |
 | `internal/wg` | WireGuard configuration over generic netlink (wgctrl). |
 | `internal/nft` | Renders the meshly table, runs `nft`, parses `nft -j list ruleset`, analyses foreign chains. |
 | `internal/preflight` | Capability and compatibility checks before any change. |
 | `internal/diag` | `meshly status` and `meshly doctor` reports. |
-| `internal/bootstrap` | Signed invite / join request / join accept messages. |
+| `internal/pairing` | The invite code (format, temporary keys derived from it) and the messages `invite` and `join` exchange. |
 | `internal/systemd` | Unit files embedded in the binary; `systemctl` control. |
 | `internal/upgrade` | Release download, signature and hash verification, binary replacement. |
 | `internal/fault` | Fault injection points (compiled to no-ops in release builds). |
@@ -61,18 +61,20 @@ and the directory is fsync'ed.
 | `/etc/meshly/meshly.json` | 0644 | Desired configuration: network, this node, peer, rules, admin state, revision. Public data only. |
 | `/etc/meshly/keys/` | 0700 | |
 | `/etc/meshly/keys/wireguard.key` | 0600 | WireGuard private key. |
-| `/etc/meshly/keys/identity.key` | 0600 | Ed25519 identity key (signs bootstrap messages; its public key is the node fingerprint). |
 | `/var/lib/meshly/` | 0700 | |
 | `/var/lib/meshly/journal.jsonl` | 0600 | Transaction journal. Rotated at 4 MiB to `journal.jsonl.1` (one previous generation), never while an operation is open. |
 | `/var/lib/meshly/history/meshly-<rev>.json` | 0600 | Copy of each saved configuration revision; the newest 20 are kept. |
-| `/var/lib/meshly/bootstrap.json` | 0600 | Invite records (one-time use, expiry), pending join request. |
 | `/var/lib/meshly/runtime.json` | 0600 | Non-authoritative runtime state: hash of the meshly table as read back after the last apply, and `peer_endpoints` (endpoint hints, see below). |
 | `/run/meshly/lock` | 0600 | Operation lock (`/run/meshly` is 0700). |
+| `/run/meshly/invite.json` | 0600 | Marker of an open `meshly invite`: only its expiry, never the code. Removed when the invite ends; a marker left by a killed invite is removed by the next command that takes the lock. `/run` is emptied at boot. |
 | `/usr/local/bin/meshly` (+ `.prev`) | 0755 | Binary, installed by `install.sh`; `.prev` is kept by `meshly upgrade`. |
 
 Private keys are read only when needed, wiped from memory afterwards, never
 passed in argv, never printed (`Keys.String()` returns `[redacted keys]`),
-and never included in status, doctor, journal or bootstrap files.
+and never included in status, doctor or the journal. The invite code and the
+temporary keys derived from it live only in the memory of `invite` and
+`join` and are wiped when they end; the code is printed once, by
+`meshly invite`, and never saved or journaled.
 
 ## Kernel state and how it is applied
 
@@ -146,14 +148,16 @@ is a no-op ("kernel state already matches").
 
 Recovery directions:
 
-- **Backward** (operations that grant or restore access: `init`, `approve`,
-  `activate`, `allow`, `start`, `restart`, `set`, service start/reload,
-  check-repair). On failure the engine reconciles back to the base
-  configuration and re-saves it, recording `rolled-back` (exit 7).
+- **Backward** (operations that grant or restore access: `init`, `invite`
+  (adding the joining node), `join`, `allow`, `start`, `restart`, `set`,
+  service start/reload, check-repair). On failure the engine reconciles back
+  to the base configuration and re-saves it, recording `rolled-back`
+  (exit 7).
 - **Forward** (operations that reduce access: `deny`, `revoke`, `stop`,
-  `reset`). On failure the engine retries reconciling to the target and
-  records `commit` with "completed after retry". An interruption must never
-  re-open access that the administrator removed.
+  `reset`, `invite-undo` and `join-undo`, which remove a joined node that
+  did not confirm the connection). On failure the engine retries reconciling
+  to the target and records `commit` with "completed after retry". An
+  interruption must never re-open access that the administrator removed.
 
 If the rollback or retry also fails, the engine enters **safe mode**,
 records `safe-mode` and exits with 8: it applies a lockdown table (same
@@ -164,6 +168,21 @@ touched and the saved configuration is kept. `meshly start` re-applies it.
 
 Ownership conflicts (a foreign interface or table with meshly's name) are
 never "repaired": the operation stops with exit 5 and nothing is changed.
+
+### Temporary overlays
+
+Pairing needs kernel state that belongs to no saved configuration: the
+temporary peer and firewall rule of an open invite, and the joining node's
+temporary tunnel. An `engine.Overlay` adds an extra WireGuard peer (with a
+preshared key), extra `allow_in` entries, or a replacement private key on
+top of a configuration. `ApplyOverlay` reconciles to the configuration plus
+the overlay and verifies it; on failure it restores the plain
+configuration. An overlay is never saved, journaled or printed, and an
+operation that carries one (`Op.Overlay`) rolls back and recovers without
+it. Removing an overlay is a plain reconcile to the saved configuration (or
+to none, on a node that has not joined yet), so anything that re-applies the
+configuration (the check timer, `meshly start`, a reboot) also removes a
+leftover one.
 
 ### Recovery of interrupted operations
 
@@ -191,12 +210,16 @@ up to 30 seconds, otherwise exit 6. Read-only commands (`status`, `doctor`,
 `rules`, `logs`) take no lock; `status` reports `operation_in_progress` from
 a non-blocking probe. The check timer never waits: if the lock is held it
 does nothing. `upgrade` holds the lock while replacing the binary.
+`invite` holds it for its whole wait, so the check timer cannot "repair"
+the invite's temporary state away; other changing commands then exit 6 with
+a message that names the open invite and its expiry.
 
 ## systemd integration
 
 The unit files are embedded in the binary and rendered with the resolved
-executable path and interface name. `init`, `activate` and `start` install
-them (only rewriting files whose content differs), enable and start them;
+executable path and interface name. `init`, `join`, `start` and an
+`invite` that a node joined install them (only rewriting files whose
+content differs), enable and start them;
 `meshly service install` rewrites them (used by `upgrade`); `reset` stops,
 disables and removes them.
 
@@ -213,9 +236,10 @@ disables and removes them.
 - `meshly-check.timer` (2 min after boot, then every minute) runs
   `meshly-check.service` → `meshly service check`: it records learned peer
   endpoints, computes drift, and repairs it in a journaled `check-repair`
-  transaction (for example a deleted or modified meshly table, or a changed
-  sysctl). `Requisite=meshly.service` means the check never starts the link
-  when the service is stopped.
+  transaction (for example a deleted or modified meshly table, a changed
+  sysctl, or the temporary peer of an invite that was killed).
+  `Requisite=meshly.service` means the check never starts the link when the
+  service is stopped.
 - `systemctl stop meshly` tears the link down without changing the
   configuration; `meshly stop` additionally saves admin state `down`, so the
   link stays down across reboots until `meshly start`.
@@ -233,15 +257,25 @@ disables and removes them.
   `ProtectKernelTunables` stays off because per-interface sysctls are
   written.
 
-## Bootstrap
+## Pairing
 
-Trust is established with three signed files carried by the administrators
-over a channel they already trust (typically `scp`): an invite (one-time,
-1 h by default, at most 24 h), a join request, and a join accept. Each node
-confirms the other's fingerprint (derived from its Ed25519 identity key)
-explicitly, interactively or with `--expect-fingerprint`. Nothing is trusted
-before `approve`, and only the accept that answers the node's own pending
-request can be activated. Details: [bootstrap-protocol.md](bootstrap-protocol.md).
+The second node joins with a one-time code. `meshly invite`, on the node
+with the public endpoint, prints the code, holds the lock and waits (10
+minutes by default, at most 1 hour). `meshly join`, on the other node, reads
+the code from a prompt or stdin, never from its arguments.
+
+The code carries the inviting node's endpoint and WireGuard public key, the
+network CIDR, the expiry and a 128-bit secret. Both nodes derive a temporary
+WireGuard key and a preshared key from the secret and build a temporary
+tunnel with them (overlays, see above) through the WireGuard port that is
+already open. Inside it the joining node sends its name and WireGuard public
+key over TCP to the inviting node's VPN address and receives the network's
+settings and its address. Each node then commits the other as its peer in a
+journaled transaction (`invite` and `join`), the joining node switches to its
+own key and confirms the connection through the real tunnel, and the invite
+closes. If the confirmation does not come, both sides undo the join
+(`invite-undo`, `join-undo`). Every way out of `invite` removes its temporary
+state. Details: [pairing-protocol.md](pairing-protocol.md).
 
 ## Upgrade
 
@@ -360,15 +394,26 @@ Each entry: context, decision, consequences.
   WireGuard roaming still updates the endpoint from authenticated packets. An
   idle link sends one small packet every 25 s in each direction.
 
-### D7. File-based bootstrap instead of a coordination server
+### D7. Pairing through the WireGuard port, without a server
 
 - **Context.** A coordination service is an extra component to run, secure
-  and trust, and two administrators of two servers already have SSH.
-- **Decision.** Trust is exchanged as signed files over an existing trusted
-  channel, with explicit fingerprint confirmation on both sides, one-time
-  invites with expiry, and binding of each message to the previous one.
-- **Consequences.** No network-exposed control plane and no third party. The
-  administrators have to copy three files and compare two fingerprints.
+  and trust. A pairing service of meshly's own that listens on the internet,
+  even for a few minutes, would be new attack surface. The administrator
+  should not have to look up or type addresses, ports or keys.
+- **Decision.** The inviting node prints a one-time code with everything the
+  joining node needs: endpoint, WireGuard public key, CIDR, expiry and a
+  128-bit secret. Keys derived from the secret open a temporary WireGuard
+  tunnel to the WireGuard port that is already open, and the two nodes
+  exchange keys and settings inside it, over TCP on the inviting node's VPN
+  address. The code is the only thing the administrator copies, from one
+  terminal to the other.
+- **Consequences.** No server, no third party, and nothing new reachable
+  from the internet, even while the invite waits. Pairing needs the same UDP
+  path as the link itself, so a blocked port shows up at `join` (exit 13)
+  rather than later. The code is a bearer secret: whoever uses it first while
+  the invite is open joins, and the channel it is copied over is a trust
+  boundary ([threat model](threat-model.md)). It is long (111 characters for
+  an IPv4 endpoint) because it carries a 32-byte key.
 
 ### D8. `start`/`stop`/`restart` and `upgrade` from GitHub releases
 

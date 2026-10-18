@@ -26,15 +26,15 @@ run it, and, at the end, what has **not** been verified. Background:
 | Package | Covers |
 |---|---|
 | `internal/model` | Validation of every configuration field (names, interface names, CIDRs, addresses, endpoints incl. IPv6 notation, ports, MTU, keepalive, mark, keys), rule parsing, address allocation, conflicts with local prefixes. |
-| `internal/store` | Directory and file modes and ownership, refusal of symlinks and non-regular files, atomic writes, bounded reads of untrusted files, config history pruning, keys (never printed, wiped), runtime and bootstrap state. |
+| `internal/store` | Directory and file modes and ownership, refusal of symlinks and non-regular files, atomic writes, bounded reads of untrusted files, config history pruning, keys (never printed, wiped), runtime state and the marker of an open invite. |
 | `internal/journal` | Append/read, torn and corrupt lines after a crash, incomplete operation detection, rotation (never with an open operation). |
-| `internal/bootstrap` | Round trip of invite → request → accept, tampering of every part, signature domain separation, strict JSON (unknown, duplicate or non-canonical keys), validity periods and clock skew, accept pinned to the inviter, fingerprints. |
+| `internal/pairing` | Invite codes: round trip for IPv4 and IPv6 endpoints, tolerant input (whitespace, letter case), every refusal (prefix, base32, length, family, checksum, fields, another version, expiry with clock skew), expiry truncated to seconds; derived keys against fixed test vectors, and wiping. Messages: the exchange between both sides, size limit and framing, strict JSON (unknown, duplicate or non-canonical keys), a hostile peer on either side, refusal to send an invalid message. The in-memory network used by the CLI tests. |
 | `internal/nft` | Deterministic rendering and policy hash, rule shapes (default deny, no forwarding, DNAT refusal, IPv4 only, no `established` shortcut inbound), lockdown table, rejection of unsafe input, ownership marker round trip, analysis of foreign rulesets. |
-| `internal/engine` | Bring-up order (firewall first), tear-down order (traffic path first), idempotency, ownership conflicts, backward rollback (also after the config was saved), forward completion, safe mode when rollback fails, recovery in both directions, drift, endpoint hints. Uses `internal/engine/enginetest`. |
+| `internal/engine` | Bring-up order (firewall first), tear-down order (traffic path first), idempotency, ownership conflicts, backward rollback (also after the config was saved), forward completion, safe mode when rollback fails, recovery in both directions, drift, endpoint hints; temporary overlays (an extra peer with a preshared key, extra allow entries, a temporary private key) never saved, the saved configuration restored when an overlay fails, the preshared key cleared when a peer is updated in place. Uses `internal/engine/enginetest`. |
 | `internal/preflight` | UFW/firewalld/legacy iptables detection, local port parsing and listen port selection, conflict checks, profile selection and firewall evaluation. |
 | `internal/systemd` | Unit rendering (unsafe executable paths refused), installation incl. networkd/NetworkManager files and the nftables drop-in, uninstall, exact `systemctl` argument vectors, state parsing. |
 | `internal/upgrade` | Release key parsing, signed message format, signature verification, `SHA256SUMS` parsing (single version), version comparison, download over a local test server with tampered files, URL policy (HTTPS only, loopback for tests), binary install and rollback. |
-| `internal/cli` (Linux) | Full two-node flow (`init` → `invite` → `join` → `approve` → `activate` → `allow`/`deny`/`revoke`) on two fake kernels, absence of private keys in all output and copied files, exit codes (including 7 rolled back and 8 safe mode, and leaving safe mode with `start`), rejection of invalid bootstrap files. |
+| `internal/cli` (Linux) | Full two-node flow (`init` → `invite` + `join` → `allow`/`deny`/`revoke`) on two fake kernels joined by an in-memory network, absence of private keys, the invite code and the keys derived from it in all output, the journal, the configuration and `status`, exit codes (including 7 rolled back and 8 safe mode, and leaving safe mode with `start`). Pairing: how the code is read (prompt, stdin, refused as an argument), the name from the host name, preflight before any contact, every answer of the invite by state, name taken, code used, no answer, cancel, hang-up and expiry on both sides, a confirmation at the deadline, an unconfirmed join undone on both sides, the open invite in `status` and `doctor`, a killed invite closed by the next command, leftovers of a crashed join removed. |
 
 `internal/nft/testdata/nft-1.0.6` and `nft-1.0.9` hold `nft -j list ruleset`
 output captured from real nftables 1.0.6 (Debian 12) and 1.0.9
@@ -57,7 +57,8 @@ docker run --rm -v "$PWD/bin:/t" debian:12 /t/cli.test -test.v
 
 | Target | Input |
 |---|---|
-| `internal/bootstrap` `FuzzOpen` | bootstrap envelopes (invite, request, accept files) |
+| `internal/pairing` `FuzzParseCode` | Invite codes as pasted; a code that parses must parse again, unchanged, from its own text form |
+| `internal/pairing` `FuzzReadRequest` | Requests on the inviting node's pairing port; what is accepted must be valid and carry exactly one body |
 | `internal/model` `FuzzParseRule` | `allow`/`deny` arguments |
 | `internal/model` `FuzzParseEndpoint` | `IP:PORT` endpoints |
 | `internal/model` `FuzzParseEndpointOrAddr` | Endpoints with an optional port; agrees with `FuzzParseEndpoint` where both accept |
@@ -124,21 +125,27 @@ nftables tables are recreated empty, and systemd boots again.
 | `TestCompromisedPeerContained` | With root on the VPS turned hostile (meshly table removed, WireGuard allowed-ips and routes widened): no access to the home LAN, to home's LAN address, to ports without a rule, with a spoofed VPN source address (from the VPN and from the LAN), or through Docker-style DNAT and redirect; forwarding stays blocked even after `forwarding=1` is set on the interface, and the check repairs that sysctl. |
 | `TestForeignStatePreserved` | Foreign nftables tables, routes, interfaces and public SSH are byte-for-byte unchanged across `init`, `allow`, `set mtu`, `stop`, `start`, `revoke` and `reset`; `reset` leaves no meshly objects. |
 | `TestNATAndIdle` | With 30 s UDP conntrack timeouts on the NAT gateway, the link works after 70 s idle, and again after all NAT mappings are flushed. |
-| `TestIdempotency` | Repeating `init`, `invite` (same invite), `activate` and `allow` leaves the kernel state (interface, routes, WireGuard, nftables) exactly as before. |
+| `TestIdempotency` | Repeating `init`, `allow` and `start` leaves the kernel state (interface, routes, WireGuard, nftables) exactly as before; a repeated `deny` has nothing to remove. |
 | `TestConcurrentOperations` | Parallel commands are serialised by the lock; `status` works while they run. |
-| `TestBootstrapTrust` | Modified invites, requests and accepts are rejected (exit 4); a wrong expected fingerprint stops `join`/`approve` (exit 10); invites are one-time; an accept activates only the node whose request it answers; private keys never appear in output or in copied files. |
+| `TestPairing` | `invite` and `join` pair the nodes; the inviting node has only the joined node's key as a peer, and there is no drift on either node. The invite code and the keys derived from it are not in the journal, the process list, `status`, `doctor` or `logs`; `status` and `doctor` show an open invite without an alarm; key files are `0600` in a `0700` directory, and no private key appears in output or readable files. |
+| `TestPairingRefusals` | A damaged code is refused (exit 4) and leaves nothing behind; a code given as an argument is refused (exit 2); a used code gets no answer (exit 13 within 45 s); an invite expires (exit 13) with nothing left of it; a code just past its expiry gets no answer (13), and one beyond the clock-skew allowance is refused as expired (4). |
+| `TestPairingNothingExposed` | While an invite waits, the only new socket is TCP 51820 on the VPN address; the public address does not accept it; a host with a route to the VPN address through the VPS is dropped by `guard_pre` (its counter grows), while another address of the VPS on the same route is reachable; no new UDP socket appears. |
+| `TestPairingUDPBlocked` | With UDP to the WireGuard port blocked, `join` exits 13 within 45 s and says why, changing nothing; the same code works once the path is open. |
+| `TestPairingCleanup` | Ctrl+C on `invite` (exit 10) leaves the kernel state as before; after `kill -9`, the temporary peer and the marker are still there until `meshly service check` removes them, journals `closed: interrupted` and leaves no drift. |
 | `TestEndpointDetected` | Without `--endpoint`, `init` on the vps (default route on the wan) advertises its public address with port 51820, and `init` on home (private address behind NAT) advertises none. |
-| `TestInviteExpiry` | Expired invites are refused. |
 | `TestFaultsInit` | `init` with `error` and `crash` at every point leaves either nothing or the complete, verified configuration after recovery. |
 | `TestFaultsAllow` | An interrupted `allow` is either fully in effect (config and packets) or not at all; with a failing rollback, safe mode removes the interface, the lockdown table admits no peer, and `start` restores the link without the failed rule. |
 | `TestFaultsReduce` | Interrupted `deny`, `stop` and `revoke` are completed by recovery; access is closed afterwards in every case. |
-| `TestFaultActivate` | A crash during `activate` is rolled back and `activate` can be repeated. |
+| `TestFaultJoin` | A crash of `join` while it configures WireGuard is cleaned up on the joining node; the inviting node undoes the join that was never confirmed and keeps waiting, and a second `join` with the same code succeeds. |
 | `TestUnsupportedFirewalls` | UFW, firewalld, legacy iptables rules and an iptables-nft drop chain each stop `init` and `init --dry-run` with exit 3 and a message naming the cause, with no change to the host. |
 | `TestNativeNftablesProfile` | A host firewall with `policy drop`: refused without the integration rule and with a misplaced one; works with it; the application port stays closed publicly and public SSH stays open; SSH is not reachable through the VPN without a rule; deleting the meshly table closes what meshly opened (fail-closed) until the check repairs it; with the integration rule removed, `allow` is refused, `deny`/`revoke` still work, and `doctor` exits 12 with the rule to add. |
 | `TestSystemdLifecycle` | Units enabled and active after pairing; after a reboot the link and an allowed service come back, with the firewall table installed before the interface; `systemctl stop/start/restart meshly` leave the configuration unchanged; `meshly stop` survives a reboot; an operation crashed before a reboot is recovered at boot and does not take effect; `nftables.service` start, reload and restart with `flush ruleset` keep the meshly table and the service reachable; the check timer is scheduled, and `meshly-check.service` restores a deleted table; after safe mode, `meshly-check.service` brings the link back from the saved configuration without the failed change. |
-| `TestInstallUpgradeUninstall` | `install.sh` installs from a local release tree and refuses a tampered `SHA256SUMS` or binary; `upgrade --check`, `upgrade` (needs `--yes` non-interactively), `.prev` kept, repeated upgrade is a no-op; the service is reachable after the upgrade; a downgrade needs `--force` (exit 5); a modified `SHA256SUMS` (signature mismatch) is refused (exit 4) without changing the binary; `reset` removes units, kernel objects and state without touching foreign state. |
+| `TestInstallUpgradeUninstall` | `install.sh` installs from a local release tree and refuses a tampered `SHA256SUMS` or binary; `upgrade --check`, `upgrade` (needs `--yes` non-interactively), `.prev` kept, repeated upgrade is a no-op; the service is reachable after the upgrade; a downgrade needs `--force` (exit 5); a modified `SHA256SUMS` (signature mismatch) is refused (exit 1) without changing the binary; `reset` removes units, kernel objects and state without touching foreign state. |
 
-A full run takes about 7 minutes on an Apple-silicon laptop with OrbStack.
+A full run takes about 9 minutes on an Apple-silicon laptop with OrbStack.
+`MESHLY_IT_SHORT=1` skips the slow parts: `TestNATAndIdle`, `TestFaultJoin`
+and the expiry checks of `TestPairingRefusals`, which wait for a real invite
+to expire.
 
 ## Continuous integration
 
@@ -197,13 +204,19 @@ care, and please report results from real systems.
 - **Automatic firing of the check timer.** The test checks that the timer is
   scheduled and starts `meshly-check.service` by hand.
 - **Distribution coverage.** Only Debian 12 (nftables 1.0.6) and Ubuntu 24.04
-  (nftables 1.0.9). `TestPolicy` runs on both; all other integration tests,
-  including all systemd tests, run on Debian 12 only.
+  (nftables 1.0.9). `TestPolicy`, which pairs the nodes with `invite` and
+  `join`, runs on both; all other integration tests, including all systemd
+  tests, run on Debian 12 only.
+- **Two nodes racing for one invite.** The `used` answer to a second node
+  that reaches the invite before it closes is tested only on fake kernels
+  (`TestJoinCodeUsed`). With real packets, the second node tries only after
+  the invite has closed, and gets no answer (exit 13).
 - **Architecture coverage.** The integration suite was run locally on arm64.
   amd64 is covered only by the CI workflow.
 - **IPv6 transport.** Validation accepts IPv6 endpoints (`[2001:db8::1]:51820`),
-  but no test runs WireGuard over IPv6. Learned endpoint hints are used only
-  for IPv4. IPv6 inside the VPN is not supported by design.
+  and invite codes carry them, but no test runs WireGuard or pairing over
+  IPv6. Learned endpoint hints are used only for IPv4. IPv6 inside the VPN
+  is not supported by design.
 - **Real networks.** One Linux masquerading NAT with short timeouts; no
   carrier-grade or symmetric NAT, no real cloud firewalls or security groups,
   no path-MTU problems.

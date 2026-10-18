@@ -36,7 +36,7 @@ make build      # bin/meshly for linux/$(go env GOARCH)
 |---|---|---|
 | Unit | `make test` (`go test ./...`) | Pure Go; the CLI flow tests (`internal/cli/*_linux_test.go`) need Linux, see below |
 | Race | `go test -race ./...` | CI runs this on amd64 and arm64 |
-| Fuzz | `make fuzz` (`FUZZTIME=30s` per target) | Bootstrap envelope, rules, endpoints, CIDRs, nft JSON, config |
+| Fuzz | `make fuzz` (`FUZZTIME=30s` per target) | Invite codes, pairing messages, rules, endpoints, CIDRs, nft JSON, config |
 | Fault injection | `go test -tags meshly_faultinject ./...` | Builds with crash/error injection points; see [docs/testing.md](docs/testing.md) |
 | Integration | `make integration` | Docker, privileged containers, kernel with WireGuard and nf_tables. About 10 minutes |
 

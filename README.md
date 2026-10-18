@@ -58,9 +58,10 @@ flowchart LR
   already established.
 - **No accidental exposure.** No forwarding into or out of the tunnel, no access to the LAN, and no IPv6 inside the
   VPN. Docker port publishing (DNAT) cannot be used to bypass the policy. Spoofed sources are dropped.
-- **Secure bootstrap without a server.** Setup goes invite → join → approve → activate. The four files are one-time,
-  time-limited and signed with Ed25519. Each side confirms the other's fingerprint by eye, and no secret passes
-  through command-line arguments.
+- **Secure pairing without a server.** `meshly invite` prints a one-time code, and `meshly join` on the other server
+  asks for it. The servers exchange their keys through the WireGuard port that is already open, so nothing new is
+  reachable from the internet, even while the invite waits. The code works once, expires after 10 minutes and never
+  passes through command-line arguments.
 - **Safe changes.** Every change is a journaled transaction with verification and rollback. If a failure leaves the
   tunnel in an unknown state, meshly closes it (*safe mode*) rather than leaving it open. An operation interrupted by
   a crash or power loss is finished or rolled back on the next start.
@@ -101,7 +102,7 @@ curl -fsSL https://github.com/nikitakiselev/meshly/releases/latest/download/inst
 The installer downloads the binary for your architecture and verifies the Ed25519 signature of `SHA256SUMS` with
 the release key built into the script. It then checks the binary's SHA-256 and installs it as
 `/usr/local/bin/meshly`. It makes no other change: the network, firewall and systemd setup is done later by
-`meshly init`, `meshly join` and `meshly activate`.
+`meshly init` and `meshly join`.
 
 <details>
 <summary>Install a specific version, inspect the installer first, or verify by hand</summary>
@@ -138,12 +139,13 @@ Every release is also rebuilt from the tagged source by the
 The example uses two servers:
 
 - **vps**: public IP `203.0.113.10`. Allow inbound **UDP 51820** in your cloud firewall.
-- **home**: behind NAT, can reach the VPS (for example over SSH).
+- **home**: behind NAT; it reaches the VPS on that UDP port.
 
-meshly passes trust through small files. Copy them over a channel you already trust, such as `scp` to a host whose
-SSH key you have verified. All copies below are run on **home**, because it can reach the VPS.
+`meshly invite` on vps prints a code, and you paste it into `meshly join` on home. Copy the code from your own
+terminal: it works once and expires after 10 minutes. The samples below leave out the steps that each command lists
+while it applies them.
 
-**1. On vps:** create the network and an invite.
+**1. On vps:** create the network.
 
 ```console
 admin@vps:~$ sudo meshly init homelab --name vps
@@ -152,54 +154,45 @@ Network "homelab" created.
   endpoint:     203.0.113.10:51820, detected on eth0 (to change: meshly set endpoint IP)
                 UDP 51820 must be reachable; cloud firewalls are not managed by meshly
   firewall:     profile none; all inbound VPN traffic is denied until `meshly allow`
-  fingerprint:  VJW7-OEX7-FGSZ-Y6TN-AID5-LTGJ-YBDE-OJNN
+  public key:   bWcWhZaUNdCDGVVlpXq8o/ep9g9jtumd2jC7Zsju9C4=
 
-admin@vps:~$ sudo meshly invite --out home.invite
-Invite written to home.invite (one-time, expires 2026-10-17T20:30:33Z).
-  fingerprint:  VJW7-OEX7-FGSZ-Y6TN-AID5-LTGJ-YBDE-OJNN   <- the joining admin must see exactly this
+Next: run `sudo meshly invite` on this node and `sudo meshly join` on the other.
 ```
 
 You do not need to look up the VPS address: meshly finds the public IP on its network interface and uses the standard
 WireGuard port 51820. Some clouds (AWS, GCP) give the server only a private address and map the public one from outside;
 there meshly reports that it found none, and you pass the address yourself: `--endpoint 203.0.113.10`.
 
-**2. On home:** fetch the invite, join, and send the request back.
+**2. On vps:** open an invite. It prints a code and waits.
 
 ```console
-admin@home:~$ scp admin@203.0.113.10:home.invite .
-admin@home:~$ sudo meshly join home.invite --name home
-Invite from node "vps" for network "homelab":
-  inviter fingerprint: VJW7-OEX7-FGSZ-Y6TN-AID5-LTGJ-YBDE-OJNN
-Does this fingerprint match the one printed by `meshly invite` on vps? Type 'yes' to continue: yes
+admin@vps:~$ sudo meshly invite
+Waiting for a node to join network "homelab" until 20:40 UTC (10 minutes). Ctrl+C cancels.
+On the other node run `sudo meshly join` and paste this code:
 
-Join request written to home.request. Nothing is trusted yet.
-  your fingerprint: ECSR-MFJA-MIHL-ML4O-LBKG-YFZP-ETRH-4A7P   <- the admin of vps must see exactly this at approve
+m1atfqa4ikzjwg2zywqwljinoqqmmvkznfpk6kh55j6yhwhnxjtxndbo3gzdxpilqkmqaaagdk2uxkasjvuxzmxu2ljlylk2tq5xtgw2omnywbs
 
-admin@home:~$ scp home.request admin@203.0.113.10:
+Node "home" (10.100.0.2) joined. The invite is closed.
 ```
 
-**3. On vps:** approve the new node.
+The last line appears once home has joined in step 3. The invite then closes by itself, and the code no longer
+works. While it waits, nothing new is reachable from the internet: the servers talk through the WireGuard port.
+
+**3. On home:** join, and paste the code when asked.
 
 ```console
-admin@vps:~$ sudo meshly approve home.request
-Join request from node "home":
-  fingerprint:     ECSR-MFJA-MIHL-ML4O-LBKG-YFZP-ETRH-4A7P
-Compare the fingerprint with the one printed by `meshly join` on home. Approve this node? Type 'yes' to approve: yes
-Node "home" approved; its key is on meshly0 with allowed IP 10.100.0.2/32 only.
-Accept written to home.accept.
+admin@home:~$ sudo meshly join
+Invite code: m1atfqa4ikzjwg2zywqwljinoqqmmvkznfpk6kh55j6yhwhnxjtxndbo3gzdxpilqkmqaaagdk2uxkasjvuxzmxu2ljlylk2tq5xtgw2omnywbs
+Connecting to 203.0.113.10:51820...
+Joined network "homelab" as "home" (10.100.0.2).
+  peer:  vps 10.100.0.1 via 203.0.113.10:51820
+Inbound VPN traffic to this node is denied until you run `meshly allow` here.
 ```
 
-**4. On home:** activate.
+The node is named after its host name (here `home`); choose another name with `--name`. If home cannot reach the
+VPS on UDP 51820, `join` says so after 30 seconds and changes nothing.
 
-```console
-admin@home:~$ scp admin@203.0.113.10:home.accept .
-admin@home:~$ sudo meshly activate home.accept
-Membership in network "homelab" is active.
-  this node:  home 10.100.0.2
-  peer:       vps 10.100.0.1 via 203.0.113.10:51820
-```
-
-**5. Allow what each side needs.** Rules are per node: a rule opens a port on the node where you run it.
+**4. Allow what each side needs.** Rules are per node: a rule opens a port on the node where you run it.
 
 ```sh
 admin@vps:~$  sudo meshly allow 22/tcp from home     # home may SSH to vps at 10.100.0.1
@@ -207,15 +200,15 @@ admin@home:~$ sudo meshly allow 9100/tcp from vps    # vps may scrape node_expor
 admin@home:~$ sudo meshly allow ping from vps
 ```
 
-**6. Check.**
+**5. Check.**
 
 ```sh
 sudo meshly status     # configuration, interface, handshake, traffic, rules, drift
 sudo meshly doctor     # every check with a verdict; exit 0 = no problems
 ```
 
-The link starts at boot via `meshly.service`. For scripts and automation, the non-interactive forms are
-`meshly join … --expect-fingerprint FP` and `meshly approve … --expect-fingerprint FP`.
+The link starts at boot via `meshly.service`. For scripts, `meshly join` also reads the code from stdin: see
+[pairing from a script](docs/cli.md#pairing-from-a-script).
 
 ## Everyday use
 
@@ -233,8 +226,8 @@ The link starts at boot via `meshly.service`. For scripts and automation, the no
 | Remove the peer | `sudo meshly revoke home` |
 | Remove meshly from a node | `sudo meshly reset` |
 
-Every command that changes something supports `--dry-run`. Run `meshly help <command>` for details. The full
-reference, including exit codes and JSON schemas, is in [docs/cli.md](docs/cli.md).
+`init`, `allow`, `deny`, `revoke`, `start`, `stop` and `set` accept `--dry-run`. Run `meshly help <command>` for
+details. The full reference, including exit codes and JSON schemas, is in [docs/cli.md](docs/cli.md).
 
 ## How it works
 
@@ -253,8 +246,10 @@ reference, including exit codes and JSON schemas, is in [docs/cli.md](docs/cli.m
 
 - Private keys are generated on the node, stored with mode `0600` under `/etc/meshly/keys`, and never printed,
   logged or put in JSON output.
-- Bootstrap files are signed with Ed25519 and bound to each other, so they can be neither replayed nor reused.
-  The fingerprints are what you compare by eye ([protocol](docs/bootstrap-protocol.md)).
+- The invite code is a one-time secret. It holds the VPS's WireGuard public key, so home talks to that server only,
+  and a random secret, so only someone with the code gets in while the invite waits. It is never accepted as an
+  argument and never logged ([pairing protocol](docs/pairing-protocol.md)). Copy it yourself, from your own
+  terminal: whoever has it can join.
 - Releases are signed with an offline Ed25519 key. `install.sh` and `meshly upgrade` both verify the signature.
 - The guarantees, and what is out of scope, are in the [threat model](docs/threat-model.md).
 
@@ -266,7 +261,7 @@ reference, including exit codes and JSON schemas, is in [docs/cli.md](docs/cli.m
 |---|---|
 | [docs/cli.md](docs/cli.md) | Every command, flag, exit code and JSON output |
 | [docs/architecture.md](docs/architecture.md) | Components, on-disk state, transactions, systemd, upgrade; design decisions |
-| [docs/bootstrap-protocol.md](docs/bootstrap-protocol.md) | Invite / join / approve / activate specification |
+| [docs/pairing-protocol.md](docs/pairing-protocol.md) | The invite code and how `invite` and `join` pair two nodes |
 | [docs/firewall.md](docs/firewall.md) | Packet path, the `inet meshly` table, supported firewall profiles, Docker |
 | [docs/threat-model.md](docs/threat-model.md) | Assets, attackers, guarantees and non-goals |
 | [docs/diagnostics-and-recovery.md](docs/diagnostics-and-recovery.md) | Reading `status` and `doctor`; runbooks; recovery and safe mode |
@@ -278,6 +273,10 @@ reference, including exit codes and JSON schemas, is in [docs/cli.md](docs/cli.m
 
 **Why not just `wg-quick`?** `wg-quick` sets up a tunnel. It does not decide what may cross it, it does not stop
 Docker or forwarding from leaking your LAN, and it cannot roll back a half-applied change. meshly does all three.
+
+**`meshly join` says the VPS did not answer.** Either the invite is no longer open (it expired, was cancelled or was
+already used), or UDP 51820 does not reach the VPS: check its cloud firewall. Nothing was changed on home. Run
+`sudo meshly invite` on the VPS again if it ended, then `sudo meshly join` on home.
 
 **Can I connect more than two servers?** Not yet. A network has exactly two nodes in 0.0.x. See the
 [roadmap](docs/roadmap.md).

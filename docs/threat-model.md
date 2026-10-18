@@ -9,7 +9,7 @@ run against an in-memory fake kernel or recorded nft output. A claim
 without a test is marked *not verified*.
 
 Related: [architecture](architecture.md), [firewall](firewall.md),
-[bootstrap protocol](bootstrap-protocol.md),
+[pairing protocol](pairing-protocol.md),
 [diagnostics and recovery](diagnostics-and-recovery.md), [CLI](cli.md).
 
 ## Scope
@@ -30,19 +30,20 @@ LAN access and no forwarding in either direction.
 | Asset | Where | Why it matters |
 |---|---|---|
 | WireGuard private key | `/etc/meshly/keys/wireguard.key` (0600, dir 0700) | impersonation of the node inside the tunnel |
-| Identity private key (Ed25519) | `/etc/meshly/keys/identity.key` | signing invites and accepts, i.e. admitting a peer |
 | Policy (allow rules, peer, addresses) | `/etc/meshly/meshly.json`, kernel `inet meshly` table | decides what the peer can reach |
 | Services on each node | local sockets, often bound to `0.0.0.0` | the thing being protected |
 | LAN behind each node | e.g. the home network | must never be reachable through the VPN |
-| Bootstrap and transaction state | `/var/lib/meshly/` (0700) | one-time invites, replay protection, recovery |
+| Invite code | printed by `meshly invite`, valid once and for 10 minutes by default; then on screens, in clipboards, in whatever it is pasted into | whoever uses it first while the invite is open becomes the peer |
+| Transaction state | `/var/lib/meshly/` (0700) | recovery |
 | The meshly binary and release key | `/usr/local/bin/meshly`, compiled-in public key | code that runs as root |
 
 ## Trust boundaries
 
 1. **Internet path** between the nodes. Untrusted. WireGuard protects it.
-2. **The administrators' file channel** (scp/ssh) for the bootstrap files.
-   meshly assumes it exists. It does not authenticate the files by itself:
-   the fingerprint comparison does.
+2. **The way the invite code travels** from the inviting node's terminal to
+   the joining node's prompt, usually copied by one administrator. meshly
+   assumes it stays private while the invite is open. It cannot tell who
+   pastes the code: the code is a bearer secret.
 3. **The peer node.** It is authenticated, but only as trusted as the policy
    says. A compromised peer is an explicit attacker model.
 4. **Other interfaces of each node**: the public interface and the LAN.
@@ -73,13 +74,19 @@ Scan the public addresses.
   CIDR from other interfaces. *Integration:* `TestPolicy` (an attacker
   with a route to `10.100.0.0/24` via the VPS cannot reach an allowed
   service).
+- An open invite exposes nothing new. Pairing runs inside a temporary
+  WireGuard tunnel through the same UDP port, and its TCP listener is bound
+  to the VPN address. *Integration:* `TestPairingNothingExposed` (the only
+  new socket is on the VPN address; the public address does not accept the
+  pairing port; a host with a route to the VPN address through the VPS is
+  dropped by `guard_pre`).
 
 **Not protected:**
 
 - denial of service (the path can be cut);
 - traffic analysis: endpoints, volume, timing;
-- an attacker who controls the file channel *and* whose substituted
-  fingerprint the admin accepts without comparing (see 4).
+- an attacker who reads or replaces the invite code on its way between the
+  terminals (see 4).
 
 ### 2. Attacker on the LAN of either node
 
@@ -155,43 +162,70 @@ peer's configuration does not matter):
   attacked node any local process can still open connections to the
   services the *compromised* peer allows.
 
-### 4. Attacker who obtains or substitutes a bootstrap file
+### 4. Attacker who obtains or substitutes an invite code
 
-**Can:** read or replace an invite, join request or accept while it is in
-transit or lying around in a shared directory.
+**Can:** read the code while it is shown or copied (a shared screen, a chat,
+a clipboard, terminal scrollback, a recorded session), or hand the
+administrator of the joining node a code of their own.
 
-**meshly guarantees** (details in [bootstrap-protocol.md](bootstrap-protocol.md)):
+**meshly guarantees** (details in [pairing-protocol.md](pairing-protocol.md)):
 
-- **Substitution is detected by the fingerprint comparison.** `join` and
-  `approve` stop without an interactive `yes` or a matching
-  `--expect-fingerprint`. The fingerprint covers both public keys.
-  *Integration:* `TestBootstrapTrust` (a wrong inviter fingerprint gives
-  exit 10; a missing flag or another candidate's fingerprint at approve
-  gives exit 10).
-- **Modification breaks the signature.** *Integration:*
-  `TestBootstrapTrust` (a tampered invite, request or accept gives exit 4,
-  and no keys are generated for a rejected invite). *Unit:*
-  `TestTamperingDetected`, `TestSignatureDomainSeparation`, `TestStrictJSON`,
-  `FuzzOpen`.
-- **A stolen invite** lets the thief create a join request, which still
-  needs the inviting admin's explicit, fingerprint-checked approval. Invites
-  are one-time and expire (default 1 h, max 24 h). *Integration:*
-  `TestBootstrapTrust` (a second candidate on the same invite is refused
-  with "one-time", also after the first peer was revoked), `TestInviteExpiry`.
-- **A stolen accept** is useless elsewhere. It activates only the node whose
-  pending request and private keys it was issued for. *Integration:*
-  `TestBootstrapTrust` (the accept used on another candidate gives exit 4).
-- **The files contain no secrets.** *Integration:* `TestBootstrapTrust`
-  checks that private keys do not appear in the invite, the accept, the
-  saved state, `status`, `doctor`, `logs` (also `--json`) or process
-  arguments.
+- **Without the code there is nothing to talk to.** The invite's temporary
+  WireGuard peer is the public key of a key derived from the code's 128-bit
+  secret, with a preshared key derived from it too. A handshake without
+  them gets no answer, and the temporary peer reaches only TCP 51820 on the
+  inviting node's VPN address. *Integration:* `TestPairingNothingExposed`
+  (nothing new is reachable from outside the tunnel), `TestPairingRefusals`
+  (the code of a closed invite gets no answer). *Unit:*
+  `TestOverlayPeerAndAllow` (the temporary peer, its preshared key and its
+  single allow entry, and their removal).
+- **A code works once, for a short time.** Once a node has joined, the
+  invite answers a second `hello` with `used` (exit 4), and once the invite
+  has closed, a second `join` gets no answer at all (exit 13). The invite
+  ends at its expiry (10 minutes by default, at most 1 hour), and the
+  joining node refuses a code more than 5 minutes past it (exit 4).
+  *Integration:* `TestPairingRefusals` (used code, expired invite, expired
+  code; nothing changes on the refused node). *CLI:* `TestJoinCodeUsed`,
+  `TestInviteSessionAnswers`, `TestInviteCancelAndExpiry`.
+- **The joining node talks only to the inviting node of the code.** The code
+  carries that node's WireGuard public key, so nobody else can answer
+  through the temporary tunnel, and the `welcome` must match the code (CIDR,
+  addresses, key, endpoint) or `join` stops (exit 1).
+- **A damaged code is refused before anything changes.** A checksum catches
+  typos and truncated pastes (exit 4). It is not a signature. *Unit:*
+  `TestParseCodeErrors`, `FuzzParseCode`. *CLI:* `TestJoinCodeInput`.
+  *Integration:* `TestPairingRefusals` (no interface, table, configuration
+  or key is left after the refusal).
+- **A hostile party in the exchange gains nothing from malformed input.**
+  Messages are parsed strictly and validated with the configuration's own
+  validators on both sides; a malformed message closes the connection, and a
+  `reject` text is limited to printable ASCII. *Unit:* `TestHostilePeer`,
+  `TestMessageSizeBoundary`, `FuzzReadRequest`.
+- **No temporary access is left behind.** Every way out of `invite`
+  removes the temporary peer, its preshared key and its allow rule; after
+  `kill -9`, `meshly-check.timer` does it within a minute. *Integration:*
+  `TestPairingCleanup`, `TestPairing`. *CLI:* `TestPairFlow`.
+- **The code is kept out of everything else.** `join` refuses it as an
+  argument (exit 2), and neither the code nor the keys derived from it are
+  saved, journaled or shown by `status`, `doctor` or `logs`. *Integration:*
+  `TestPairing` (process list, journal, `status`, `doctor` and `logs`, also
+  `--json`), `TestPairingRefusals`.
 
 **Not protected:**
 
-- an admin who approves without comparing the fingerprint;
-- a thief whose request reaches the admin first and is approved without
-  comparison: then the thief becomes the peer. This is the residual risk of
-  file-based bootstrap; the fingerprint step exists to remove it.
+- **A stolen code used first.** Whoever joins with the code while the invite
+  is open becomes the peer. It reaches nothing until `meshly allow` on the
+  inviting node, the invite prints the name it joined with, and the real
+  node's `join` then fails (exit 13). Remove the intruder with `sudo meshly
+  revoke <name>`, then invite again.
+- **A substituted code.** The joining node then pairs with whoever made the
+  code. Nothing on the joining node is reachable until `meshly allow` there,
+  but what it sends to the peer's VPN address goes to that party. `join`
+  prints the endpoint it connects to and the peer it joined, so the
+  administrator can check the address before using the link.
+- **The code where it was copied to.** Scrollback, clipboard history, chat
+  logs keep it; it is a credential until the invite closes and useless
+  after that.
 
 ### 5. Local unprivileged user on a node
 
@@ -206,22 +240,21 @@ in shared directories such as `/tmp`.
 - **Secrets are unreadable to the user:**
   - keys are `0600` root in a `0700` directory;
   - state in `/var/lib/meshly` is `0700`/`0600`;
-  - the lock is in `/run/meshly` (`0700`).
+  - the lock and the marker of an open invite are in `/run/meshly`
+    (`0700`).
 
-  *Integration:* `TestBootstrapTrust` (key and directory modes).
+  *Integration:* `TestPairing` (key and directory modes).
 - **No secret in `argv`.** WireGuard is configured through netlink
-  (`wgctrl`) and nft scripts are passed on stdin; no shell is ever
-  involved. *Integration:* `TestBootstrapTrust` checks `ps` output once
-  (a spot check, not a proof).
+  (`wgctrl`), nft scripts are passed on stdin, and `join` reads the invite
+  code from a prompt or stdin and refuses it as an argument (exit 2); no
+  shell is ever involved. *Integration:* `TestPairing` checks `ps` output
+  while an invite waits (a spot check, not a proof), `TestPairingRefusals`
+  the refusal.
 - **Managed files cannot be swapped.** meshly refuses to load them if they
   are symlinks, not regular files, owned by another user or group- or
-  world-writable. *Unit:* `internal/store` tests (`fs_test.go`,
-  `keys_test.go`, `config_test.go`, `bootstrap_test.go`).
-- **Planted links do not redirect file I/O.** Bootstrap input files are
-  opened with `O_NOFOLLOW`, regular files only, and a FIFO does not block.
-  Output files are created with `O_EXCL|O_NOFOLLOW`; a symlink or directory
-  planted at the output path is refused even with `--force`. *Unit:*
-  `TestReadUntrusted`, `TestWriteOutputRefusesNonRegular`.
+  world-writable, and a FIFO planted at their path does not block it.
+  *Unit:* `internal/store` tests (`fs_test.go`, `keys_test.go`,
+  `config_test.go`, `invite_test.go`).
 
 **Not protected:**
 
@@ -250,7 +283,7 @@ release.
     `<exe>.prev`.
 
   *Integration:* `TestInstallUpgradeUninstall` (upgrade, repeated upgrade,
-  downgrade refused, forged `SHA256SUMS` refused with exit 4, binary
+  downgrade refused, forged `SHA256SUMS` refused with exit 1, binary
   unchanged after a refusal).
 - **`install.sh` performs the same checks** with `openssl` and `sha256sum`
   before anything is written to `/usr/local/bin`. *Integration:*
@@ -355,7 +388,7 @@ grants. Changes run as journaled transactions:
   table and removes the interface.
 
 *Integration:* `TestFaultsInit`, `TestFaultsAllow` (including safe mode),
-`TestFaultsReduce`, `TestFaultActivate`, which inject errors and crashes
+`TestFaultsReduce`, `TestFaultJoin`, which inject errors and crashes
 (immediate process exit without cleanup) at each step, and `TestSystemdLifecycle/recovery-at-boot`.
 Concurrent commands are serialised by a lock (`TestConcurrentOperations`).
 The fault-injection points exist only in builds with the
@@ -371,9 +404,10 @@ The fault-injection points exist only in builds with the
   against mistakes; root can rewrite it.
 - **More than two nodes, IPv6 inside the tunnel, and per-user policies.**
   They are not supported in this version.
-- **Time.** Validity checks use the local clocks, with 5 minutes of
-  tolerated skew for creation times. An attacker who controls a node's
-  clock controls that node's notion of expiry.
+- **Time.** An invite ends at its expiry by the inviting node's clock; the
+  joining node refuses the code more than 5 minutes past the expiry by its
+  own clock, to allow for clocks that differ. An attacker who controls a
+  node's clock controls that node's notion of expiry.
 
 ## Test environment caveat
 

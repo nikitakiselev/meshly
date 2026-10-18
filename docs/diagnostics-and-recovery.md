@@ -14,10 +14,10 @@ node can be configured correctly and still have no handshake because the
 peer is switched off.
 
 ```
-Configuration (saved, revision 4, 2026-10-17T19:30:58Z)
+Configuration (saved, revision 4, 2026-10-18T20:31:40Z)
   network      homelab  10.100.0.0/24  (id b5cf94172d66)
-  this node    vps  10.100.0.1  udp/51820  endpoint 198.51.100.10:51820
-  fingerprint  VJW7-OEX7-FGSZ-Y6TN-AID5-LTGJ-YBDE-OJNN
+  this node    vps  10.100.0.1  udp/51820  endpoint 203.0.113.10:51820
+  public key   bWcWhZaUNdCDGVVlpXq8o/ep9g9jtumd2jC7Zsju9C4=
   admin state  up   firewall profile none   2 allow rule(s)
 Service
   meshly.service active/enabled, check timer active   (systemd state says nothing about connectivity)
@@ -26,18 +26,20 @@ Interface
 Firewall
   table inet meshly  present, matches config
 Peer home
-  address 10.100.0.2   fingerprint ECSR-MFJA-MIHL-ML4O-LBKG-YFZP-ETRH-4A7P
+  address 10.100.0.2   public key Z4YzTt5wXZdSfsyoVJhIk0Q8KYaqf3moKZi95pr9DmA=
   wireguard configured, allowed-ips 10.100.0.2/32, route ok, keepalive 25s
   endpoint 198.51.100.20:51820
   connectivity: last handshake 6s ago, rx 180 B, tx 124 B
   may use here: ping, 22/tcp
 Transaction
-  none pending; last: allow commit at 2026-10-17T19:30:58Z
+  none pending; last: allow commit at 2026-10-18T20:31:40Z
 Drift
   none: kernel state matches the configuration
 ```
 
-- **admin state** is `up` after `start`/`init`/`activate` and `down` after
+- **public key** is this node's WireGuard public key, and the peer's is in
+  its section. The private key is never shown.
+- **admin state** is `up` after `init`, `join` or `start` and `down` after
   `meshly stop`.
 - **Service** is the systemd state only. `active` means the last start
   succeeded, not that the peer is reachable.
@@ -50,6 +52,31 @@ Drift
   operation with its outcome.
 - **Drift** lists every step that would be needed to make the kernel match
   the configuration. It is empty in normal operation.
+
+While `meshly invite` waits on this node, `status` says so. The invite holds
+meshly's lock, its temporary rules are in the firewall table, and drift is
+not checked:
+
+```
+! another meshly operation is in progress
+Configuration (saved, revision 1, 2026-10-18T20:30:00Z)
+  network      homelab  10.100.0.0/24  (id b5cf94172d66)
+  this node    vps  10.100.0.1  udp/51820  endpoint 203.0.113.10:51820
+  public key   bWcWhZaUNdCDGVVlpXq8o/ep9g9jtumd2jC7Zsju9C4=
+  admin state  up   firewall profile none   0 allow rule(s)
+Service
+  meshly.service active/enabled, check timer active   (systemd state says nothing about connectivity)
+Interface
+  meshly0  up, mtu 1420, addresses 10.100.0.1/32, listen udp/51820, key ok
+Firewall
+  table inet meshly  present, with the open invite's temporary rules
+Transaction
+  none pending; last: init commit at 2026-10-18T20:30:00Z
+Invite open until 2026-10-18T20:40:00Z: waiting for a node to join (run `sudo meshly join` on the other node).
+```
+
+`status --json` then has an `invite` object with `expires_at`. Only the
+expiry of an invite is ever shown, never its code.
 
 Without root, `status` works with reduced detail (no keys, WireGuard or
 firewall inspection).
@@ -109,9 +136,8 @@ never contains private keys.
 | `wireguard` | Kernel WireGuard module loaded or available. | Use the distribution kernel or `modprobe wireguard`; meshly installs no packages. |
 | `nftables` | `/usr/sbin/nft` exists and is version 1.0.6 or newer. | `apt install nftables` |
 | `systemd` | systemd is PID 1; without it there is no autostart. | — |
-| `config` | `/etc/meshly/meshly.json` is valid (or: not initialized). | Restore from `/var/lib/meshly/history/`, or `meshly reset`. |
-| `bootstrap` | A join request is waiting for its accept file. | `meshly activate <file.accept>` once the inviting node approved. |
-| `keys` | Key files are root-owned `0600` in a `0700` directory and match the public keys in the configuration. | Restore the original keys; new keys need a new trust procedure (`reset`, then `join`). |
+| `config` | `/etc/meshly/meshly.json` is valid (or: not initialized). | Restore from `/var/lib/meshly/history/`, or `meshly reset`. Not initialized: `meshly init` or `sudo meshly join`. |
+| `keys` | The key file is root-owned `0600` in a `0700` directory and matches the public key in the configuration. | Restore the original key; changing the key requires pairing again (`meshly reset`, then `join` again). |
 | `nftables-ruleset` | The ruleset could not be read. | Check that `nf_tables` is available in the kernel. |
 | `firewall-manager` | firewalld or UFW is active; there is no adapter for them. | Disable them and use native nftables, or do not use meshly on this host. |
 | `iptables-legacy` | Legacy iptables rules exist (or cannot be inspected). | Migrate them to nftables manually. |
@@ -126,19 +152,20 @@ never contains private keys.
 | `service` | `meshly.service` installed, enabled and active. | `meshly start`; `journalctl -u meshly` |
 | `transaction` | An operation did not finish (problem), or the last one ended in rollback or safe mode (warning). | `meshly recover`, or fix the cause and repeat; `meshly start` re-applies the configuration. |
 | `link` | The link is stopped by the administrator. | `meshly start` |
+| `invite` | An invite is open until the time shown; the drift check is skipped while it waits (info). | Let it finish, or cancel it with Ctrl+C where it runs. |
 | `drift` | The kernel differs from the configuration; the finding lists the differences. | `meshly start` (or wait for the check timer). |
 | `routes` | Routes on the meshly interface that meshly did not create; traffic to them is dropped. | Remove them (`ip route show dev meshly0`). |
 | `mtu` | The interface MTU is larger than the smallest outer MTU minus 80 bytes of WireGuard overhead. | `meshly set mtu <n>` on both nodes. |
-| `peer` | No peer yet. | `meshly invite` |
+| `peer` | No peer yet. | `sudo meshly invite` on this node and `sudo meshly join` on the other. |
 | `peer:<name>` | Handshake state of the peer; see [No handshake](#no-handshake). | Depends on the finding. |
 | `policy` | Number of packets from the VPN dropped by the default-deny policy since the table was loaded. | If a peer needs a service: `meshly allow <port>/<proto> from <peer>`. |
 | `service:<port>/<proto>` | For each allow rule: a service listens on the VPN address or on all addresses (ok), only on another address, or nothing listens. | Bind the service to the VPN address or `0.0.0.0`; start it. |
 | `probe:<port>/<proto>` | Result of `--probe` (see below). | Depends on the finding. |
 
-Preflight checks that run before `init`, `start` and `set cidr`, but not in
-`doctor`: `interface` (name taken by a foreign interface), `addresses` (VPN
-network overlaps local addresses or routes) and `listen-port` (UDP port in
-use).
+Preflight checks that run before `init`, `join`, `start` and `set cidr`, but
+not in `doctor`: `interface` (name taken by a foreign interface), `addresses`
+(VPN network overlaps local addresses or routes) and `listen-port` (UDP port
+in use).
 
 ### Active probe
 
@@ -159,16 +186,24 @@ Every mutating operation writes a `begin` record (operation, arguments,
 actor uid and `SUDO_USER`, recovery direction, plan, full target
 configuration) and a terminal record: `commit`, `rolled-back`, `safe-mode`
 or `recovered`. Events outside a transaction are recorded as `audit`
-records: `invite`, `join`, `upgrade` and `upgrade-rollback`, `reset`,
-`restart` and `service-stop`. The journal never contains private keys.
+records: `invite` (opened, with its expiry, and closed: `joined <name>`,
+`cancelled`, `expired`, `failed` or `interrupted`), `upgrade` and
+`upgrade-rollback`, `reset`, `restart` and `service-stop`. The journal never
+contains private keys or an invite code.
 
 ```
-$ sudo meshly logs -n 4
-2026-10-17 19:30:58  begin        allow          22/tcp from home  (uid=0 user=root)
-2026-10-17 19:30:58  commit       allow
-2026-10-17 19:30:58  begin        allow          ping from home  (uid=0 user=root)
-2026-10-17 19:30:58  commit       allow
+$ sudo meshly logs -n 6
+2026-10-18 20:30:00  audit        invite          (uid=0 sudo_user=admin)  — opened, expires 2026-10-18T20:40:00Z
+2026-10-18 20:31:05  begin        invite         peer=home  (uid=0 sudo_user=admin)
+2026-10-18 20:31:05  commit       invite
+2026-10-18 20:31:06  audit        invite          (uid=0 sudo_user=admin)  — closed: joined home
+2026-10-18 20:31:40  begin        allow          22/tcp from home  (uid=0 sudo_user=admin)
+2026-10-18 20:31:40  commit       allow
+
+Service output: journalctl -u meshly -u meshly-check
 ```
+
+On the joining node the same pairing is one `join` transaction.
 
 The journal is `/var/lib/meshly/journal.jsonl` (rotated at 4 MiB to
 `journal.jsonl.1`). `meshly reset` keeps it for audit. Output of the systemd
@@ -189,11 +224,20 @@ it automatically before doing anything else, and print, for example:
 meshly: recovered interrupted operation "allow": rolled-back
 ```
 
-- Operations that grant access (`init`, `approve`, `activate`, `allow`,
-  `start`, `set`) are rolled back unless their configuration had already been
-  saved, in which case they are completed.
-- Operations that reduce access (`deny`, `revoke`, `stop`, `reset`) are
-  always completed (`rolled-forward`).
+- Operations that grant access (`init`, `invite`, `join`, `allow`, `start`,
+  `set`) are rolled back unless their configuration had already been saved,
+  in which case they are completed.
+- Operations that reduce access (`deny`, `revoke`, `stop`, `reset`, and
+  `invite-undo` and `join-undo`, which remove a node that joined but did not
+  confirm) are always completed (`rolled-forward`).
+
+An invite that was killed (`kill -9`, or a power loss) holds no transaction,
+but leaves its temporary peer and firewall rule in the kernel and its marker
+`/run/meshly/invite.json`. The next command that takes the lock removes the
+marker and journals `invite` `closed: interrupted`. The check timer removes
+the temporary state within a minute, as drift; `sudo meshly start` removes it
+at once. A node that the invite had already added stays: its `invite`
+transaction had committed.
 
 `meshly recover` runs only this step, and is useful after a crash before
 looking at anything else. `doctor` reports an unfinished operation as
@@ -235,9 +279,10 @@ kernel with the configuration and repairs differences in a journaled
 - the interface, its address, WireGuard peers or routes were changed outside
   meshly.
 
-It skips the run if another meshly operation holds the lock, and never
-starts a link that was stopped (`meshly stop` or `systemctl stop meshly`).
-To repair immediately instead of waiting: `sudo meshly start`.
+It skips the run if another meshly operation holds the lock, for example
+while `meshly invite` waits, and never starts a link that was stopped
+(`meshly stop` or `systemctl stop meshly`). To repair immediately instead of
+waiting: `sudo meshly start`.
 
 ## After an nftables reload or `flush ruleset`
 
@@ -261,6 +306,40 @@ your own configuration with deleting only your own tables, for example
 
 ## Runbooks
 
+### Pairing fails
+
+`meshly join` changes nothing on the joining node unless it says otherwise.
+By exit code:
+
+- **13, the inviting node did not answer** within 30 seconds. Either the
+  invite is no longer open (expired, cancelled or already used: run `sudo
+  meshly invite` there again), or UDP to the WireGuard port does not get
+  through: open it in the cloud firewall or security group and check that
+  the inviting node's endpoint in `meshly status` is the address you expect
+  (`sudo meshly set endpoint IP` there, then a new invite). From the joining
+  node the two cases look the same.
+- **4, invalid invite code.** The code is damaged or incomplete (copy the
+  whole line again: whitespace and line breaks do not matter), it expired
+  (open a new invite), it was made by another meshly version (upgrade both
+  nodes), or another node already used it.
+- **5, conflict.** The name is taken by the inviting node (`--name`), or
+  this node is already a member of a network (`meshly status`; `meshly
+  reset` to leave it).
+- **3, preflight.** Something on this node conflicts with the network, for
+  example a route that overlaps the VPN CIDR or an unsupported firewall. The
+  message names it; nothing was sent to the inviting node.
+- **7, rolled back.** The real tunnel did not come up after the switch to
+  this node's own key. This node was rolled back; the invite undoes its side
+  after a minute and keeps waiting while the code is valid, so `sudo meshly
+  join` with the same code may be run again until then.
+- **1, joined, but not acknowledged.** The tunnel works, but the
+  confirmation got no answer. Check `meshly status` on both nodes. If the
+  inviting node lists no peer, run `sudo meshly reset` here and pair again.
+
+On the inviting node, `invite` exits 5 when the network already has a peer
+or the link is stopped, and 2 when the node has no public endpoint. A
+running invite blocks other changing commands (exit 6) until it ends.
+
 ### No handshake
 
 Run `sudo meshly doctor` on both nodes and look at `peer:<name>`:
@@ -268,11 +347,12 @@ Run `sudo meshly doctor` on both nodes and look at `peer:<name>`:
 1. *No WireGuard UDP packet reached this host on port N* (observed). The
    packets are dropped before the host: open UDP N in the cloud security
    group or provider firewall, or the router's port forwarding. meshly does
-   not manage these. Also check that the peer has run `meshly activate`.
+   not manage these. Also check that the peer has joined: its `meshly
+   status` must list this node.
 2. *UDP packets arrived but no handshake completed* (likely). The packets
    come from a key this node does not know: the peer was reset or a different
-   node is sending. Compare the fingerprints in `meshly status` on both
-   nodes; if they differ, `revoke` the peer and pair again.
+   node is sending. Compare the WireGuard public keys in `meshly status` on
+   both nodes; if they differ, `revoke` the peer and pair again.
 3. *Handshake initiations are sent but nothing comes back* (possible). The
    peer is down, UDP is blocked on the path, the configured endpoint is wrong,
    or the peer revoked this node. Check the peer with `meshly status`; fix the
@@ -345,8 +425,8 @@ sudo meshly reset --yes
 ```
 
 `reset` removes the link (traffic path first, then the firewall table), the
-configuration, keys, bootstrap and runtime state, the configuration history
-and the systemd units. Nothing outside meshly's own objects is touched. The
+configuration, the key, the runtime state, the configuration history and
+the systemd units. Nothing outside meshly's own objects is touched. The
 journal (`/var/lib/meshly/journal.jsonl`) and the binary remain; delete them
 by hand if you no longer need them:
 

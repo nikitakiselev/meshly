@@ -5,6 +5,7 @@ it, how meshly coexists with a host firewall (the *profiles*), what it refuses t
 
 - [The `inet meshly` table](#the-inet-meshly-table)
 - [Packet path](#packet-path)
+- [During an invite](#during-an-invite)
 - [Per-interface sysctls](#per-interface-sysctls)
 - [Profiles](#profiles)
 - [Unsupported configurations](#unsupported-configurations)
@@ -139,6 +140,30 @@ a local process using `SO_MARK`, therefore never passes the integration rule. Th
 configuration (`firewall.mark`, exactly one bit). This version always uses `0x10000000` and has no command to
 change it.
 
+## During an invite
+
+While `meshly invite` waits, the table of the inviting node carries two temporary elements for the address the
+joining node will get (here `10.100.0.2`). With no peer yet, the sets look like this:
+
+```nft
+	set peers      { type ipv4_addr; elements = { 10.100.0.2 } }
+	set allow_in   { type ipv4_addr . inet_proto . inet_service; elements = { 10.100.0.2 . tcp . 51820 } }
+```
+
+They let the joining node reach the pairing port, TCP 51820 on this node's VPN address, through the temporary
+WireGuard tunnel, and nothing else. Only a node that has the invite code can send from `10.100.0.2` through
+`meshly0`, and `guard_pre` drops packets for the VPN address from any other interface, so the port is not
+reachable from the internet or the LAN. In profile `nftables` these packets carry the mark like any other allowed
+VPN traffic.
+
+The joining node's own temporary table has the inviting node's address in `@peers` and no allow rule: its
+connection to the pairing port is locally initiated, and the replies come back as such.
+
+The temporary elements are never saved in the configuration. They go when the invite ends, in every way it can
+end. If the invite was killed, `meshly-check.timer` removes them within a minute, and `sudo meshly start` removes
+them at once. `meshly status` shows the table as present *with the open invite's temporary rules* while the invite
+waits.
+
 ## Per-interface sysctls
 
 meshly sets these on `meshly0` only. It changes no global sysctl.
@@ -209,7 +234,7 @@ blocks all VPN traffic until meshly re-applies its table.
 
 ## Unsupported configurations
 
-These are detected before any change. `init`, `join` and `activate` then exit with code 3 and change nothing.
+These are detected before any change. `init`, `invite` and `join` then exit with code 3 and change nothing.
 
 | Configuration | Why |
 |---|---|

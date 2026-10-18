@@ -41,8 +41,9 @@ In scope: anything that breaks a guarantee stated in [docs/threat-model.md](docs
 
 - access through the tunnel to a port without an allow rule;
 - reaching the LAN or another host through a node;
-- a way to make a node trust a key without the administrator's approval;
-- leaking private keys;
+- joining a network without its invite code, or with a code that was already used or has expired;
+- reaching anything on a node, other than the pairing exchange, through an open invite;
+- leaking private keys or an invite code;
 - installing a release that is not signed by the release key.
 
 Out of scope: the non-goals listed in the threat model, such as a compromised root account on a node, the GitHub

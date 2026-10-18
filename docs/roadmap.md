@@ -12,14 +12,14 @@ planned, roughly in order. Nothing here is a commitment to a date. Suggestions a
   restore the previous one.
 - **Safe-mode backoff.** The check timer retries a failed configuration every minute; retries should back off and
   be visible in `status`.
-- **Key rotation.** `meshly rotate-keys` for the WireGuard key and the identity key, coordinated with the peer.
+- **Key rotation.** `meshly rotate-keys` for the WireGuard key, coordinated with the peer, without pairing again.
 - **Packaging of the release key.** Publish the release public key in more places (website, keyserver-style
   transparency) and document key rollover.
 
 ## Later
 
 - **More than two nodes.** Hub-and-spoke first (one public node, several nodes behind NAT), with per-peer rules.
-  This needs multi-peer bootstrap state and policy sets keyed by peer.
+  This needs invites that add a node to an existing network and policy sets keyed by peer.
 - **Host names in endpoints.** Resolve DNS names for `--endpoint` / `set peer-endpoint`, with re-resolution when
   the handshake goes stale.
 - **IPv6.** IPv6 transport endpoints are accepted today but not yet covered by integration tests; IPv6 *inside* the tunnel is blocked. Dual-stack VPN
@@ -31,6 +31,7 @@ planned, roughly in order. Nothing here is a commitment to a date. Suggestions a
 
 ## Not planned
 
-- A coordination server or any cloud component. Trust is established between the two administrators with files.
+- A coordination server or any cloud component. The nodes pair directly, with a one-time code, through the
+  WireGuard port.
 - Running arbitrary user commands (`PostUp`/`PostDown`-style hooks).
 - Managing cloud provider firewalls or security groups.
