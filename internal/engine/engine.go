@@ -297,7 +297,7 @@ func (e *Engine) planTeardown(d *Desired, o *Observed) []Step {
 			if err != nil {
 				return err
 			}
-			if script := nft.IptablesRemoveScript(rs.IptablesChains(0)); script != "" {
+			if script := nft.IptablesRemoveScript(rs.IptablesChains(0, false)); script != "" {
 				return e.FW.ApplyScript(ctx, script)
 			}
 			return nil
@@ -353,7 +353,7 @@ func pendingIptables(o *Observed, mark uint32) []nft.IptablesChain {
 		return nil
 	}
 	var out []nft.IptablesChain
-	for _, c := range o.Ruleset.IptablesChains(mark) {
+	for _, c := range o.Ruleset.IptablesChains(mark, false) {
 		if !c.OK() {
 			out = append(out, c)
 		}
@@ -367,7 +367,7 @@ func iptablesWithOurs(o *Observed) []nft.IptablesChain {
 		return nil
 	}
 	var out []nft.IptablesChain
-	for _, c := range o.Ruleset.IptablesChains(0) {
+	for _, c := range o.Ruleset.IptablesChains(0, false) {
 		if len(c.Ours) > 0 {
 			out = append(out, c)
 		}
@@ -383,7 +383,7 @@ func (e *Engine) integrateIptables(ctx context.Context, mark uint32) error {
 	if err != nil {
 		return err
 	}
-	script := nft.IptablesScript(rs.IptablesChains(mark), mark)
+	script := nft.IptablesScript(rs.IptablesChains(mark, false), mark)
 	if script == "" {
 		return nil
 	}

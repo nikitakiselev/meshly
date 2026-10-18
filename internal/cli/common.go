@@ -74,7 +74,7 @@ func (a *App) printIptables(ctx context.Context, cfg *model.Config, label string
 		return
 	}
 	var first []nft.IptablesChain
-	for _, c := range rs.IptablesChains(cfg.Firewall.Mark) {
+	for _, c := range rs.IptablesChains(cfg.Firewall.Mark, false) {
 		if c.First {
 			first = append(first, c)
 		}

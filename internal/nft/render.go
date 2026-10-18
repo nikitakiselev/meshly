@@ -5,7 +5,8 @@
 // whole in one nft transaction ("add; delete; define"), so packets observe
 // either the old or the new policy, never a partial one. No other table is
 // ever modified, except for one rule that Meshly keeps at the top of the
-// iptables filter INPUT and OUTPUT chains (see iptables.go).
+// iptables filter INPUT and OUTPUT chains, and ip filter FORWARD (see
+// iptables.go).
 package nft
 
 import (

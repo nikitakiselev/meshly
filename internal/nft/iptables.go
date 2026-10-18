@@ -6,8 +6,8 @@ import (
 )
 
 // IptablesComment marks the rule Meshly keeps at the top of the iptables
-// filter INPUT and OUTPUT chains. It is Meshly's only object outside table
-// inet meshly.
+// filter INPUT and OUTPUT chains (and ip filter FORWARD while the node has
+// Docker networks). It is Meshly's only object outside table inet meshly.
 const IptablesComment = MarkerPrefix + " integration"
 
 // IptablesChain is a built-in chain of an iptables-nft filter table into
@@ -15,7 +15,7 @@ const IptablesComment = MarkerPrefix + " integration"
 // the chain; their rules still decide everything else).
 type IptablesChain struct {
 	Family string // "ip" or "ip6"
-	Chain  string // "INPUT" or "OUTPUT"
+	Chain  string // "INPUT", "OUTPUT" or (family ip only) "FORWARD"
 	Policy string
 	// Ours are the handles of Meshly's rules in the chain, in chain order.
 	Ours []int
@@ -23,28 +23,34 @@ type IptablesChain struct {
 	// has no other rule of Meshly.
 	First bool
 	// Needed: the chain may drop Meshly traffic (policy drop or any rule
-	// besides Meshly's), or it already has Meshly's rule.
+	// besides Meshly's), or it already has Meshly's rule. FORWARD is Needed
+	// only while the node has Docker networks.
 	Needed bool
 }
 
 func (c IptablesChain) String() string { return c.Family + " filter " + c.Chain }
 
 // OK reports whether the chain is as Meshly wants it.
-func (c IptablesChain) OK() bool { return !c.Needed || c.First }
+func (c IptablesChain) OK() bool {
+	return (c.Needed && c.First) || (!c.Needed && len(c.Ours) == 0)
+}
 
 // iptablesHooks maps the hooks of the integrated chains to their names.
-var iptablesHooks = map[string]string{"input": "INPUT", "output": "OUTPUT"}
+var iptablesHooks = map[string]string{"input": "INPUT", "output": "OUTPUT", "forward": "FORWARD"}
 
 // integratedByMeshly reports whether a chain is one Meshly integrates
-// itself: INPUT or OUTPUT of an iptables-nft filter table.
+// itself: INPUT or OUTPUT of an iptables-nft filter table, or FORWARD of
+// ip filter (family ip6 never carries the VPN's IPv4 traffic).
 func integratedByMeshly(rs *Ruleset, c Chain) bool {
 	return (c.Family == "ip" || c.Family == "ip6") && c.Table == "filter" && c.IsBase() &&
-		iptablesHooks[c.Hook] == c.Name && isIptablesTable(rs, c.Family, c.Table)
+		iptablesHooks[c.Hook] == c.Name && (c.Name != "FORWARD" || c.Family == "ip") &&
+		isIptablesTable(rs, c.Family, c.Table)
 }
 
 // IptablesChains returns the integrated chains present in the ruleset,
-// with Meshly's rule for mark observed in each.
-func (rs *Ruleset) IptablesChains(mark uint32) []IptablesChain {
+// with Meshly's rule for mark observed in each. docker tells whether the
+// node has Docker networks, which makes FORWARD a needed chain.
+func (rs *Ruleset) IptablesChains(mark uint32, docker bool) []IptablesChain {
 	an := &analyzer{rs: rs, ctx: Context{Mark: mark}}
 	var out []IptablesChain
 	for _, c := range rs.Chains {
@@ -60,6 +66,9 @@ func (rs *Ruleset) IptablesChains(mark uint32) []IptablesChain {
 		}
 		ic.First = len(ic.Ours) == 1 && rules[0].Handle == ic.Ours[0] && an.isIntegration(rules[0])
 		ic.Needed = c.Policy == "drop" || len(rules) > 0
+		if c.Name == "FORWARD" {
+			ic.Needed = docker && ic.Needed
+		}
 		out = append(out, ic)
 	}
 	return out
@@ -71,8 +80,8 @@ func IptablesRule(mark uint32) string {
 }
 
 // IptablesScript puts Meshly's rule first in every chain that needs it and
-// is not as wanted: Meshly's old rules are deleted by handle and one rule
-// is inserted at the top, in one transaction. It returns "" when nothing
+// is not as wanted: Meshly's old rules are deleted by handle and, if the
+// chain is Needed, one rule is inserted at the top, in one transaction. It returns "" when nothing
 // is to be done.
 func IptablesScript(chains []IptablesChain, mark uint32) string {
 	var b strings.Builder
@@ -83,7 +92,9 @@ func IptablesScript(chains []IptablesChain, mark uint32) string {
 		for _, h := range c.Ours {
 			fmt.Fprintf(&b, "delete rule %s filter %s handle %d\n", c.Family, c.Chain, h)
 		}
-		fmt.Fprintf(&b, "insert rule %s filter %s %s\n", c.Family, c.Chain, IptablesRule(mark))
+		if c.Needed {
+			fmt.Fprintf(&b, "insert rule %s filter %s %s\n", c.Family, c.Chain, IptablesRule(mark))
+		}
 	}
 	return b.String()
 }

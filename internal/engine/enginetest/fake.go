@@ -424,8 +424,8 @@ func isIptablesScript(s string) bool {
 }
 
 var (
-	iptDeleteRe = regexp.MustCompile(`^delete rule (ip6?) filter (INPUT|OUTPUT) handle (\d+)$`)
-	iptInsertRe = regexp.MustCompile(`^insert rule (ip6?) filter (INPUT|OUTPUT) meta mark & 0x([0-9a-f]{8}) == 0x([0-9a-f]{8}) counter accept comment "([^"]+)"$`)
+	iptDeleteRe = regexp.MustCompile(`^delete rule (ip6?) filter (INPUT|OUTPUT|FORWARD) handle (\d+)$`)
+	iptInsertRe = regexp.MustCompile(`^insert rule (ip6?) filter (INPUT|OUTPUT|FORWARD) meta mark & 0x([0-9a-f]{8}) == 0x([0-9a-f]{8}) counter accept comment "([^"]+)"$`)
 )
 
 // iptablesScript applies (or with check only validates) a script of

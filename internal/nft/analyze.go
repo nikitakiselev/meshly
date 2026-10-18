@@ -42,8 +42,8 @@ type ChainFinding struct {
 	Policy   string `json:"policy"`
 	// IptablesManaged: the table is owned by iptables-nft.
 	IptablesManaged bool `json:"iptables_managed"`
-	// ByMeshly: an iptables filter INPUT or OUTPUT chain, into which
-	// Meshly puts its integration rule itself (see IptablesChains).
+	// ByMeshly: an iptables filter INPUT or OUTPUT chain (or ip filter
+	// FORWARD), into which Meshly puts its integration rule itself (see IptablesChains).
 	ByMeshly bool `json:"integrated_by_meshly,omitempty"`
 	// Interfering lists handles of rules that may drop Meshly traffic
 	// (directly or through jumps). Policy drop is reported separately.

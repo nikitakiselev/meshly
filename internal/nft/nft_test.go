@@ -441,12 +441,18 @@ func TestIptablesChainsRealUFW(t *testing.T) {
 	mark := model.DefaultFirewallMark
 	rule := `insert rule %s filter %s meta mark & 0x10000000 == 0x10000000 counter accept comment "meshly:v1 integration"` + "\n"
 	for _, v := range allVersions {
-		chains := loadFixture(t, v, "ufw").IptablesChains(mark)
-		if got := IptablesNames(chains); got != "ip filter INPUT, ip filter OUTPUT, ip6 filter INPUT, ip6 filter OUTPUT" {
+		chains := loadFixture(t, v, "ufw").IptablesChains(mark, false)
+		if got := IptablesNames(chains); got != "ip filter INPUT, ip filter OUTPUT, ip filter FORWARD, ip6 filter INPUT, ip6 filter OUTPUT" {
 			t.Fatalf("%s: chains %s", v, got)
 		}
 		want := ""
 		for _, c := range chains {
+			if c.Chain == "FORWARD" { // not needed without Docker
+				if !c.OK() || c.Needed || len(c.Ours) != 0 {
+					t.Fatalf("%s: %s observed as %+v", v, c, c)
+				}
+				continue
+			}
 			if c.OK() || !c.Needed || len(c.Ours) != 0 {
 				t.Fatalf("%s: %s observed as %+v", v, c, c)
 			}
@@ -459,8 +465,11 @@ func TestIptablesChainsRealUFW(t *testing.T) {
 			t.Fatalf("%s: nothing to remove, got %q", v, got)
 		}
 
-		chains = loadFixture(t, v, "ufw-integrated").IptablesChains(mark)
+		chains = loadFixture(t, v, "ufw-integrated").IptablesChains(mark, false)
 		for _, c := range chains {
+			if c.Chain == "FORWARD" {
+				continue
+			}
 			if !c.OK() || !c.First || len(c.Ours) != 1 {
 				t.Fatalf("%s: %s observed as %+v", v, c, c)
 			}
@@ -472,7 +481,7 @@ func TestIptablesChainsRealUFW(t *testing.T) {
 			t.Fatalf("%s: remove script %q", v, got)
 		}
 		// Another mark: the rule is replaced.
-		other := loadFixture(t, v, "ufw-integrated").IptablesChains(0x20000000)
+		other := loadFixture(t, v, "ufw-integrated").IptablesChains(0x20000000, false)
 		if got := IptablesScript(other, 0x20000000); strings.Count(got, "delete rule ") != 4 || strings.Count(got, "insert rule ") != 4 {
 			t.Fatalf("%s: rule with another mark kept: %q", v, got)
 		}
@@ -511,7 +520,7 @@ func TestIptablesChainStates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		chains := rs.IptablesChains(model.DefaultFirewallMark)
+		chains := rs.IptablesChains(model.DefaultFirewallMark, false)
 		if len(chains) != 1 || chains[0].OK() != c.ok || chains[0].Needed != c.needed {
 			t.Fatalf("%s: %+v", c.name, chains)
 		}
@@ -540,7 +549,7 @@ func TestIptablesOtherChainsUnsupported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rs.IptablesChains(model.DefaultFirewallMark)) != 0 {
+	if len(rs.IptablesChains(model.DefaultFirewallMark, false)) != 0 {
 		t.Fatal("mangle chain taken for integration")
 	}
 	a := Analyze(rs, testContext())
@@ -658,5 +667,62 @@ func TestRenderLockdownHasNoDocker(t *testing.T) {
 		if strings.Contains(r.Definition, no) {
 			t.Errorf("lockdown table contains %q", no)
 		}
+	}
+}
+
+// ip filter FORWARD is integrated only on request; ip6 filter FORWARD never.
+func TestIptablesForwardChain(t *testing.T) {
+	mark := model.DefaultFirewallMark
+	ours := `{"rule":{"family":"ip","table":"filter","chain":"FORWARD","handle":9,"comment":"meshly:v1 integration","expr":[{"match":{"op":"==","left":{"&":[{"meta":{"key":"mark"}},268435456]},"right":268435456}},{"counter":{"packets":0,"bytes":0}},{"accept":null}]}}`
+	foreign := `{"rule":{"family":"ip","table":"filter","chain":"FORWARD","handle":5,"expr":[{"counter":{"packets":0,"bytes":0}},{"drop":null}]}}`
+	build := func(rules ...string) *Ruleset {
+		js := `{"nftables":[{"metainfo":{"json_schema_version":1}},{"table":{"family":"ip","name":"filter","handle":1}},` +
+			`{"chain":{"family":"ip","table":"filter","name":"FORWARD","handle":2,"type":"filter","hook":"forward","prio":0,"policy":"drop"}},` +
+			`{"table":{"family":"ip6","name":"filter","handle":3}},` +
+			`{"chain":{"family":"ip6","table":"filter","name":"FORWARD","handle":4,"type":"filter","hook":"forward","prio":0,"policy":"drop"}}`
+		for _, r := range rules {
+			js += "," + r
+		}
+		rs, err := ParseRuleset([]byte(js + "]}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rs
+	}
+	rs := build(foreign)
+	for _, c := range Analyze(rs, testContext()).Chains {
+		if c.Family == "ip6" && c.ByMeshly {
+			t.Fatalf("ip6 FORWARD taken for integration: %+v", c)
+		}
+	}
+	for _, docker := range []bool{true, false} {
+		for _, c := range rs.IptablesChains(mark, docker) {
+			if c.Family != "ip" || c.Chain != "FORWARD" {
+				t.Fatalf("docker=%v: unexpected chain %s", docker, c)
+			}
+		}
+	}
+	on := rs.IptablesChains(mark, true)
+	if len(on) != 1 || !on[0].Needed || on[0].OK() {
+		t.Fatalf("docker: %+v", on)
+	}
+	want := `insert rule ip filter FORWARD meta mark & 0x10000000 == 0x10000000 counter accept comment "meshly:v1 integration"` + "\n"
+	if got := IptablesScript(on, mark); got != want {
+		t.Fatalf("script %q", got)
+	}
+	off := rs.IptablesChains(mark, false)
+	if len(off) != 1 || off[0].Needed || !off[0].OK() {
+		t.Fatalf("no docker: %+v", off)
+	}
+	rs = build(ours, foreign)
+	off = rs.IptablesChains(mark, false)
+	if len(off) != 1 || off[0].OK() {
+		t.Fatalf("leftover rule: %+v", off)
+	}
+	if got := IptablesScript(off, mark); got != "delete rule ip filter FORWARD handle 9\n" {
+		t.Fatalf("script %q", got)
+	}
+	if on = rs.IptablesChains(mark, true); !on[0].OK() || IptablesScript(on, mark) != "" {
+		t.Fatalf("first rule disturbed: %+v", on)
 	}
 }
