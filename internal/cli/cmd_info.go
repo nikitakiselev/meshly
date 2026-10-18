@@ -13,7 +13,7 @@ import (
 )
 
 func (a *App) deps() diag.Deps {
-	return diag.Deps{Paths: a.Paths, Engine: a.Engine, Journal: a.Journal, Systemd: a.Systemd, Privileged: a.Euid == 0, Now: a.Now}
+	return diag.Deps{Paths: a.Paths, Engine: a.Engine, Journal: a.Journal, Systemd: a.Systemd, Sys: a.Sys, Privileged: a.Euid == 0, Now: a.Now}
 }
 
 func (a *App) cmdStatus(ctx context.Context, args []string) error {
@@ -103,6 +103,9 @@ func (a *App) renderStatus(st *diag.Status) {
 		}
 		if len(f.DockerNetworks) > 0 {
 			p("  docker networks   %s\n", strings.Join(f.DockerNetworks, ", "))
+		}
+		if len(f.ForwardFindings) > 0 {
+			p("  forward chains    %s may drop container traffic (meshly doctor)\n", strings.Join(f.ForwardFindings, ", "))
 		}
 	}
 	for _, pi := range st.Peers {

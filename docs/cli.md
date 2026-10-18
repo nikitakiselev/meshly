@@ -245,7 +245,8 @@ kernel. The systemd state is shown separately and says nothing about connectivit
 details are omitted. While `meshly invite` waits, status shows `Invite open until …` instead of the drift, and the
 firewall table as `present, with the open invite's temporary rules`. Under the firewall table, `iptables chains`
 names the iptables chains that carry meshly's rule and whether it is first, and on a node with Docker networks
-`docker networks` lists them (see [diagnostics-and-recovery.md](diagnostics-and-recovery.md#meshly-status)).
+`docker networks` lists them and `forward chains` names the forward chains that may drop container traffic (see
+[diagnostics-and-recovery.md](diagnostics-and-recovery.md#meshly-status)).
 
 ### `meshly nodes [--json]`
 
@@ -419,8 +420,9 @@ An abridged `meshly.status/v1` example:
 `config.wg_public_key` and `peers[].wg_public_key` are the WireGuard public keys; compare them across the two nodes
 to check that each knows the other's key. On a host with UFW, iptables rules or Docker, `firewall.iptables_chains`
 lists the chains that carry meshly's rule (`chain`, `meshly_rule_present`, `meshly_rule_first`). On a node with
-Docker networks, `firewall.docker_networks` lists them, for example `["br-3f1c2a9b7d01", "docker0"]`; without them
-the field is absent. `peers[].connectivity` is one of `handshake-recent`, `handshake-stale`,
+Docker networks, `firewall.docker_networks` lists them, for example `["br-3f1c2a9b7d01", "docker0"]`, and
+`firewall.forward_findings` the forward chains that may drop container traffic, for example `["inet filter forward"]`
+(`meshly doctor` has the fix); without them the fields are absent. `peers[].connectivity` is one of `handshake-recent`, `handshake-stale`,
 `no-handshake` or `unknown`.
 
 While `meshly invite` waits, the document has `"invite": {"expires_at": "2026-10-18T20:40:00Z"}` and

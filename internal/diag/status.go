@@ -18,6 +18,7 @@ import (
 	"github.com/nikitakiselev/meshly/internal/model"
 	"github.com/nikitakiselev/meshly/internal/netstack"
 	"github.com/nikitakiselev/meshly/internal/nft"
+	"github.com/nikitakiselev/meshly/internal/preflight"
 	"github.com/nikitakiselev/meshly/internal/store"
 	"github.com/nikitakiselev/meshly/internal/systemd"
 )
@@ -136,6 +137,10 @@ type FirewallInfo struct {
 	// DockerNetworks are the Docker bridges whose published ports meshly
 	// serves through the VPN.
 	DockerNetworks []string `json:"docker_networks,omitempty"`
+	// ForwardFindings are the forward chains that may drop the traffic of
+	// Docker containers through meshly ("inet filter forward"); doctor has
+	// the fix.
+	ForwardFindings []string `json:"forward_findings,omitempty"`
 }
 
 // IptablesInfo is an iptables chain into which meshly puts its rule.
@@ -182,10 +187,12 @@ type TransactionInfo struct {
 
 // Deps are the collaborators of the reports.
 type Deps struct {
-	Paths      store.Paths
-	Engine     *engine.Engine
-	Journal    *journal.Journal
-	Systemd    *systemd.Manager
+	Paths   store.Paths
+	Engine  *engine.Engine
+	Journal *journal.Journal
+	Systemd *systemd.Manager
+	// Sys analyses the forward chains for status (nil: they are not).
+	Sys        *preflight.System
 	Privileged bool
 	Now        func() time.Time
 }
@@ -287,6 +294,12 @@ func Collect(ctx context.Context, d Deps) *Status {
 	if desired.Present {
 		for _, b := range desired.Docker {
 			fw.DockerNetworks = append(fw.DockerNetworks, b.Name)
+		}
+		if len(desired.Docker) > 0 && d.Sys != nil {
+			a := nft.Analyze(obs.Ruleset, d.Sys.AnalysisContext(cfg))
+			for _, c := range preflight.ForwardWarnings(a) {
+				fw.ForwardFindings = append(fw.ForwardFindings, c.Family+" "+c.Table+" "+c.Chain)
+			}
 		}
 	}
 	st.Firewall = fw

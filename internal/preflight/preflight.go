@@ -395,12 +395,13 @@ func EvaluateFirewall(r *Report, a *nft.Analysis, profile string, mark uint32, s
 				"add to that chain in /etc/nftables.conf, before any drop/reject rule, then reload nftables:\n      "+rule)
 		}
 	}
-	// Forward chains never fail: they carry only the traffic of Docker
-	// containers, not the tunnel between the hosts. The chains of Docker's
-	// own nftables backend pass meshly's traffic (TestDockerNftablesBackend).
+	// Forward chains never fail: meshly analyses them only for the traffic
+	// of Docker containers, not the tunnel between the hosts. The chains of
+	// Docker's own nftables backend pass meshly's traffic
+	// (TestDockerNftablesBackend).
 	for _, c := range a.Forward() {
 		where := fmt.Sprintf("chain %s %s %s (hook forward, policy %s)", c.Family, c.Table, c.Chain, c.Policy)
-		if strings.HasPrefix(c.Table, "docker") {
+		if dockerBackend(c) {
 			r.add("firewall-forward", Info, where+": Docker's nftables firewall backend decides container traffic here; published container ports and container connections work through meshly with it (tested with Docker 29), but rules you add to Docker's chains can block them", "")
 			continue
 		}
@@ -448,6 +449,22 @@ func EvaluateFirewall(r *Report, a *nft.Analysis, profile string, mark uint32, s
 		r.add("netdev", Warn, c+" exists; netdev hooks run before meshly and may drop WireGuard transport", "")
 	}
 }
+
+// ForwardWarnings returns the forward chains that EvaluateFirewall warns
+// about: they may drop the traffic of Docker containers through meshly.
+func ForwardWarnings(a *nft.Analysis) []nft.ChainFinding {
+	var out []nft.ChainFinding
+	for _, c := range a.Forward() {
+		if !dockerBackend(c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// dockerBackend reports whether a chain is of Docker's own nftables
+// firewall backend (tables ip docker-bridges and the like).
+func dockerBackend(c nft.ChainFinding) bool { return strings.HasPrefix(c.Table, "docker") }
 
 // AutoProfile chooses a profile from an analysis; forward chains do not
 // count.

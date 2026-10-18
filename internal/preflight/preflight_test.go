@@ -664,6 +664,25 @@ func TestEvaluateFirewallForward(t *testing.T) {
 	}
 }
 
+// The forward chains a warning is for, as status lists them: not the
+// chains of Docker's own backend, meshly's or integrated ones.
+func TestForwardWarnings(t *testing.T) {
+	native := nft.ChainFinding{Family: "inet", Table: "filter", Chain: "forward", Hook: "forward", Policy: "drop", Status: "needs-integration"}
+	other := nft.ChainFinding{Family: "ip", Table: "mangle", Chain: "FORWARD", Hook: "forward", Policy: "accept", Status: "unsupported"}
+	backend := nft.ChainFinding{Family: "ip", Table: "docker-bridges", Chain: "filter-FORWARD", Hook: "forward", Policy: "accept", Status: "needs-integration"}
+	ours := nft.ChainFinding{Family: "ip", Table: "filter", Chain: "FORWARD", Hook: "forward", Policy: "drop", ByMeshly: true, Status: "needs-integration"}
+	integrated := nft.ChainFinding{Family: "inet", Table: "filter", Chain: "forward2", Hook: "forward", Policy: "drop", Status: "integrated"}
+	input := nft.ChainFinding{Family: "inet", Table: "filter", Chain: "input", Hook: "input", Policy: "drop", Status: "needs-integration"}
+	a := &nft.Analysis{DockerBridges: []string{"docker0"}, Chains: []nft.ChainFinding{native, other, backend, ours, integrated, input}}
+	var got []string
+	for _, c := range ForwardWarnings(a) {
+		got = append(got, c.Family+" "+c.Table+" "+c.Chain)
+	}
+	if !slices.Equal(got, []string{"inet filter forward", "ip mangle FORWARD"}) {
+		t.Fatalf("ForwardWarnings = %v", got)
+	}
+}
+
 func TestEvaluateFirewallDockerMessages(t *testing.T) {
 	const networks = "Docker networks docker0, br-3f1c2a9b7d01: published container ports are reachable through the VPN after meshly allow <port>; containers reach the other node like programs on this host"
 	const noBridge = "Docker rules found but no Docker bridge network (docker0, br-<id>): containers on networks with custom bridge names cannot use the VPN"

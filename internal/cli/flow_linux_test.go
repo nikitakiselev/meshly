@@ -1934,22 +1934,30 @@ func interrupted(t *testing.T, n *testNode) int {
 
 func TestStatusDockerNetworks(t *testing.T) {
 	vps, _ := pair(t)
-	if js := vps.must("status", "--json"); strings.Contains(js, "docker_networks") {
+	// A native forward chain that drops: it concerns only containers.
+	vps.k.AddIptables("inet", "forward", "drop", 0)
+	if js := vps.must("status", "--json"); strings.Contains(js, "docker_networks") || strings.Contains(js, "forward_findings") {
 		t.Fatalf("status mentions Docker without any:\n%s", js)
+	}
+	if st := vps.must("status"); strings.Contains(st, "forward chains") {
+		t.Fatalf("status mentions forward chains without Docker:\n%s", st)
 	}
 	vps.k.Docker = []netstack.Bridge{{Name: "docker0", Prefixes: []netip.Prefix{netip.MustParsePrefix("172.17.0.0/16")}}}
 	vps.k.AddIptables("ip", "FORWARD", "drop", 1)
 	vps.must("service", "check")
 	var doc struct {
+		Schema   string `json:"schema"`
 		Firewall struct {
-			DockerNetworks []string `json:"docker_networks"`
+			DockerNetworks  []string `json:"docker_networks"`
+			ForwardFindings []string `json:"forward_findings"`
 		} `json:"firewall"`
 	}
-	if js := vps.must("status", "--json"); json.Unmarshal([]byte(js), &doc) != nil || !slices.Equal(doc.Firewall.DockerNetworks, []string{"docker0"}) {
+	if js := vps.must("status", "--json"); json.Unmarshal([]byte(js), &doc) != nil || !slices.Equal(doc.Firewall.DockerNetworks, []string{"docker0"}) ||
+		!slices.Equal(doc.Firewall.ForwardFindings, []string{"inet filter forward"}) || doc.Schema != "meshly.status/v1" {
 		t.Fatalf("status --json:\n%s", js)
 	}
 	st := vps.must("status")
-	for _, want := range []string{"docker networks   docker0", "ip filter FORWARD"} {
+	for _, want := range []string{"docker networks   docker0", "ip filter FORWARD", "forward chains    inet filter forward may drop container traffic (meshly doctor)"} {
 		if !strings.Contains(st, want) {
 			t.Fatalf("status lacks %q:\n%s", want, st)
 		}
