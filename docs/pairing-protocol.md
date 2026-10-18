@@ -228,8 +228,9 @@ When the invite waits again, the marker holds the code's expiry again.
 - Ctrl+C, SIGTERM, a hang-up of the terminal (SIGHUP, for example a
   closed SSH session) or a broken pipe on its output (SIGPIPE, for example
   `| tee` killed by the same Ctrl+C) arrives: a node that joined but has not
-  confirmed is undone first; exit 10. While the invite cleans up, a write
-  that fails does not stop it. A SIGHUP or SIGPIPE that was ignored at
+  confirmed is undone first; exit 10 (after a broken pipe, writing the
+  final message can still end the process with 141 once the cleanup is
+  done). While the invite cleans up, a write that fails does not stop it. A SIGHUP or SIGPIPE that was ignored at
   start, as under `nohup`, stays ignored;
 - the code expired while no node had joined: exit 13. A node that joined in
   time may still confirm after the expiry; if it does not, the undo ends the

@@ -272,8 +272,10 @@ in shared directories such as `/tmp`.
   address, which a local process reaches over loopback. The invite's
   firewall rule admits it only from the joining node's address through the
   tunnel, and the listener answers no other source, so a local user can
-  neither join without the code nor take the peer slot or block the real
-  node. *Integration:* `TestPairingClosedToLocalUsers`. *CLI:*
+  neither join without the code nor take the peer slot. It can still take
+  TCP port 51820 on the VPN address before the invite starts; `invite` then
+  fails at once with "address already in use" instead of waiting, so the
+  block is loud, not silent. *Integration:* `TestPairingClosedToLocalUsers`. *CLI:*
   `TestInviteIgnoresForeignSource`.
 
 **Not protected:**

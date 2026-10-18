@@ -90,7 +90,8 @@ Node "home" (10.100.0.2) joined. The invite is closed.
 - **It ends** when a node has joined and confirmed the connection (exit code 0, `Node "home" (10.100.0.2) joined.
   The invite is closed.`), on Ctrl+C, SIGTERM, when the terminal hangs up, for example a closed SSH session, or when
   its output pipe breaks, for example `| tee` killed by the same Ctrl+C (exit code 10; under `nohup` the hang-up is
-  ignored), or when the code expires and no node joined (exit code 13).
+  ignored; after a broken pipe the cleanup still completes, but writing the final message to the broken pipe can end
+  meshly with exit code 141 instead), or when the code expires and no node joined (exit code 13).
 - **If the node that joined cannot confirm** within a minute, its membership is undone (`Node "home" did not
   confirm the connection; its membership was undone.`), and the invite waits again while the code is valid. Until
   then the invite counts as open, for `status` and the busy message, even past the code's expiry.
