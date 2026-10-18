@@ -133,6 +133,9 @@ type FirewallInfo struct {
 	DeniedPkts      *uint64   `json:"vpn_packets_denied,omitempty"`
 	// Iptables are the iptables chains that need meshly's rule.
 	Iptables []IptablesInfo `json:"iptables_chains,omitempty"`
+	// DockerNetworks are the Docker bridges whose published ports meshly
+	// serves through the VPN.
+	DockerNetworks []string `json:"docker_networks,omitempty"`
 }
 
 // IptablesInfo is an iptables chain into which meshly puts its rule.
@@ -279,6 +282,11 @@ func Collect(ctx context.Context, d Deps) *Status {
 		// A stopped link has no rule on purpose; a leftover shows as drift.
 		if c.Needed && desired.Present {
 			fw.Iptables = append(fw.Iptables, IptablesInfo{Chain: c.String(), RulePresent: len(c.Ours) > 0, RuleFirst: c.First})
+		}
+	}
+	if desired.Present {
+		for _, b := range desired.Docker {
+			fw.DockerNetworks = append(fw.DockerNetworks, b.Name)
 		}
 	}
 	st.Firewall = fw

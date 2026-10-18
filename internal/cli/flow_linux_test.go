@@ -30,6 +30,7 @@ import (
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/lock"
 	"github.com/nikitakiselev/meshly/internal/model"
+	"github.com/nikitakiselev/meshly/internal/netstack"
 	"github.com/nikitakiselev/meshly/internal/nft"
 	"github.com/nikitakiselev/meshly/internal/pairing"
 	"github.com/nikitakiselev/meshly/internal/preflight"
@@ -1929,4 +1930,32 @@ func interrupted(t *testing.T, n *testNode) int {
 		}
 	}
 	return c
+}
+
+func TestStatusDockerNetworks(t *testing.T) {
+	vps, _ := pair(t)
+	if js := vps.must("status", "--json"); strings.Contains(js, "docker_networks") {
+		t.Fatalf("status mentions Docker without any:\n%s", js)
+	}
+	vps.k.Docker = []netstack.Bridge{{Name: "docker0", Prefixes: []netip.Prefix{netip.MustParsePrefix("172.17.0.0/16")}}}
+	vps.k.AddIptables("ip", "FORWARD", "drop", 1)
+	vps.must("service", "check")
+	var doc struct {
+		Firewall struct {
+			DockerNetworks []string `json:"docker_networks"`
+		} `json:"firewall"`
+	}
+	if js := vps.must("status", "--json"); json.Unmarshal([]byte(js), &doc) != nil || !slices.Equal(doc.Firewall.DockerNetworks, []string{"docker0"}) {
+		t.Fatalf("status --json:\n%s", js)
+	}
+	st := vps.must("status")
+	for _, want := range []string{"docker networks   docker0", "ip filter FORWARD"} {
+		if !strings.Contains(st, want) {
+			t.Fatalf("status lacks %q:\n%s", want, st)
+		}
+	}
+	// Warnings (no handshake, no systemd) make doctor exit non-zero.
+	if _, d, _ := vps.run("doctor"); !strings.Contains(d, "published container ports are reachable through the VPN") {
+		t.Fatalf("doctor:\n%s", d)
+	}
 }

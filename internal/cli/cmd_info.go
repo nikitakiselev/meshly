@@ -101,6 +101,9 @@ func (a *App) renderStatus(st *diag.Status) {
 			}
 			p("  iptables chains   meshly rule first: %s\n", strings.Join(cs, ", "))
 		}
+		if len(f.DockerNetworks) > 0 {
+			p("  docker networks   %s\n", strings.Join(f.DockerNetworks, ", "))
+		}
 	}
 	for _, pi := range st.Peers {
 		p("Peer %s\n", pi.Name)
