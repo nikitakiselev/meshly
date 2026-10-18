@@ -50,6 +50,10 @@ type Input struct {
 	Mark       uint32
 	Peers      []netip.Addr
 	Allow      []AllowEntry
+	// Exclusive are allow entries whose port only their peer may reach,
+	// through Interface: guard_in drops every other packet for it, from
+	// loopback or after DNAT too. Each must also be in Allow.
+	Exclusive []AllowEntry
 }
 
 // InputFromConfig derives the renderer input from a config. With lockdown
@@ -109,6 +113,14 @@ func (in Input) validate() error {
 		}
 		if !slices.Contains(in.Peers, a.Peer) {
 			return fmt.Errorf("allow entry for unknown peer %s", a.Peer)
+		}
+	}
+	for _, x := range in.Exclusive {
+		if x.Proto != model.ProtoTCP && x.Proto != model.ProtoUDP {
+			return fmt.Errorf("exclusive entry for %s: only a TCP or UDP port can be exclusive", x.Peer)
+		}
+		if !slices.Contains(in.Allow, x) {
+			return fmt.Errorf("exclusive entry %s %s/%d is not an allow entry", x.Peer, x.Proto, x.Port)
 		}
 	}
 	return nil
@@ -194,11 +206,16 @@ func Render(in Input) (Rendered, error) {
 	w("\t\tcounter drop comment \"default deny\"")
 	w("\t}")
 	w("")
-	// After DNAT: anything rewritten is refused.
+	// After DNAT: anything rewritten is refused. An exclusive port is
+	// checked here for every interface, because input sees loopback too
+	// and the destination after DNAT.
 	w("\tchain guard_in {")
 	w("\t\ttype filter hook input priority %d; policy accept;", PolicyPriority)
 	w("\t\tiifname %s ip daddr != %s counter drop comment \"rewritten destination\"", ifname, local)
 	w("\t\tiifname %s ct status dnat counter drop comment \"dnat from the vpn is not supported\"", ifname)
+	for _, x := range exclusiveRules(in.Exclusive, ifname) {
+		w("\t\tip daddr %s %s dport %d iifname . ip saddr != { %s } counter drop comment \"reachable only from its peer through the vpn\"", local, x.proto, x.port, x.from)
+	}
 	w("\t}")
 	w("")
 	w("\tchain guard_fwd {")
@@ -264,6 +281,44 @@ func pingElements(as []AllowEntry) string {
 		}
 	}
 	return peerElements(ps)
+}
+
+// exclusiveRule is one port of the local VPN address that only the
+// interface and peer pairs in from may reach.
+type exclusiveRule struct {
+	proto model.Proto
+	port  uint16
+	from  string
+}
+
+// exclusiveRules groups the entries by port: peers that share a port share
+// its rule, or each rule would drop the other peers.
+func exclusiveRules(xs []AllowEntry, ifname string) []exclusiveRule {
+	var out []exclusiveRule
+	for _, x := range slices.Compact(sortedPort(xs)) {
+		el := ifname + " . " + x.Peer.String()
+		if n := len(out); n > 0 && out[n-1].proto == x.Proto && out[n-1].port == x.Port {
+			out[n-1].from += ", " + el
+			continue
+		}
+		out = append(out, exclusiveRule{proto: x.Proto, port: x.Port, from: el})
+	}
+	return out
+}
+
+// sortedPort sorts by protocol, port and peer.
+func sortedPort(as []AllowEntry) []AllowEntry {
+	s := slices.Clone(as)
+	slices.SortFunc(s, func(a, b AllowEntry) int {
+		if c := strings.Compare(string(a.Proto), string(b.Proto)); c != 0 {
+			return c
+		}
+		if c := int(a.Port) - int(b.Port); c != 0 {
+			return c
+		}
+		return a.Peer.Compare(b.Peer)
+	})
+	return s
 }
 
 func sortedAllow(as []AllowEntry) []AllowEntry {

@@ -81,9 +81,12 @@ type Desired struct {
 // Overlay is temporary kernel state applied on top of a config. It is
 // never saved, journaled or printed.
 type Overlay struct {
-	Peer       *wg.DesiredPeer  // extra peer (nil: none)
-	Allow      []nft.AllowEntry // extra allow entries
-	PrivateKey *wgtypes.Key     // replaces the key file (nil: use it)
+	Peer *wg.DesiredPeer // extra peer (nil: none)
+	// Allow are extra TCP or UDP ports for their peer alone: the firewall
+	// drops what comes for them from anywhere else, loopback included
+	// (nft.Input.Exclusive).
+	Allow      []nft.AllowEntry
+	PrivateKey *wgtypes.Key // replaces the key file (nil: use it)
 }
 
 // DesiredFrom derives desired state; a nil config or admin state "down"
@@ -131,6 +134,7 @@ func DesiredWith(cfg *model.Config, ifname string, ov *Overlay) (*Desired, error
 			}
 		}
 		in.Allow = append(in.Allow, ov.Allow...)
+		in.Exclusive = append(in.Exclusive, ov.Allow...)
 		if ov.PrivateKey != nil {
 			k := *ov.PrivateKey
 			d.PrivateKey = &k

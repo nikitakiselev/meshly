@@ -408,8 +408,8 @@ func TestOverlayPeerAndAllow(t *testing.T) {
 	if len(l.Routes) != 1 || l.Routes[0].Dst != netip.MustParsePrefix("10.100.0.2/32") {
 		t.Fatalf("routes %v", l.Routes)
 	}
-	if last := v.k.Scripts[len(v.k.Scripts)-1]; !strings.Contains(last, "10.100.0.2 . tcp . 51820") {
-		t.Fatalf("allow entry missing in:\n%s", last)
+	if last := v.k.Scripts[len(v.k.Scripts)-1]; !strings.Contains(last, "10.100.0.2 . tcp . 51820") || !strings.Contains(last, exclusiveRule) {
+		t.Fatalf("allow entry or its exclusive rule missing in:\n%s", last)
 	}
 	if drift, err := v.e.Drift(ctx, c); err != nil || len(drift) == 0 {
 		t.Fatalf("drift while overlay is in place: %v %v", drift, err)
@@ -426,10 +426,21 @@ func TestOverlayPeerAndAllow(t *testing.T) {
 	if drift, _ := v.e.Drift(ctx, c); len(drift) != 0 {
 		t.Fatalf("drift after removing overlay: %v", drift)
 	}
-	if last := v.k.Scripts[len(v.k.Scripts)-1]; strings.Contains(last, "tcp . 51820") {
-		t.Fatalf("allow entry still present in:\n%s", last)
+	if last := v.k.Scripts[len(v.k.Scripts)-1]; strings.Contains(last, "tcp . 51820") || strings.Contains(last, "tcp dport 51820") {
+		t.Fatalf("allow entry or its exclusive rule still present in:\n%s", last)
+	}
+	plain, err := DesiredFrom(c, "meshly0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := v.k.Scripts[len(v.k.Scripts)-1]; last != plain.Firewall.ApplyScript() {
+		t.Fatalf("the table without the overlay differs from the saved configuration's:\n%s", last)
 	}
 }
+
+// exclusiveRule is what the overlay's allow entry adds to guard_in: the
+// pairing port answers its peer through the tunnel only.
+const exclusiveRule = `ip daddr 10.100.0.1 tcp dport 51820 iifname . ip saddr != { "meshly0" . 10.100.0.2 } counter drop`
 
 func mustObserve(t *testing.T, v *env) *wg.Device {
 	t.Helper()
@@ -497,8 +508,8 @@ func TestExecuteWithOverlay(t *testing.T) {
 	if _, ok := dev.Peer(target.Peers[0].WGPublicKey); !ok {
 		t.Fatal("real peer missing")
 	}
-	if last := v.k.Scripts[len(v.k.Scripts)-1]; !strings.Contains(last, "10.100.0.2 . tcp . 51820") {
-		t.Fatalf("allow entry missing in:\n%s", last)
+	if last := v.k.Scripts[len(v.k.Scripts)-1]; !strings.Contains(last, "10.100.0.2 . tcp . 51820") || !strings.Contains(last, exclusiveRule) {
+		t.Fatalf("allow entry or its exclusive rule missing in:\n%s", last)
 	}
 	saved, err := v.paths.LoadConfig()
 	if err != nil || len(saved.Peers) != 1 || len(saved.Rules) != 0 {

@@ -296,20 +296,68 @@ func TestPairingNothingExposed(t *testing.T) {
 	}
 }
 
-var guardRe = regexp.MustCompile(`counter packets (\d+) bytes \d+ drop comment "vpn address reachable only through the vpn"`)
-
 // guardDrops returns the packets meshly's guard dropped because they came
 // for the VPN address from outside the tunnel.
 func guardDrops(t *testing.T, n *Node) int {
 	t.Helper()
-	out := n.MustSh("nft list chain inet meshly guard_pre")
-	m := guardRe.FindStringSubmatch(out)
+	return drops(t, n, "guard_pre", "vpn address reachable only through the vpn")
+}
+
+// pairingDrops returns the packets for the pairing port that the invite's
+// rule dropped because they did not come from the joining node through the
+// tunnel.
+func pairingDrops(t *testing.T, n *Node) int {
+	t.Helper()
+	return drops(t, n, "guard_in", "reachable only from its peer through the vpn")
+}
+
+// drops returns the counter of the drop rule with comment in chain.
+func drops(t *testing.T, n *Node, chain, comment string) int {
+	t.Helper()
+	out := n.MustSh("nft list chain inet meshly " + chain)
+	m := regexp.MustCompile(`counter packets (\d+) bytes \d+ drop comment "` + regexp.QuoteMeta(comment) + `"`).FindStringSubmatch(out)
 	if m == nil {
-		t.Fatalf("%s: no guard counter in:\n%s", n.Name, out)
+		t.Fatalf("%s: no counter %q in:\n%s", n.Name, comment, out)
 	}
 	v, err := strconv.Atoi(m[1])
 	must(t, err)
 	return v
+}
+
+// The pairing port is closed to the processes of the inviting node, root's
+// included: loopback reaches the VPN address, so the firewall lets in only
+// the joining node's address through the tunnel.
+func TestPairingClosedToLocalUsers(t *testing.T) {
+	l := newLab(t, distros[0])
+	vps := l.Node("vps")
+	vps.MustMeshly("init", "homelab", "--name", "vps", "--endpoint", "198.51.100.10:51820")
+	before := vps.KernelSnapshot()
+	vps.Invite()
+	connect := func(user string) bool {
+		return vps.Sh("runuser -u "+user+" -- /opt/it/fileserver -connect -tcp-dial 10.100.0.1:51820 -timeout 2s").Code == 0
+	}
+	for _, user := range []string{"nobody", "root"} {
+		n := pairingDrops(t, vps)
+		if connect(user) {
+			t.Fatalf("%s on the vps reaches the pairing port", user)
+		}
+		after := pairingDrops(t, vps)
+		if after <= n {
+			t.Fatalf("%s: the probe never reached the invite's rule (%d -> %d drops), so its failure proves nothing", user, n, after)
+		}
+		t.Logf("%s: refused, the invite's rule dropped %d packets", user, after-n)
+	}
+	// Control: without the rule, loopback reaches the listener, so the rule
+	// alone keeps the port closed.
+	vps.MustSh(`nft delete rule inet meshly guard_in handle $(nft -a list chain inet meshly guard_in | awk '/reachable only from its peer/{print $NF}')`)
+	if !connect("nobody") {
+		t.Fatal("control: without the invite's rule the pairing port is not reachable over loopback either")
+	}
+	interrupt(t, vps, "INT")
+	if c, inv := vps.InviteExit(30 * time.Second); c != 10 {
+		t.Fatalf("cancelled invite: exit %d\n%s", c, inv)
+	}
+	inviteClosed(t, vps, before)
 }
 
 // UDP to the WireGuard port is blocked: join says so, changes nothing and

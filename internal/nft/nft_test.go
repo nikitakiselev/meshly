@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -123,6 +124,89 @@ func TestRenderPolicyShape(t *testing.T) {
 	}
 	if strings.Contains(lock.Definition, "elements") {
 		t.Fatalf("lockdown table admits peers or services:\n%s", lock.Definition)
+	}
+}
+
+// chainBody returns the rules of chain name in a rendered definition.
+func chainBody(t *testing.T, def, name string) string {
+	t.Helper()
+	i := strings.Index(def, "\tchain "+name+" {\n")
+	if i < 0 {
+		t.Fatalf("no chain %s in:\n%s", name, def)
+	}
+	body := def[i:]
+	return body[:strings.Index(body, "\n\t}\n")+1]
+}
+
+var markerHash = regexp.MustCompile(`hash=[0-9a-f]+`)
+
+// An exclusive service is reachable only from its peer through the
+// interface: guard_in drops its port from anywhere else, loopback and DNAT
+// included. Without exclusive entries the table renders as before
+// (TestMarkerRoundTripRealNft holds that hash against real nft).
+func TestRenderExclusive(t *testing.T) {
+	const rule = `ip daddr 10.100.0.1 tcp dport 51820 iifname . ip saddr != { "meshly0" . 10.100.0.2 } counter drop comment "reachable only from its peer through the vpn"`
+	home := netip.MustParseAddr("10.100.0.2")
+	pair := AllowEntry{Peer: home, Proto: model.ProtoTCP, Port: 51820}
+	in := fixtureInput()
+	in.Allow = append(in.Allow, pair)
+	allowOnly, err := Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(allowOnly.Definition, "reachable only from its peer") {
+		t.Fatalf("a plain allow entry is exclusive:\n%s", allowOnly.Definition)
+	}
+	in.Exclusive = []AllowEntry{pair}
+	r, err := Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := chainBody(t, r.Definition, "guard_in"); !strings.HasSuffix(g, "\t\t"+rule+"\n") {
+		t.Fatalf("guard_in does not end with the exclusive rule:\n%s", g)
+	}
+	if n := strings.Count(r.Definition, "reachable only from its peer"); n != 1 {
+		t.Fatalf("%d exclusive rules, want 1:\n%s", n, r.Definition)
+	}
+	if r.Hash == allowOnly.Hash {
+		t.Fatal("the exclusive rule does not change the hash")
+	}
+	without := strings.Replace(r.Definition, "\t\t"+rule+"\n", "", 1)
+	if markerHash.ReplaceAllString(without, "") != markerHash.ReplaceAllString(allowOnly.Definition, "") {
+		t.Fatalf("the exclusive entry changes more than its rule:\n%s", r.Definition)
+	}
+
+	// Peers that share a port share its rule: each would drop the other.
+	other := netip.MustParseAddr("10.100.0.3")
+	in.Peers = append(in.Peers, other)
+	in.Allow = append(in.Allow, AllowEntry{Peer: other, Proto: model.ProtoTCP, Port: 51820}, AllowEntry{Peer: other, Proto: model.ProtoUDP, Port: 53})
+	in.Exclusive = []AllowEntry{in.Allow[len(in.Allow)-1], in.Allow[len(in.Allow)-2], pair}
+	r, err = Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := chainBody(t, r.Definition, "guard_in")
+	for _, want := range []string{
+		`ip daddr 10.100.0.1 tcp dport 51820 iifname . ip saddr != { "meshly0" . 10.100.0.2, "meshly0" . 10.100.0.3 } counter drop`,
+		`ip daddr 10.100.0.1 udp dport 53 iifname . ip saddr != { "meshly0" . 10.100.0.3 } counter drop`,
+	} {
+		if !strings.Contains(g, want) {
+			t.Errorf("guard_in lacks %q:\n%s", want, g)
+		}
+	}
+	if strings.Index(g, "tcp dport 51820") > strings.Index(g, "udp dport 53") {
+		t.Errorf("exclusive rules are not sorted:\n%s", g)
+	}
+
+	for name, x := range map[string]AllowEntry{
+		"not allowed": {Peer: home, Proto: model.ProtoTCP, Port: 8080},
+		"ping":        {Peer: home, Proto: model.ProtoPing},
+	} {
+		in := fixtureInput()
+		in.Exclusive = []AllowEntry{x}
+		if _, err := Render(in); err == nil {
+			t.Errorf("exclusive entry %s: accepted", name)
+		}
 	}
 }
 
