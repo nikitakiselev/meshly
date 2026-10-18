@@ -16,6 +16,7 @@ import (
 // (docs/firewall.md#docker): a port published by Docker opens to a peer
 // with meshly allow, a container connects to a peer like a program on its
 // host, and Docker networks that come and go are followed within seconds.
+// Nothing else opens (TestDockerHostContained).
 
 // FetchOK reports whether url answers "ok" to curl on the node.
 func (n *Node) FetchOK(url string) bool {
@@ -54,6 +55,52 @@ func (n *Node) ServeToken(name, proto string, hostPort, port int) {
 // forwardFirst reports whether meshly's rule is the first rule of the
 // iptables FORWARD chain.
 func (n *Node) forwardFirst() bool { return n.iptablesFirst("iptables -S FORWARD") }
+
+// withoutRawGuard removes, until the end of t, Docker's raw PREROUTING
+// rules that drop packets for the container address addr arriving on
+// another interface than its bridge: they come before meshly and would
+// hide what meshly drops.
+func (n *Node) withoutRawGuard(t *testing.T, addr string) {
+	t.Helper()
+	var removed []string
+	t.Cleanup(func() {
+		for _, r := range removed {
+			if res := n.Sh("iptables -t raw " + r); res.Code != 0 {
+				t.Errorf("%s: restore Docker's rule %s: %s", n.Name, r, res)
+			}
+		}
+	})
+	out := strings.TrimSpace(n.MustSh("iptables -t raw -S PREROUTING | grep -F -- '-d " + addr + "/32 ' || true"))
+	if out == "" {
+		return
+	}
+	for _, r := range strings.Split(out, "\n") {
+		n.MustSh("iptables -t raw " + strings.Replace(r, "-A ", "-D ", 1))
+		removed = append(removed, r)
+	}
+}
+
+// unwatched stops meshly-watch.service and meshly-check.timer, which would
+// repair what t breaks, until repair runs meshly service check and starts
+// both again: at the end of t at the latest.
+func (n *Node) unwatched(t *testing.T) (repair func()) {
+	t.Helper()
+	repair = sync.OnceFunc(func() {
+		for _, c := range []string{"meshly service check", "systemctl start meshly-watch.service meshly-check.timer"} {
+			if r := n.Sh(c); r.Code != 0 {
+				t.Errorf("%s: repair: %s: %s", n.Name, c, r)
+			}
+		}
+	})
+	t.Cleanup(repair)
+	n.MustSh("systemctl stop meshly-watch.service meshly-check.timer")
+	return repair
+}
+
+// unroutable reports whether ip route get failed for want of a route.
+func unroutable(r Result) bool {
+	return r.Code != 0 && (strings.Contains(r.Err, "No route to host") || strings.Contains(r.Err, "Network is unreachable"))
+}
 
 // counted returns the packets counted by the rule with comment in chain of
 // table inet meshly.
@@ -110,20 +157,7 @@ func TestDockerPublishedPort(t *testing.T) {
 		// interface. Without it, meshly's from_vpn is what drops them.
 		l.Run("container-address", func(t *testing.T) {
 			pub := strings.TrimSpace(vps.MustSh("wg show meshly0 public-key"))
-			var removed []string
-			t.Cleanup(func() {
-				for _, r := range removed {
-					if res := vps.Sh("iptables -t raw " + r); res.Code != 0 {
-						t.Errorf("vps: restore Docker's rule %s: %s", r, res)
-					}
-				}
-			})
-			if out := strings.TrimSpace(vps.MustSh("iptables -t raw -S PREROUTING | grep -F -- '-d " + web + "/32 ' || true")); out != "" {
-				for _, r := range strings.Split(out, "\n") {
-					vps.MustSh("iptables -t raw " + strings.Replace(r, "-A ", "-D ", 1))
-					removed = append(removed, r)
-				}
-			}
+			vps.withoutRawGuard(t, web)
 			repair := sync.OnceFunc(func() {
 				for _, c := range []string{"ip route del " + web + "/32 dev meshly0 2>/dev/null || true", "meshly service check", "systemctl start meshly-watch.service meshly-check.timer"} {
 					if r := home.Sh(c); r.Code != 0 {
@@ -501,6 +535,209 @@ EOF`)
 			home.WaitFor("published port with the integration rule", 10*time.Second, func() bool { return home.FetchOK(url) })
 			if r := vps.Meshly("doctor"); strings.Contains(r.Out, "chain inet hostfw forward") {
 				t.Fatalf("doctor still warns about the integrated forward chain:\n%s", r.Out)
+			}
+		})
+	})
+}
+
+// A Docker host whose peer turns against it, as in
+// TestCompromisedPeerContained: forwarding for containers opens nothing
+// else. The home LAN stays closed to vps, also through a foreign DNAT on an
+// allowed port and while the meshly table is gone; nothing from the LAN is
+// forwarded into the tunnel; a local redirect is dropped; container
+// addresses and unpublished ports stay closed. Each check also makes sure
+// that it is meshly that drops the packets.
+func TestDockerHostContained(t *testing.T) {
+	forDistros(t, func(t *testing.T, distro string) {
+		l := newDockerLab(t, distro)
+		home, lanhost := l.Node("home"), l.Node("lanhost")
+		// Forwarding is on before Docker starts, as on a host that routes
+		// already: Docker leaves the FORWARD policy at accept, and only
+		// meshly keeps the tunnel apart from the LAN.
+		home.MustSh("sysctl -qw net.ipv4.ip_forward=1 && systemctl start docker")
+		home.DockerStart()
+		if p := strings.TrimSpace(home.MustSh("iptables -S FORWARD | head -n 1")); p != "-P FORWARD ACCEPT" {
+			t.Fatalf("Docker changed the FORWARD policy: %s", p)
+		}
+		vps, home := l.Pair()
+		web := home.ServeHTTP("web", "9104:8080")
+		// A port of the same container that is not published.
+		home.MustDocker("exec", "-d", "web", "/busybox", "httpd", "-f", "-p", "8081", "-h", "/www")
+		home.WaitFor("unpublished port serving", 5*time.Second, func() bool { return home.FetchOK("http://" + web + ":8081/") })
+		// A foreign table DNATs an allowed port to the LAN host and
+		// redirects another to a local port without a rule. The LAN host's
+		// replies return through home. Behind 8888 and 8889 the token is
+		// that of another port, so Connects checks them, not Probe.
+		home.MustSh(`nft -f - <<'EOF'
+table ip foreign {
+	chain prerouting {
+		type nat hook prerouting priority dstnat;
+		tcp dport 8888 dnat to 192.168.77.20:80
+		tcp dport 8889 redirect to :22
+	}
+	chain postrouting { type nat hook postrouting priority srcnat; ip daddr 192.168.77.20 masquerade; }
+}
+EOF`)
+		home.Listen("tcp", 22)
+		lanhost.Listen("tcp", 80)
+		for _, p := range []string{"9104/tcp", "8888/tcp", "8889/tcp"} {
+			home.MustMeshly("allow", p, "from", "vps")
+		}
+
+		// vps turns against home as in TestCompromisedPeerContained and
+		// routes home's Docker network into the tunnel too. Its watch and
+		// check timer would undo that.
+		subnet := strings.TrimSpace(home.MustDocker("network", "inspect", "-f", "{{range .IPAM.Config}}{{.Subnet}}{{end}}", "bridge").Out)
+		pub := strings.TrimSpace(vps.MustSh("wg show meshly0 peers"))
+		t.Cleanup(func() {
+			for _, c := range []string{"ip route del 192.168.77.0/24 dev meshly0 2>/dev/null || true", "ip route del " + subnet + " dev meshly0 2>/dev/null || true"} {
+				if r := vps.Sh(c); r.Code != 0 {
+					t.Errorf("vps: restore: %s: %s", c, r)
+				}
+			}
+		})
+		vps.unwatched(t)
+		compromise(t, vps)
+		vps.MustSh(fmt.Sprintf("wg set meshly0 peer %s allowed-ips 10.100.0.2/32,10.100.0.0/24,192.168.77.0/24,%s && ip route replace %s dev meshly0", pub, subnet, subnet))
+		if !vps.FetchOK("http://10.100.0.2:9104/") {
+			t.Fatal("baseline: published and allowed port unreachable")
+		}
+		// home's route for a packet from vps to dst.
+		routeFromVPN := func(dst string) Result { return home.Sh("ip route get " + dst + " from 10.100.0.1 iif meshly0") }
+
+		// from_vpn drops the LAN address. The DNAT on an allowed port gets
+		// past it, and policy routing refuses it before the forward hook.
+		l.Run("lan", func(t *testing.T) {
+			before := home.counted("from_vpn", "only the local vpn address")
+			if vps.Probe("tcp", "192.168.77.20", 80) {
+				t.Fatal("compromised peer reaches the home LAN")
+			}
+			if after := home.counted("from_vpn", "only the local vpn address"); after <= before {
+				t.Fatalf("meshly did not drop the packets to the LAN host: counter %d -> %d", before, after)
+			}
+			before = home.counted("guard_fwd", "no forwarding from the vpn")
+			if vps.Connects("10.100.0.2", 8888) {
+				t.Fatal("DNAT on an allowed port reaches the LAN host")
+			}
+			if r := routeFromVPN("192.168.77.20"); !unroutable(r) {
+				t.Fatalf("policy routing does not refuse the LAN host to the tunnel: %s", r)
+			}
+			if after := home.counted("guard_fwd", "no forwarding from the vpn"); after != before {
+				t.Fatalf("DNAT to the LAN host reached the forward hook: counter %d -> %d", before, after)
+			}
+		})
+
+		// Without the routing rule, guard_fwd alone drops the DNAT to the
+		// LAN; service check brings the rule back.
+		l.Run("lan-without-routing-rule", func(t *testing.T) {
+			repair := home.unwatched(t)
+			home.MustSh("ip rule del iif meshly0 lookup 109")
+			before := home.counted("guard_fwd", "no forwarding from the vpn")
+			if vps.Connects("10.100.0.2", 8888) {
+				t.Fatal("DNAT on an allowed port reaches the LAN host without the routing rule")
+			}
+			if after := home.counted("guard_fwd", "no forwarding from the vpn"); after <= before {
+				t.Fatalf("meshly did not drop the DNAT to the LAN host: counter %d -> %d", before, after)
+			}
+			repair()
+			if out := home.MustSh("ip rule"); !strings.Contains(out, "iif meshly0 lookup 109") {
+				t.Fatalf("service check did not restore the routing rule:\n%s", out)
+			}
+		})
+
+		l.Run("local-redirect", func(t *testing.T) {
+			before := home.counted("guard_in", "dnat from the vpn is not supported")
+			if vps.Connects("10.100.0.2", 8889) {
+				t.Fatal("local redirect on an allowed port reaches a port without a rule")
+			}
+			if after := home.counted("guard_in", "dnat from the vpn is not supported"); after <= before {
+				t.Fatalf("meshly did not drop the redirect: counter %d -> %d", before, after)
+			}
+		})
+
+		// Docker's own guard comes first: raw PREROUTING drops packets for
+		// a container that arrive on another interface. Without it,
+		// meshly's from_vpn is what drops them.
+		l.Run("containers", func(t *testing.T) {
+			home.withoutRawGuard(t, web)
+			home.MustMeshly("allow", "8081/tcp", "from", "vps")
+			before := home.counted("from_vpn", "only the local vpn address")
+			for _, port := range []int{8080, 8081} {
+				if vps.Connects(web, port) {
+					t.Fatalf("container address reachable through the VPN on port %d", port)
+				}
+			}
+			if after := home.counted("from_vpn", "only the local vpn address"); after <= before {
+				t.Fatalf("meshly did not drop the packets to the container address: counter %d -> %d", before, after)
+			}
+			if vps.Connects("10.100.0.2", 8081) {
+				t.Fatal("an unpublished container port is reachable through the VPN")
+			}
+			if !vps.FetchOK("http://10.100.0.2:9104/") {
+				t.Fatal("published and allowed port unreachable")
+			}
+		})
+
+		// lanhost routes vps's VPN address through home. A datagram needs
+		// no reply: vps would log one that gets through. With rp_filter on
+		// (Ubuntu sets 2), the kernel drops them before the forward hook,
+		// since the reverse path lookup for a packet leaving through meshly0
+		// follows meshly's routing rule to its unreachable default. With
+		// rp_filter off, guard_fwd alone decides.
+		l.Run("lan-into-vpn", func(t *testing.T) {
+			vps.Listen("tcp", 8080)
+			vps.Listen("udp", 5353)
+			rp := strings.TrimSpace(home.MustSh("sysctl -n net.ipv4.conf.all.rp_filter"))
+			t.Cleanup(func() {
+				if r := home.Sh("sysctl -qw net.ipv4.conf.all.rp_filter=" + rp); r.Code != 0 {
+					t.Errorf("home: restore rp_filter: %s", r)
+				}
+			})
+			home.MustSh("sysctl -qw net.ipv4.conf.all.rp_filter=0")
+			t.Cleanup(func() {
+				if r := lanhost.Sh("ip route del 10.100.0.1/32 2>/dev/null || true"); r.Code != 0 {
+					t.Errorf("lanhost: restore: %s", r)
+				}
+			})
+			lanhost.MustSh("ip route replace 10.100.0.1/32 via 192.168.77.10")
+			before := home.counted("guard_fwd", "no forwarding into the vpn")
+			if lanhost.Probe("tcp", "10.100.0.1", 8080) || lanhost.Probe("udp", "10.100.0.1", 5353) {
+				t.Fatal("the home LAN reaches vps through the tunnel")
+			}
+			if hits := vps.Sh("cat /tmp/hits-tcp-8080 /tmp/hits-udp-5353 2>/dev/null").Out; hits != "" {
+				t.Fatalf("vps received packets from the home LAN: %s", hits)
+			}
+			if after := home.counted("guard_fwd", "no forwarding into the vpn"); after <= before {
+				t.Fatalf("meshly did not drop the packets from the LAN: counter %d -> %d", before, after)
+			}
+		})
+
+		// The second layer, until service check repairs the table: policy
+		// routing passes only Docker's networks from the tunnel. (Ports
+		// Docker publishes on all addresses are open meanwhile, a known
+		// limitation, so they are not checked here.)
+		l.Run("without-table", func(t *testing.T) {
+			repair := home.unwatched(t)
+			home.MustSh("nft delete table inet meshly")
+			if r := routeFromVPN("192.168.77.20"); !unroutable(r) {
+				t.Fatalf("policy routing does not refuse the LAN host to the tunnel: %s", r)
+			}
+			if r := routeFromVPN(web); r.Code != 0 || !strings.Contains(r.Out, "dev docker0") {
+				t.Fatalf("policy routing does not pass the container to docker0: %s", r)
+			}
+			if vps.Probe("tcp", "192.168.77.20", 80) || vps.Connects("10.100.0.2", 8888) {
+				t.Fatal("compromised peer reaches the home LAN without the meshly table")
+			}
+			repair()
+			if r := home.Sh("nft list table inet meshly"); r.Code != 0 {
+				t.Fatalf("service check did not restore the table: %s", r)
+			}
+		})
+
+		l.Run("one-routing-rule", func(t *testing.T) {
+			out := home.MustSh("ip rule")
+			if n := strings.Count(out, "iif meshly0"); n != 1 {
+				t.Fatalf("%d routing rules for meshly0:\n%s", n, out)
 			}
 		})
 	})
