@@ -162,6 +162,8 @@ systemctl enable --now nftables.service`)
 		if out := vps.MustSh("systemctl list-timers meshly-check.timer --no-legend"); !strings.Contains(out, "meshly-check") {
 			t.Fatalf("timer not scheduled: %s", out)
 		}
+		// The watch would restore the table first.
+		vps.unwatched(t)
 		vps.MustSh("nft delete table inet meshly")
 		vps.MustSh("systemctl start meshly-check.service") // what the timer fires
 		if vps.Sh("nft list table inet meshly").Code != 0 {
@@ -170,8 +172,10 @@ systemctl enable --now nftables.service`)
 	})
 	// Safe mode while the service is active: the VPN stays closed until
 	// the check retries the saved (last committed) configuration, which
-	// does not include the change that failed.
+	// does not include the change that failed. The watch, which retries
+	// the same within a second, is stopped so that the check does it.
 	l.Run("safe-mode-retried-by-check", func(t *testing.T) {
+		vps.unwatched(t)
 		r := vps.Meshly("MESHLY_FAULT=step:firewall.apply=error,tx:rollback=error", "allow", "8081/tcp", "from", "home")
 		if r.Code != 8 {
 			t.Fatalf("want exit 8 (safe mode): %s", r)
