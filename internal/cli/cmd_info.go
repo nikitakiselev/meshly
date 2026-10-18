@@ -87,6 +87,20 @@ func (a *App) renderStatus(st *diag.Status) {
 		default:
 			p("present, %s%s\n", yesno(f.MatchesConfig, "matches config", "OUTDATED"), yesno(f.ModifiedOutside, ", MODIFIED OUTSIDE MESHLY", ""))
 		}
+		if len(f.Iptables) > 0 {
+			var cs []string
+			for _, c := range f.Iptables {
+				state := "MISSING"
+				switch {
+				case c.RuleFirst:
+					state = "ok"
+				case c.RulePresent:
+					state = "NOT FIRST"
+				}
+				cs = append(cs, c.Chain+" "+state)
+			}
+			p("  iptables chains   meshly rule first: %s\n", strings.Join(cs, ", "))
+		}
 	}
 	for _, pi := range st.Peers {
 		p("Peer %s\n", pi.Name)

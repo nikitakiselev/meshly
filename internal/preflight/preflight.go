@@ -182,7 +182,8 @@ func (s *System) checkNft(ctx context.Context, r *Report) {
 	r.add("nftables", OK, "nftables "+vs, "")
 }
 
-// Managers detects firewall managers without a Meshly adapter.
+// Managers detects firewall managers: firewalld and legacy iptables are
+// refused, UFW is reported.
 func (s *System) Managers(ctx context.Context, r *Report, a *nft.Analysis) {
 	firewalld := a != nil && a.FirewalldTables
 	if _, err := os.Stat(s.path("/run/firewalld/firewalld.pid")); err == nil {
@@ -197,13 +198,8 @@ func (s *System) Managers(ctx context.Context, r *Report, a *nft.Analysis) {
 		r.add("firewall-manager", Fail, "firewalld is active; meshly has no firewalld adapter in this version",
 			"stop and disable firewalld (systemctl disable --now firewalld) and manage nftables natively, or do not use meshly on this host")
 	}
-	ufw := a != nil && a.UFWChains
-	if b, err := os.ReadFile(s.path("/etc/ufw/ufw.conf")); err == nil && ufwEnabled(b) {
-		ufw = true
-	}
-	if ufw {
-		r.add("firewall-manager", Fail, "UFW is enabled; meshly has no UFW adapter in this version",
-			"disable UFW (ufw disable) and use a native nftables ruleset with the meshly integration rule, or do not use meshly on this host")
+	if a != nil && a.UFWChains || s.UFWEnabled() {
+		r.add("ufw", Info, "UFW is enabled: meshly keeps its rule at the top of the iptables INPUT and OUTPUT chains, and UFW decides all other traffic", "")
 	}
 	for _, f := range []string{"/proc/net/ip_tables_names", "/proc/net/ip6_tables_names"} {
 		b, err := os.ReadFile(s.path(f))
@@ -225,12 +221,30 @@ func (s *System) Managers(ctx context.Context, r *Report, a *nft.Analysis) {
 		}
 		if legacyHasRules(out) {
 			r.add("iptables-legacy", Fail, "legacy iptables (xtables) rules are present; meshly cannot integrate with them",
-				"migrate the rules to nftables manually (meshly never migrates firewalls automatically)")
+				"switch iptables (and UFW, which uses it) to the nftables backend: update-alternatives --set iptables /usr/sbin/iptables-nft and --set ip6tables /usr/sbin/ip6tables-nft, then reload the rules; meshly never migrates firewalls itself")
 		}
 	}
-	if !firewalld && !ufw {
+	if !firewalld {
 		r.add("firewall-manager", OK, "no unsupported firewall manager detected", "")
 	}
+}
+
+// SavedIptablesRules lists the files of netfilter-persistent that contain
+// meshly's rule for the iptables chains.
+func (s *System) SavedIptablesRules() []string {
+	var out []string
+	for _, f := range []string{"/etc/iptables/rules.v4", "/etc/iptables/rules.v6"} {
+		if b, err := os.ReadFile(s.path(f)); err == nil && bytes.Contains(b, []byte(nft.IptablesComment)) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// UFWEnabled reports whether UFW is enabled in its configuration.
+func (s *System) UFWEnabled() bool {
+	b, err := os.ReadFile(s.path("/etc/ufw/ufw.conf"))
+	return err == nil && ufwEnabled(b)
 }
 
 func ufwEnabled(b []byte) bool {
@@ -322,18 +336,25 @@ func EvaluateFirewall(r *Report, a *nft.Analysis, profile string, mark uint32, s
 	}
 	integrated := 0
 	for _, c := range a.Chains {
-		if c.Status == "integrated" {
+		if c.Status == "integrated" && !c.ByMeshly {
 			integrated++
 		}
+	}
+	if ipt := a.ByMeshly(); len(ipt) > 0 {
+		var names []string
+		for _, c := range ipt {
+			names = append(names, c.Family+" "+c.Table+" "+c.Chain)
+		}
+		r.add("firewall-iptables", Info, "iptables chains "+strings.Join(names, ", ")+" filter traffic: meshly keeps its rule at the top of them, so only what meshly's policy accepts passes them", "")
 	}
 	if len(needs) == 0 && len(a.Unsupported()) == 0 {
 		switch {
 		case profile == model.ProfileNftables && integrated == 0:
-			r.add("firewall-profile", Warn, "profile nftables is configured but no foreign chain needs integration", "")
+			r.add("firewall-profile", Warn, "profile nftables is configured but no native nftables chain needs integration", "")
 		case profile == model.ProfileNftables:
 			r.add("firewall-profile", OK, fmt.Sprintf("native nftables profile: integration rule present in %d chain(s)", integrated), "")
 		default:
-			r.add("firewall-profile", OK, "no foreign filtering chain affects meshly traffic (profile none)", "")
+			r.add("firewall-profile", OK, "no native nftables chain affects meshly traffic (profile none)", "")
 		}
 	}
 	if a.DockerDetected {
@@ -347,7 +368,7 @@ func EvaluateFirewall(r *Report, a *nft.Analysis, profile string, mark uint32, s
 // AutoProfile chooses a profile from an analysis.
 func AutoProfile(a *nft.Analysis) string {
 	for _, c := range a.Chains {
-		if c.Status == "integrated" || c.Status == "needs-integration" || c.Status == "misplaced-integration" {
+		if !c.ByMeshly && (c.Status == "integrated" || c.Status == "needs-integration" || c.Status == "misplaced-integration") {
 			return model.ProfileNftables
 		}
 	}

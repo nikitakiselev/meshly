@@ -36,6 +36,9 @@ type ChainFinding struct {
 	Policy   string `json:"policy"`
 	// IptablesManaged: the table is owned by iptables-nft.
 	IptablesManaged bool `json:"iptables_managed"`
+	// ByMeshly: an iptables filter INPUT or OUTPUT chain, into which
+	// Meshly puts its integration rule itself (see IptablesChains).
+	ByMeshly bool `json:"integrated_by_meshly,omitempty"`
 	// Interfering lists handles of rules that may drop Meshly traffic
 	// (directly or through jumps). Policy drop is reported separately.
 	Interfering []int `json:"interfering_rules,omitempty"`
@@ -63,11 +66,12 @@ type Analysis struct {
 	NetdevChains    []string       `json:"netdev_chains,omitempty"`
 }
 
-// NeedsIntegration reports chains that block Meshly without integration.
+// NeedsIntegration reports chains that block Meshly until the
+// administrator adds the integration rule.
 func (a *Analysis) NeedsIntegration() []ChainFinding {
 	var out []ChainFinding
 	for _, c := range a.Chains {
-		if c.Status == "needs-integration" || c.Status == "misplaced-integration" {
+		if !c.ByMeshly && (c.Status == "needs-integration" || c.Status == "misplaced-integration") {
 			out = append(out, c)
 		}
 	}
@@ -79,6 +83,18 @@ func (a *Analysis) Unsupported() []ChainFinding {
 	var out []ChainFinding
 	for _, c := range a.Chains {
 		if c.Status == "unsupported" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// ByMeshly reports the iptables chains that may drop Meshly traffic, into
+// which Meshly puts its integration rule itself.
+func (a *Analysis) ByMeshly() []ChainFinding {
+	var out []ChainFinding
+	for _, c := range a.Chains {
+		if c.ByMeshly && c.Status != "compatible" {
 			out = append(out, c)
 		}
 	}
@@ -192,6 +208,7 @@ func (an *analyzer) chain(c Chain) ChainFinding {
 		Family: c.Family, Table: c.Table, Chain: c.Name, Hook: c.Hook,
 		Priority: c.Priority(), Policy: c.Policy,
 		IptablesManaged: isIptablesTable(an.rs, c.Family, c.Table),
+		ByMeshly:        integratedByMeshly(an.rs, c),
 	}
 	if f.Policy == "" {
 		f.Policy = "accept"
@@ -225,9 +242,9 @@ func (an *analyzer) chain(c Chain) ChainFinding {
 		}
 	}
 	switch {
-	case f.IptablesManaged:
+	case f.IptablesManaged && !f.ByMeshly:
 		f.Status = "unsupported"
-		f.Detail = reason + "; chain is managed by iptables (no meshly adapter)"
+		f.Detail = reason + "; meshly integrates only the INPUT and OUTPUT chains of the iptables filter table"
 	case (c.Hook == "prerouting" || c.Hook == "output") && f.Priority <= PolicyPriority:
 		f.Status = "unsupported"
 		f.Detail = fmt.Sprintf("%s; chain priority %d runs before meshly (%d), integration is impossible", reason, f.Priority, PolicyPriority)

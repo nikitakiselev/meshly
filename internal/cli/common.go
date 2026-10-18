@@ -66,6 +66,29 @@ func (a *App) resolveProfile(ctx context.Context, profile string, cfg *model.Con
 	return preflight.AutoProfile(nft.Analyze(rs, a.Sys.AnalysisContext(cfg))), nil
 }
 
+// printIptables names the iptables chains that carry meshly's rule (after
+// init or join), on a line that starts with label.
+func (a *App) printIptables(ctx context.Context, cfg *model.Config, label string) {
+	rs, err := a.Sys.NFT.ListRuleset(ctx)
+	if err != nil {
+		return
+	}
+	var first []nft.IptablesChain
+	for _, c := range rs.IptablesChains(cfg.Firewall.Mark) {
+		if c.First {
+			first = append(first, c)
+		}
+	}
+	if len(first) == 0 {
+		return
+	}
+	note := ""
+	if a.Sys.UFWEnabled() {
+		note = "; UFW is enabled and decides all other traffic"
+	}
+	a.printf("%smeshly rule first in %s%s\n", label, nft.IptablesNames(first), note)
+}
+
 // apply executes or previews op.
 func (a *App) apply(ctx context.Context, op engine.Op, dryRun bool) (*engine.Result, error) {
 	if op.Actor == "" {
@@ -100,15 +123,21 @@ func (a *App) printPlan(d *engine.Desired, steps []engine.Step, cfgChanged bool)
 		return
 	}
 	a.printf("Planned system changes, in order:\n")
-	fw := false
+	fw, ipt := false, false
 	for i, s := range steps {
 		a.printf("  %d. %s\n", i+1, s.Desc)
-		if s.Name == "firewall.apply" {
+		switch s.Name {
+		case "firewall.apply":
 			fw = true
+		case "iptables.integrate":
+			ipt = true
 		}
 	}
 	if fw && d.Present {
 		a.printf("\nFirewall table that would be installed (atomically replaces only table inet meshly):\n\n%s\n", d.Firewall.Definition)
+	}
+	if ipt && d.Present {
+		a.printf("\nRule that would be put at the top of those iptables chains:\n\n  %s\n", nft.IptablesRule(d.Config.Firewall.Mark))
 	}
 }
 

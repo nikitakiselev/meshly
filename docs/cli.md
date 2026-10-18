@@ -36,12 +36,13 @@ port is reachable from the internet. Keys are generated locally.
 | `--cidr CIDR` | `10.100.0.0/24` | VPN network: private IPv4, `/16`–`/30`, must not overlap local addresses or routes |
 | `--mtu N` | `1420` | Interface MTU |
 | `--interface NAME` | `meshly0` | Interface name |
-| `--firewall PROFILE` | `auto` | `auto`, `none` or `nftables`; see [firewall.md](firewall.md) |
+| `--firewall PROFILE` | `auto` | `auto`, `none` or `nftables`: how a native nftables firewall is integrated; UFW and iptables need nothing. See [firewall.md](firewall.md) |
 | `--dry-run` | | Show what would change |
 
-Preflight runs first. If the environment is unsupported (no kernel WireGuard, nftables older than 1.0.6, ufw,
-firewalld, iptables-legacy rules, a foreign drop chain without integration, a CIDR conflict or a busy port), init
-stops with exit code 3 and changes nothing.
+Preflight runs first. If the environment is unsupported (no kernel WireGuard, nftables older than 1.0.6,
+firewalld, iptables-legacy rules, a native nftables drop chain without integration, a CIDR conflict or a busy port),
+init stops with exit code 3 and changes nothing. UFW and iptables rules need nothing: meshly puts its rule at the
+top of their `INPUT` and `OUTPUT` chains, and init names the chains.
 
 init ends with what to do next: `sudo meshly invite` on this node and `sudo meshly join` on the other. Without an
 endpoint it says that no other node can join until this node has one (`meshly set endpoint IP`).
@@ -281,7 +282,8 @@ unchanged.
 ### `meshly reset [--yes]`
 
 Stops the link and removes the configuration, keys, runtime state, configuration history and units from this node.
-The binary and the operation journal stay.
+The binary and the operation journal stay. If `/etc/iptables/rules.v4` or `rules.v6` still contains meshly's iptables
+rule (saved with `netfilter-persistent save`), `reset` warns: run `sudo netfilter-persistent save` again.
 
 ### `meshly recover`
 

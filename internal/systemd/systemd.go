@@ -98,7 +98,8 @@ func Executable() (string, error) {
 	return filepath.EvalSymlinks(exe)
 }
 
-// Install writes the unit files (only when content differs) and reloads
+// Install writes the unit files and the drop-ins for nftables.service and
+// netfilter-persistent.service (only when content differs) and reloads
 // systemd. It also tells systemd-networkd and NetworkManager, when
 // installed, to leave the interface alone. Returns whether anything
 // changed.
@@ -116,6 +117,7 @@ func (m *Manager) Install(ctx context.Context, exe, iface string) (bool, error) 
 		targets["10-meshly-unmanaged.network"] = filepath.Join(m.Root, "etc/systemd/network/10-meshly-unmanaged.network")
 	}
 	targets["nftables-meshly.conf"] = filepath.Join(m.UnitDir, "nftables.service.d", "50-meshly.conf")
+	targets["netfilter-persistent-meshly.conf"] = filepath.Join(m.UnitDir, "netfilter-persistent.service.d", "50-meshly.conf")
 	if dirExists(filepath.Join(m.Root, "etc/NetworkManager/conf.d")) {
 		targets["networkmanager-meshly.conf"] = filepath.Join(m.Root, "etc/NetworkManager/conf.d/meshly.conf")
 	}
@@ -152,12 +154,15 @@ func (m *Manager) Uninstall(ctx context.Context) error {
 		filepath.Join(m.Root, "etc/systemd/network/10-meshly-unmanaged.network"),
 		filepath.Join(m.Root, "etc/NetworkManager/conf.d/meshly.conf"),
 		filepath.Join(m.UnitDir, "nftables.service.d", "50-meshly.conf"),
+		filepath.Join(m.UnitDir, "netfilter-persistent.service.d", "50-meshly.conf"),
 	} {
 		if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, err)
 		}
 	}
-	_ = os.Remove(filepath.Join(m.UnitDir, "nftables.service.d")) // only if empty
+	// Only if empty.
+	_ = os.Remove(filepath.Join(m.UnitDir, "nftables.service.d"))
+	_ = os.Remove(filepath.Join(m.UnitDir, "netfilter-persistent.service.d"))
 	if m.Available {
 		if _, err := m.Run(ctx, "daemon-reload"); err != nil {
 			errs = append(errs, err)

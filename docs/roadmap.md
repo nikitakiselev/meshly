@@ -24,8 +24,8 @@ planned, roughly in order. Nothing here is a commitment to a date. Suggestions a
   the handshake goes stale.
 - **IPv6.** IPv6 transport endpoints are accepted today but not yet covered by integration tests; IPv6 *inside* the tunnel is blocked. Dual-stack VPN
   addressing would need a second policy family.
-- **Firewall adapters.** firewalld (zones/policies) and ufw adapters, so those hosts are supported instead of
-  refused.
+- **firewalld adapter.** Zones and policies, so firewalld hosts are supported instead of refused (UFW and iptables
+  are supported since 0.0.1).
 - **Distribution packages.** `.deb` packages with the same signing key, as an alternative to `install.sh`.
 - **Metrics.** A textfile collector output for node_exporter (handshake age, bytes, denied packets).
 

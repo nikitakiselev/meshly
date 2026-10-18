@@ -339,13 +339,22 @@ an admin's `nft flush ruleset` can interfere with meshly's table.
 **meshly guarantees:**
 
 - **Detection before any change.** The live ruleset is analysed before
-  anything is touched. Unsupported setups (UFW, firewalld, legacy iptables
-  rules, iptables-nft chains that would drop meshly traffic, flowtables that
-  offload the interface) stop the command with exit 3. `--dry-run` reports
-  the same. *Integration:* `TestUnsupportedFirewalls` checks that foreign
-  state is unchanged after the refusal. Note that UFW and firewalld are
-  simulated by their config and pid files, not by the real daemons. *Unit:*
+  anything is touched. Unsupported setups (firewalld, legacy iptables rules,
+  iptables-nft chains outside `filter INPUT`/`OUTPUT` that would drop meshly
+  traffic, flowtables that offload the interface) stop the command with exit
+  3. `--dry-run` reports the same. *Integration:* `TestUnsupportedFirewalls`
+  checks that foreign state is unchanged after the refusal. Note that
+  firewalld is simulated by its pid file, not by the real daemon. *Unit:*
   `TestAnalyzeFixtures` over rulesets recorded from nft 1.0.6 and 1.0.9.
+- **UFW and iptables.** meshly keeps one rule at the top of the iptables
+  `filter` chains `INPUT` and `OUTPUT`; it accepts only packets that carry
+  meshly's mark, which meshly sets only on packets its own policy accepted
+  and clears on every other packet. UFW's and the administrator's rules
+  still decide everything else, and a port they open to the internet stays
+  closed to the peer through the VPN. Without the rule (after
+  `iptables-restore`, until the check repairs it) the VPN fails closed.
+  *Integration:* `TestUFW` (Debian 12 and Ubuntu 24.04, real UFW on both
+  nodes), `TestIptablesHost`, `TestSystemdUFW` (reboot).
 - **Native nftables profile.** A host firewall with `policy drop` must
   contain the one integration rule
   `meta mark & 0x10000000 == 0x10000000 accept`. A missing or misplaced rule
@@ -396,8 +405,20 @@ an admin's `nft flush ruleset` can interfere with meshly's table.
   WireGuard UDP port must be opened there by the admin.
 - **Rules in hooks that run before meshly.** For example, `netdev` ingress
   chains are reported as warnings, not prevented.
-- **Firewall managers without an adapter.** UFW and firewalld must be
-  disabled to use meshly.
+- **Firewall managers without an adapter.** firewalld must be disabled to
+  use meshly. UFW and iptables must use the default `iptables-nft` backend.
+- **meshly's mark set outside meshly.** While table `inet meshly` exists,
+  its chains clear the bit before any filter chain sees a packet. While it
+  is absent (deleted, until the check restores it), a local process with
+  `CAP_NET_ADMIN` that sets the bit with `SO_MARK` passes the integration
+  rule in `OUTPUT`; such a process can change the firewall anyway. The
+  administrator's own `MARK` rules in `mangle` run after meshly's chains and
+  must not set the bit.
+- **Saved iptables rules.** `netfilter-persistent save` writes meshly's rule
+  into `/etc/iptables/rules.v4` and `rules.v6`. While meshly runs (or is
+  stopped) this is harmless: meshly replaces or removes the restored copy at
+  boot. After `meshly reset` it would come back at every boot; `reset` warns
+  and says to save the rules again.
 
 ## Failures and interrupted operations
 

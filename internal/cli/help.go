@@ -22,7 +22,9 @@ Usually run on the server whose UDP port is reachable from the internet.
   --cidr CIDR          VPN network (default 10.100.0.0/24, IPv4 /16-/30)
   --mtu N              interface MTU (default 1420)
   --interface NAME     interface name (default meshly0)
-  --firewall PROFILE   auto | none | nftables (default auto)
+  --firewall PROFILE   auto | none | nftables (default auto): how a native
+                       nftables firewall is integrated; UFW and iptables
+                       need nothing
   --dry-run            show what would change, change nothing
 
 Examples:
@@ -61,7 +63,9 @@ in the shell history.
   --keepalive SECONDS  persistent keepalive towards the inviting node
                        (default 25, 0 = off)
   --interface NAME     interface name (default meshly0)
-  --firewall PROFILE   auto | none | nftables (default auto)
+  --firewall PROFILE   auto | none | nftables (default auto): how a native
+                       nftables firewall is integrated; UFW and iptables
+                       need nothing
 
 Examples:
   sudo meshly join

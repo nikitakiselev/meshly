@@ -44,6 +44,67 @@ type Kernel struct {
 	Version string
 	// DefaultRoute lists the addresses of the interfaces with a default route.
 	DefaultRoute []model.LinkAddr
+	// Iptables are built-in chains of iptables-nft filter tables.
+	Iptables []*IptablesChain
+	handle   int
+}
+
+// IptablesChain is a built-in chain of table "ip filter" or "ip6 filter"
+// as iptables-nft creates it.
+type IptablesChain struct {
+	Family, Chain, Policy string
+	Rules                 []IptablesRule
+}
+
+// IptablesRule is a rule of an IptablesChain: meshly's when Comment is
+// set, otherwise a foreign jump to a UFW chain.
+type IptablesRule struct {
+	Handle  int
+	Comment string
+	Mark    uint32
+}
+
+// AddIptables adds a chain with n foreign rules, as UFW leaves INPUT and
+// OUTPUT.
+func (k *Kernel) AddIptables(family, chain, policy string, n int) *IptablesChain {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	c := &IptablesChain{Family: family, Chain: chain, Policy: policy}
+	for range n {
+		k.handle++
+		c.Rules = append(c.Rules, IptablesRule{Handle: k.handle})
+	}
+	k.Iptables = append(k.Iptables, c)
+	return c
+}
+
+// IptablesRules returns a copy of the rules of a chain.
+func (k *Kernel) IptablesRules(family, chain string) []IptablesRule {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if c := k.iptablesChain(family, chain); c != nil {
+		return slices.Clone(c.Rules)
+	}
+	return nil
+}
+
+// SetIptablesRules replaces the rules of a chain, as iptables-restore
+// would.
+func (k *Kernel) SetIptablesRules(family, chain string, rules []IptablesRule) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if c := k.iptablesChain(family, chain); c != nil {
+		c.Rules = slices.Clone(rules)
+	}
+}
+
+func (k *Kernel) iptablesChain(family, chain string) *IptablesChain {
+	for _, c := range k.Iptables {
+		if c.Family == family && c.Chain == chain {
+			return c
+		}
+	}
+	return nil
 }
 
 // New returns an empty kernel.
@@ -57,7 +118,7 @@ func New() *Kernel {
 // Fail makes the next n calls of op fail (n < 0: always). Ops are
 // link.create, link.delete, link.up, link.down, link.mtu, link.alias,
 // link.address, routes.sync, link.sysctl, wireguard.configure, nft.check,
-// nft.apply.
+// nft.apply, iptables.check, iptables.apply.
 func (k *Kernel) Fail(op string, n int) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -321,14 +382,27 @@ func (r runner) Run(_ context.Context, stdin string, args ...string) ([]byte, er
 	case "--version":
 		return []byte(k.Version + "\n"), nil
 	case "-c -f -":
-		if err := k.call("nft.check"); err != nil {
-			return nil, err
-		}
 		if strings.Contains(stdin, "flush ruleset") {
 			return nil, errors.New("meshly must never flush the ruleset")
 		}
+		if isIptablesScript(stdin) {
+			if err := k.call("iptables.check"); err != nil {
+				return nil, err
+			}
+			return nil, k.iptablesScript(stdin, true)
+		}
+		if err := k.call("nft.check"); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	case "-f -":
+		if isIptablesScript(stdin) {
+			if err := k.call("iptables.apply"); err != nil {
+				return nil, err
+			}
+			k.Scripts = append(k.Scripts, stdin)
+			return nil, k.iptablesScript(stdin, false)
+		}
 		if err := k.call("nft.apply"); err != nil {
 			return nil, err
 		}
@@ -345,8 +419,83 @@ func (r runner) Run(_ context.Context, stdin string, args ...string) ([]byte, er
 	return nil, fmt.Errorf("fake nft: unsupported arguments %q", args)
 }
 
+func isIptablesScript(s string) bool {
+	return strings.HasPrefix(s, "insert rule ") || strings.HasPrefix(s, "delete rule ")
+}
+
+var (
+	iptDeleteRe = regexp.MustCompile(`^delete rule (ip6?) filter (INPUT|OUTPUT) handle (\d+)$`)
+	iptInsertRe = regexp.MustCompile(`^insert rule (ip6?) filter (INPUT|OUTPUT) meta mark & 0x([0-9a-f]{8}) == 0x([0-9a-f]{8}) counter accept comment "([^"]+)"$`)
+)
+
+// iptablesScript applies (or with check only validates) a script of
+// meshly's iptables statements, all or nothing.
+func (k *Kernel) iptablesScript(script string, check bool) error {
+	chains := map[*IptablesChain][]IptablesRule{}
+	rules := func(c *IptablesChain) []IptablesRule {
+		if r, ok := chains[c]; ok {
+			return r
+		}
+		return slices.Clone(c.Rules)
+	}
+	handle := k.handle
+	for _, line := range strings.Split(strings.TrimSuffix(script, "\n"), "\n") {
+		if m := iptDeleteRe.FindStringSubmatch(line); m != nil {
+			c := k.iptablesChain(m[1], m[2])
+			if c == nil {
+				return fmt.Errorf("fake nft: no chain %s filter %s", m[1], m[2])
+			}
+			var h int
+			fmt.Sscan(m[3], &h)
+			rs := rules(c)
+			i := slices.IndexFunc(rs, func(r IptablesRule) bool { return r.Handle == h })
+			if i < 0 {
+				return fmt.Errorf("fake nft: no rule with handle %d in %s filter %s", h, m[1], m[2])
+			}
+			chains[c] = slices.Delete(rs, i, i+1)
+			continue
+		}
+		m := iptInsertRe.FindStringSubmatch(line)
+		if m == nil || m[3] != m[4] {
+			return fmt.Errorf("fake nft: unexpected statement %q", line)
+		}
+		c := k.iptablesChain(m[1], m[2])
+		if c == nil {
+			return fmt.Errorf("fake nft: no chain %s filter %s", m[1], m[2])
+		}
+		var mark uint32
+		fmt.Sscanf(m[3], "%x", &mark)
+		handle++
+		chains[c] = append([]IptablesRule{{Handle: handle, Comment: m[5], Mark: mark}}, rules(c)...)
+	}
+	if check {
+		return nil
+	}
+	k.handle = handle
+	for c, rs := range chains {
+		c.Rules = rs
+	}
+	return nil
+}
+
 func (k *Kernel) rulesetJSON() string {
 	objs := []string{`{"metainfo":{"json_schema_version":1}}`}
+	tables := map[string]bool{}
+	for _, c := range k.Iptables {
+		if !tables[c.Family] {
+			tables[c.Family] = true
+			objs = append(objs, fmt.Sprintf(`{"table":{"family":%q,"name":"filter","handle":100}}`, c.Family))
+		}
+		hook := strings.ToLower(c.Chain)
+		objs = append(objs, fmt.Sprintf(`{"chain":{"family":%q,"table":"filter","name":%q,"handle":101,"type":"filter","hook":%q,"prio":0,"policy":%q}}`, c.Family, c.Chain, hook, c.Policy))
+		for _, r := range c.Rules {
+			if r.Comment == "" {
+				objs = append(objs, fmt.Sprintf(`{"rule":{"family":%q,"table":"filter","chain":%q,"handle":%d,"expr":[{"counter":{"packets":0,"bytes":0}},{"jump":{"target":"ufw-before-%s"}}]}}`, c.Family, c.Chain, r.Handle, hook))
+				continue
+			}
+			objs = append(objs, fmt.Sprintf(`{"rule":{"family":%q,"table":"filter","chain":%q,"handle":%d,"comment":%q,"expr":[{"match":{"op":"==","left":{"&":[{"meta":{"key":"mark"}},%d]},"right":%d}},{"counter":{"packets":0,"bytes":0}},{"accept":null}]}}`, c.Family, c.Chain, r.Handle, r.Comment, r.Mark, r.Mark))
+		}
+	}
 	if k.Table != "" || k.Foreign {
 		objs = append(objs, `{"table":{"family":"inet","name":"meshly","handle":1}}`,
 			`{"chain":{"family":"inet","table":"meshly","name":"guard_pre","handle":2,"type":"filter","hook":"prerouting","prio":-180,"policy":"accept"}}`)

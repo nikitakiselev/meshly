@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nikitakiselev/meshly/internal/journal"
@@ -272,6 +273,10 @@ func (a *App) cmdReset(ctx context.Context, args []string) error {
 		return err
 	}
 	a.printf("meshly was removed from this node (the binary and the journal %s remain).\n", a.Paths.JournalFile())
+	if saved := a.Sys.SavedIptablesRules(); len(saved) > 0 {
+		fmt.Fprintf(a.Stderr, "meshly: warning: meshly's iptables rule is still saved in %s (netfilter-persistent) and would come back at the next boot\n", strings.Join(saved, " and "))
+		fmt.Fprintf(a.Stderr, "         fix: sudo netfilter-persistent save   (saves the rules without it)\n")
+	}
 	return nil
 }
 

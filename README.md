@@ -65,9 +65,10 @@ flowchart LR
 - **Safe changes.** Every change is a journaled transaction with verification and rollback. If a failure leaves the
   tunnel in an unknown state, meshly closes it (*safe mode*) rather than leaving it open. An operation interrupted by
   a crash or power loss is finished or rolled back on the next start.
-- **Respects your firewall.** meshly owns one nftables table, `inet meshly`, replaces it atomically and never touches
-  anything else. Unsupported setups (ufw, firewalld, iptables-legacy rules, foreign drop chains without integration)
-  are detected *before* any change.
+- **Works with your firewall.** meshly owns one nftables table, `inet meshly`, and replaces it atomically. With UFW
+  or iptables rules, meshly keeps one rule at the top of their `INPUT` and `OUTPUT` chains that lets through only
+  what meshly allowed; no `ufw allow` is needed. It touches nothing else. Unsupported setups (firewalld,
+  iptables-legacy rules, native nftables drop chains without the integration rule) are detected *before* any change.
 - **Survives the real world.** NAT and idle timeouts (keepalive on both sides), VPS restarts (instant re-handshake
   from learned endpoints), reboots, `systemctl restart nftables` and `flush ruleset`. A one-minute integrity check
   repairs drift.
@@ -84,7 +85,7 @@ flowchart LR
 | OS | Linux with systemd. Tested on **Debian 12** and **Ubuntu 24.04** |
 | Architecture | `amd64`, `arm64` |
 | Kernel | WireGuard in the kernel (built-in or module; any 5.6+ distribution kernel) |
-| Firewall | nftables ≥ 1.0.6 (`/usr/sbin/nft`) on its own, or no firewall. Not supported: ufw, firewalld, iptables-legacy rules |
+| Firewall | nftables ≥ 1.0.6 (`/usr/sbin/nft`) is required. Host firewall: none, UFW, iptables rules (`iptables-nft`, the default backend) or a native nftables ruleset. Not supported: firewalld, iptables-legacy rules |
 | Network | One node needs a public UDP port (default `51820`) that the other node can reach |
 | Tools | `curl` or `wget`, `openssl`, `sha256sum` (installer only) |
 
@@ -281,8 +282,11 @@ already used), or UDP 51820 does not reach the VPS: check its cloud firewall. No
 **Can I connect more than two servers?** Not yet. A network has exactly two nodes in 0.0.x. See the
 [roadmap](docs/roadmap.md).
 
-**Does it work with ufw or firewalld?** No. meshly detects them and refuses to change anything, because it cannot
-guarantee its policy alongside them. Native nftables, or no firewall at all, is supported.
+**Does it work with UFW or iptables?** Yes, with nothing to configure. meshly keeps one rule at the top of the
+`INPUT` and `OUTPUT` chains that accepts only what meshly's own policy accepted, including the WireGuard port, and
+puts it back when a reload of the rules removes it. UFW keeps deciding all other traffic. firewalld and the legacy
+iptables backend are not supported: meshly detects them and changes nothing. See the
+[firewall docs](docs/firewall.md#iptables-and-ufw).
 
 **Are my Docker containers reachable through the VPN?** No. Published ports work through DNAT, and meshly drops
 DNAT and forwarding for tunnel traffic. To expose a container service, publish it on the host and allow that port.

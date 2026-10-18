@@ -30,6 +30,7 @@ import (
 	"github.com/nikitakiselev/meshly/internal/journal"
 	"github.com/nikitakiselev/meshly/internal/lock"
 	"github.com/nikitakiselev/meshly/internal/model"
+	"github.com/nikitakiselev/meshly/internal/nft"
 	"github.com/nikitakiselev/meshly/internal/pairing"
 	"github.com/nikitakiselev/meshly/internal/preflight"
 	"github.com/nikitakiselev/meshly/internal/store"
@@ -501,10 +502,10 @@ func TestExitCodes(t *testing.T) {
 	l.Release()
 
 	// Unsupported firewall manager: nothing changes.
-	if err := os.MkdirAll(filepath.Join(n.root, "etc/ufw"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(n.root, "run/firewalld"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(n.root, "etc/ufw/ufw.conf"), []byte("ENABLED=yes\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(n.root, "run/firewalld/firewalld.pid"), []byte("1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	scripts := len(n.k.Scripts)
@@ -516,7 +517,7 @@ func TestExitCodes(t *testing.T) {
 	n.must("stop")
 
 	// Rolled back / safe mode exit codes.
-	_ = os.Remove(filepath.Join(n.root, "etc/ufw/ufw.conf"))
+	_ = os.Remove(filepath.Join(n.root, "run/firewalld/firewalld.pid"))
 	n.must("start")
 	n.k.Fail("link.mtu", 1)
 	n.expect(ExitRolledBack, "set", "mtu", "1300")
@@ -529,6 +530,65 @@ func TestExitCodes(t *testing.T) {
 	n.must("start")
 	if _, ok := n.k.Links["meshly0"]; !ok {
 		t.Fatal("start did not leave safe mode")
+	}
+}
+
+// A host with UFW: init succeeds, says what meshly does with the iptables
+// chains, and puts its rule first in them; status shows it; reset removes it.
+func TestUFWHost(t *testing.T) {
+	n := newTestNode(t, time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC))
+	if err := os.MkdirAll(filepath.Join(n.root, "etc/ufw"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(n.root, "etc/ufw/ufw.conf"), []byte("ENABLED=yes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"ip", "ip6"} {
+		n.k.AddIptables(f, "INPUT", "drop", 3)
+		n.k.AddIptables(f, "OUTPUT", "accept", 3)
+	}
+	dry := n.must("init", "homelab", "--name", "vps", "--endpoint", "198.51.100.10", "--dry-run")
+	for _, want := range []string{"put the meshly rule at the top of iptables chain(s) ip filter INPUT, ip filter OUTPUT, ip6 filter INPUT, ip6 filter OUTPUT",
+		"Rule that would be put at the top", `meta mark & 0x10000000 == 0x10000000 counter accept comment "meshly:v1 integration"`} {
+		if !strings.Contains(dry, want) {
+			t.Fatalf("dry run lacks %q:\n%s", want, dry)
+		}
+	}
+	if rs := n.k.IptablesRules("ip", "INPUT"); len(rs) != 3 {
+		t.Fatalf("dry run changed the chain: %+v", rs)
+	}
+	out := n.must("init", "homelab", "--name", "vps", "--endpoint", "198.51.100.10")
+	for _, want := range []string{"profile none", "UFW is enabled", "ip filter INPUT, ip filter OUTPUT, ip6 filter INPUT, ip6 filter OUTPUT"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("init output lacks %q:\n%s", want, out)
+		}
+	}
+	for _, c := range n.k.Iptables {
+		if len(c.Rules) != 4 || c.Rules[0].Comment != nft.IptablesComment {
+			t.Fatalf("%s filter %s: %+v", c.Family, c.Chain, c.Rules)
+		}
+	}
+	st := n.must("status")
+	if !strings.Contains(st, "iptables chains") || !strings.Contains(st, "ip6 filter OUTPUT") || strings.Contains(st, "MISSING") {
+		t.Fatalf("status:\n%s", st)
+	}
+	if d := n.drift(); len(d) != 0 {
+		t.Fatalf("drift %v", d)
+	}
+	// Flushed by iptables-restore: status says so, the check repairs it.
+	n.k.SetIptablesRules("ip", "INPUT", n.k.IptablesRules("ip", "INPUT")[1:])
+	if st := n.must("status"); !strings.Contains(st, "ip filter INPUT MISSING") {
+		t.Fatalf("status does not show the missing rule:\n%s", st)
+	}
+	n.must("service", "check")
+	if rs := n.k.IptablesRules("ip", "INPUT"); rs[0].Comment != nft.IptablesComment {
+		t.Fatalf("not repaired: %+v", rs)
+	}
+	n.must("reset", "--yes")
+	for _, c := range n.k.Iptables {
+		if len(c.Rules) != 3 {
+			t.Fatalf("%s filter %s after reset: %+v", c.Family, c.Chain, c.Rules)
+		}
 	}
 }
 

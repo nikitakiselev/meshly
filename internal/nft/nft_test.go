@@ -1,6 +1,7 @@
 package nft
 
 import (
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -13,6 +14,10 @@ import (
 )
 
 var nftVersions = []string{"nft-1.0.6", "nft-1.0.9"}
+
+// ufwVersions adds nft-1.1.3 (Debian 13, iptables 1.8.11), captured only
+// with UFW: ufw.json and ufw-integrated.json.
+var ufwVersions = []string{"nft-1.0.6", "nft-1.0.9", "nft-1.1.3"}
 
 func loadFixture(t testing.TB, version, name string) *Ruleset {
 	t.Helper()
@@ -124,6 +129,14 @@ func TestRenderPolicyShape(t *testing.T) {
 	}
 	if strings.Contains(lock.Definition, "elements") {
 		t.Fatalf("lockdown table admits peers or services:\n%s", lock.Definition)
+	}
+	// Nor the transport: the interface is gone in safe mode, and the mark
+	// would let anything bound to the listen port pass the host firewall.
+	if strings.Contains(lock.Definition, "wireguard transport") || strings.Contains(lock.Definition, "51820") {
+		t.Fatalf("lockdown table marks the WireGuard transport:\n%s", lock.Definition)
+	}
+	if normal, _ := Render(InputFromConfig(cfg, false)); strings.Count(normal.Definition, "comment \"wireguard transport\"") != 2 {
+		t.Fatalf("table does not mark the WireGuard transport:\n%s", normal.Definition)
 	}
 }
 
@@ -271,13 +284,21 @@ func TestAnalyzeFixtures(t *testing.T) {
 		"accept-compatible": {chains: map[string]string{"inet filter input": "needs-integration"}},
 		"named-set-peer":    {chains: map[string]string{"inet filter input": "needs-integration"}},
 		"docker":            {chains: map[string]string{"ip nat PREROUTING": "compatible", "ip nat POSTROUTING": "compatible"}, docker: true},
-		"iptables-nft-drop": {chains: map[string]string{"ip filter INPUT": "unsupported"}},
-		"ufw-chains":        {chains: map[string]string{"ip filter INPUT": "unsupported"}, ufw: true},
-		"firewalld":         {firewalld: true},
-		"flowtable-netdev":  {flowtables: 1, netdev: 1},
+		// iptables filter INPUT/OUTPUT: integrated by meshly itself.
+		"iptables-nft-drop": {chains: map[string]string{"ip filter INPUT": "needs-integration"}},
+		"ufw-chains":        {chains: map[string]string{"ip filter INPUT": "needs-integration"}, ufw: true},
+		"ufw": {chains: map[string]string{"ip filter INPUT": "needs-integration", "ip filter OUTPUT": "compatible",
+			"ip6 filter INPUT": "needs-integration", "ip6 filter OUTPUT": "needs-integration"}, ufw: true},
+		"ufw-integrated": {chains: map[string]string{"ip filter INPUT": "integrated", "ip filter OUTPUT": "compatible",
+			"ip6 filter INPUT": "integrated", "ip6 filter OUTPUT": "integrated"}, ufw: true},
+		"firewalld":        {firewalld: true},
+		"flowtable-netdev": {flowtables: 1, netdev: 1},
 	}
-	for _, v := range nftVersions {
+	for _, v := range ufwVersions {
 		for name, w := range cases {
+			if !slices.Contains(nftVersions, v) && name != "ufw" && name != "ufw-integrated" {
+				continue
+			}
 			t.Run(v+"/"+name, func(t *testing.T) {
 				a := Analyze(loadFixture(t, v, name), testContext())
 				got := map[string]string{}
@@ -292,12 +313,134 @@ func TestAnalyzeFixtures(t *testing.T) {
 						t.Fatalf("%s: status %q, want %q (all: %v)", k, got[k], s, got)
 					}
 				}
+				for _, c := range a.Chains {
+					if want := c.Table == "filter" && c.IptablesManaged; c.ByMeshly != want {
+						t.Fatalf("%s %s %s: integrated by meshly %v, want %v", c.Family, c.Table, c.Chain, c.ByMeshly, want)
+					}
+				}
+				if len(a.NeedsIntegration()) != 0 && strings.HasPrefix(name, "ufw") {
+					t.Fatalf("the administrator is asked to integrate iptables chains: %+v", a.NeedsIntegration())
+				}
 				if a.DockerDetected != w.docker || a.UFWChains != w.ufw || a.FirewalldTables != w.firewalld ||
 					len(a.Flowtables) != w.flowtables || len(a.NetdevChains) != w.netdev {
 					t.Fatalf("flags: %+v", a)
 				}
 			})
 		}
+	}
+}
+
+// Meshly's rule in the iptables chains of a real UFW ruleset: inserted
+// where missing, left alone where it is first.
+func TestIptablesChainsRealUFW(t *testing.T) {
+	mark := model.DefaultFirewallMark
+	rule := `insert rule %s filter %s meta mark & 0x10000000 == 0x10000000 counter accept comment "meshly:v1 integration"` + "\n"
+	for _, v := range ufwVersions {
+		chains := loadFixture(t, v, "ufw").IptablesChains(mark)
+		if got := IptablesNames(chains); got != "ip filter INPUT, ip filter OUTPUT, ip6 filter INPUT, ip6 filter OUTPUT" {
+			t.Fatalf("%s: chains %s", v, got)
+		}
+		want := ""
+		for _, c := range chains {
+			if c.OK() || !c.Needed || len(c.Ours) != 0 {
+				t.Fatalf("%s: %s observed as %+v", v, c, c)
+			}
+			want += fmt.Sprintf(rule, c.Family, c.Chain)
+		}
+		if got := IptablesScript(chains, mark); got != want {
+			t.Fatalf("%s: script\n%s\nwant\n%s", v, got, want)
+		}
+		if got := IptablesRemoveScript(chains); got != "" {
+			t.Fatalf("%s: nothing to remove, got %q", v, got)
+		}
+
+		chains = loadFixture(t, v, "ufw-integrated").IptablesChains(mark)
+		for _, c := range chains {
+			if !c.OK() || !c.First || len(c.Ours) != 1 {
+				t.Fatalf("%s: %s observed as %+v", v, c, c)
+			}
+		}
+		if got := IptablesScript(chains, mark); got != "" {
+			t.Fatalf("%s: integrated chains changed: %q", v, got)
+		}
+		if got := IptablesRemoveScript(chains); strings.Count(got, "delete rule ") != 4 {
+			t.Fatalf("%s: remove script %q", v, got)
+		}
+		// Another mark: the rule is replaced.
+		other := loadFixture(t, v, "ufw-integrated").IptablesChains(0x20000000)
+		if got := IptablesScript(other, 0x20000000); strings.Count(got, "delete rule ") != 4 || strings.Count(got, "insert rule ") != 4 {
+			t.Fatalf("%s: rule with another mark kept: %q", v, got)
+		}
+	}
+}
+
+// The rule must be the only meshly rule and the first one; chains that
+// cannot drop anything are left alone.
+func TestIptablesChainStates(t *testing.T) {
+	ours := func(h int) string {
+		return fmt.Sprintf(`{"rule":{"family":"ip","table":"filter","chain":"INPUT","handle":%d,"comment":"meshly:v1 integration","expr":[{"match":{"op":"==","left":{"&":[{"meta":{"key":"mark"}},268435456]},"right":268435456}},{"counter":{"packets":0,"bytes":0}},{"accept":null}]}}`, h)
+	}
+	foreign := `{"rule":{"family":"ip","table":"filter","chain":"INPUT","handle":5,"expr":[{"counter":{"packets":0,"bytes":0}},{"drop":null}]}}`
+	head := `{"nftables":[{"metainfo":{"json_schema_version":1}},{"table":{"family":"ip","name":"filter","handle":1}},` +
+		`{"chain":{"family":"ip","table":"filter","name":"INPUT","handle":2,"type":"filter","hook":"input","prio":0,"policy":"%s"}}`
+	cases := []struct {
+		name, policy string
+		rules        []string
+		ok, needed   bool
+		script       string
+	}{
+		{"empty accept chain", "accept", nil, true, false, ""},
+		{"empty drop chain", "drop", nil, false, true, "insert"},
+		{"foreign rule", "accept", []string{foreign}, false, true, "insert"},
+		{"first", "drop", []string{ours(7), foreign}, true, true, ""},
+		{"misplaced", "drop", []string{foreign, ours(7)}, false, true, "delete 7, insert"},
+		{"duplicate", "drop", []string{ours(7), foreign, ours(8)}, false, true, "delete 7, delete 8, insert"},
+		{"alone in an accept chain", "accept", []string{ours(7)}, true, true, ""},
+	}
+	for _, c := range cases {
+		js := fmt.Sprintf(head, c.policy)
+		for _, r := range c.rules {
+			js += "," + r
+		}
+		rs, err := ParseRuleset([]byte(js + "]}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		chains := rs.IptablesChains(model.DefaultFirewallMark)
+		if len(chains) != 1 || chains[0].OK() != c.ok || chains[0].Needed != c.needed {
+			t.Fatalf("%s: %+v", c.name, chains)
+		}
+		var ops []string
+		for _, l := range strings.Split(strings.TrimSpace(IptablesScript(chains, model.DefaultFirewallMark)), "\n") {
+			switch {
+			case strings.HasPrefix(l, "delete rule ip filter INPUT handle "):
+				ops = append(ops, "delete "+strings.TrimPrefix(l, "delete rule ip filter INPUT handle "))
+			case strings.HasPrefix(l, "insert rule ip filter INPUT "):
+				ops = append(ops, "insert")
+			case l != "":
+				t.Fatalf("%s: unexpected statement %q", c.name, l)
+			}
+		}
+		if got := strings.Join(ops, ", "); got != c.script {
+			t.Fatalf("%s: script %q, want %q", c.name, got, c.script)
+		}
+	}
+}
+
+// Chains of other iptables tables and hooks are not integrated by meshly.
+func TestIptablesOtherChainsUnsupported(t *testing.T) {
+	js := `{"nftables":[{"metainfo":{"json_schema_version":1}},{"table":{"family":"ip","name":"mangle","handle":1}},
+{"chain":{"family":"ip","table":"mangle","name":"INPUT","handle":2,"type":"filter","hook":"input","prio":-150,"policy":"drop"}}]}`
+	rs, err := ParseRuleset([]byte(js))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rs.IptablesChains(model.DefaultFirewallMark)) != 0 {
+		t.Fatal("mangle chain taken for integration")
+	}
+	a := Analyze(rs, testContext())
+	if len(a.Chains) != 1 || a.Chains[0].Status != "unsupported" || a.Chains[0].ByMeshly {
+		t.Fatalf("mangle INPUT with policy drop: %+v", a.Chains)
 	}
 }
 

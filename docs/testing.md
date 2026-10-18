@@ -30,8 +30,8 @@ run it, and, at the end, what has **not** been verified. Background:
 | `internal/journal` | Append/read, torn and corrupt lines after a crash, incomplete operation detection, rotation (never with an open operation). |
 | `internal/pairing` | Invite codes: round trip for IPv4 and IPv6 endpoints, tolerant input (whitespace, letter case), the start of a code read on across lines and garbage refused at once, every refusal (prefix, base32, length, family, checksum, fields, another version, expiry with clock skew), expiry truncated to seconds; derived keys against fixed test vectors, and wiping. Messages: the exchange between both sides, size limit and framing, strict JSON (unknown, duplicate or non-canonical keys), a hostile peer on either side, refusal to send an invalid message. The in-memory network used by the CLI tests, whose connections report the addresses of both ends as a kernel's do. |
 | `internal/nft` | Deterministic rendering and policy hash, rule shapes (default deny, no forwarding, DNAT refusal, IPv4 only, no `established` shortcut inbound), lockdown table, rejection of unsafe input, ownership marker round trip, analysis of foreign rulesets; an exclusive port (the pairing port of an invite) dropped for anything but its peer through the interface, loopback included, with the table otherwise unchanged and no such rule without one. |
-| `internal/engine` | Bring-up order (firewall first), tear-down order (traffic path first), idempotency, ownership conflicts, backward rollback (also after the config was saved), forward completion, safe mode when rollback fails, recovery in both directions, drift, endpoint hints; temporary overlays (an extra peer with a preshared key, extra allow entries that only their peer may reach, a temporary private key) never saved, the table of the saved configuration again once the overlay is removed, the saved configuration restored when an overlay fails, the preshared key cleared when a peer is updated in place. Uses `internal/engine/enginetest`. |
-| `internal/preflight` | UFW/firewalld/legacy iptables detection, local port parsing and listen port selection, conflict checks, profile selection and firewall evaluation. |
+| `internal/engine` | Bring-up order (firewall first), tear-down order (traffic path first), idempotency, ownership conflicts, backward rollback (also after the config was saved), forward completion, safe mode when rollback fails, recovery in both directions, drift, endpoint hints; meshly's rule in the iptables chains (first, right after the table, only where a chain may drop; idempotent; removed, misplaced and duplicate rules repaired; rolled back with the step; removed in tear-down; kept in safe mode, whose table marks no transport); temporary overlays (an extra peer with a preshared key, extra allow entries that only their peer may reach, a temporary private key) never saved, the table of the saved configuration again once the overlay is removed, the saved configuration restored when an overlay fails, the preshared key cleared when a peer is updated in place. Uses `internal/engine/enginetest`. |
+| `internal/preflight` | UFW/firewalld/legacy iptables detection, local port parsing and listen port selection, conflict checks, profile selection and firewall evaluation (iptables chains reported, not refused, and not part of the profile). |
 | `internal/systemd` | Unit rendering (unsafe executable paths refused), installation incl. networkd/NetworkManager files and the nftables drop-in, uninstall, exact `systemctl` argument vectors, state parsing. |
 | `internal/upgrade` | Release key parsing, signed message format, signature verification, `SHA256SUMS` parsing (single version), version comparison, download over a local test server with tampered files, URL policy (HTTPS only, loopback for tests), binary install and rollback. |
 | `internal/cli` (Linux) | Full two-node flow (`init` → `invite` + `join` → `allow`/`deny`/`revoke`) on two fake kernels joined by an in-memory network, absence of private keys, the invite code and the keys derived from it in all output, the journal, the configuration and `status`, exit codes (including 7 rolled back and 8 safe mode, and leaving safe mode with `start`). Pairing: how the code is read (prompt, stdin, broken across lines, refused as an argument), the name from the host name, preflight before any contact, every answer of the invite by state, no answer to a connection from another address than the joining node's, a `welcome` that does not match the code, name taken, code used, no answer, cancel, hang-up, broken pipe and expiry on both sides, a confirmation at the deadline, an unconfirmed join undone on both sides, the open invite in `status` and `doctor` (also until a joined node's confirmation deadline past the code's expiry), a killed invite closed by the next command, leftovers of a crashed join removed. |
@@ -40,8 +40,10 @@ run it, and, at the end, what has **not** been verified. Background:
 output captured from real nftables 1.0.6 (Debian 12) and 1.0.9
 (Ubuntu 24.04): empty ruleset, host firewalls with and without the
 integration rule, a misplaced rule, compatible accept rules, named sets,
-Docker, iptables-nft, UFW, firewalld, flowtable/netdev, and meshly's own
-table.
+Docker, iptables-nft, UFW 0.36.2 enabled with and without meshly's rule in
+its chains, firewalld, flowtable/netdev, and meshly's own table.
+`nft-1.1.3` (Debian 13, iptables 1.8.11, UFW 0.36.2) holds only the two UFW
+captures.
 
 To run the Linux-only CLI tests from macOS, build the test binary and run it
 in a Linux container:
@@ -113,8 +115,10 @@ flowchart TB
 ```
 
 Images: `node.Dockerfile` on Debian 12 and Ubuntu 24.04 (nftables,
-iptables, iproute2, wireguard-tools, conntrack, netcat), and
-`systemd.Dockerfile` on Debian 12 with systemd as PID 1. A container
+iptables, UFW, iproute2, wireguard-tools, conntrack, netcat), and
+`systemd.Dockerfile` on Debian 12 with systemd as PID 1 (also with
+iptables and UFW). UFW is installed but enabled only by the tests that
+need it. A container
 restart stands in for a reboot: the network namespace, interface and all
 nftables tables are recreated empty, and systemd boots again.
 
@@ -138,9 +142,12 @@ nftables tables are recreated empty, and systemd boots again.
 | `TestFaultsAllow` | An interrupted `allow` is either fully in effect (config and packets) or not at all; with a failing rollback, safe mode removes the interface, the lockdown table admits no peer, and `start` restores the link without the failed rule. |
 | `TestFaultsReduce` | Interrupted `deny`, `stop` and `revoke` are completed by recovery; access is closed afterwards in every case. |
 | `TestFaultJoin` | A crash of `join` while it configures WireGuard is cleaned up on the joining node; the inviting node undoes the join that was never confirmed and keeps waiting, and a second `join` with the same code succeeds. |
-| `TestUnsupportedFirewalls` | UFW, firewalld, legacy iptables rules and an iptables-nft drop chain each stop `init` and `init --dry-run` with exit 3 and a message naming the cause, with no change to the host. |
+| `TestUnsupportedFirewalls` | firewalld, legacy iptables rules and an iptables-nft `mangle` chain that drops each stop `init` and `init --dry-run` with exit 3 and a message naming the cause, with no change to the host. |
+| `TestUFW` (Debian 12 and Ubuntu 24.04) | Real UFW enabled on both nodes (default deny incoming, SSH allowed on the vps) with no rule for meshly: `init` names the chains it integrates; pairing and an allowed service work; SSH, open in UFW, is not reachable through the VPN without a meshly rule; the application port stays closed publicly and public SSH stays open; UFW's rules are unchanged; `ufw allow`, `reload`, `disable` and `enable` keep meshly's rule first with no drift; after `iptables-restore` without it the VPN service is closed and `status` shows `MISSING` until the check repairs it; `stop` removes the rule, `start` brings it back, `reset` leaves UFW as it was. |
+| `TestIptablesHost` | Hand-written iptables rules with `policy DROP` on `INPUT` and nothing for the WireGuard port: pairing and an allowed service work, SSH is not reachable through the VPN, public ports are unchanged; meshly's rule is first in `INPUT` and absent from the empty `OUTPUT`; a rule inserted above it is moved below by the check; `reset` leaves `iptables-save` exactly as before. |
 | `TestNativeNftablesProfile` | A host firewall with `policy drop`: refused without the integration rule and with a misplaced one; works with it; the application port stays closed publicly and public SSH stays open; SSH is not reachable through the VPN without a rule; deleting the meshly table closes what meshly opened (fail-closed) until the check repairs it; with the integration rule removed, `allow` is refused, `deny`/`revoke` still work, and `doctor` exits 12 with the rule to add. |
 | `TestSystemdLifecycle` | Units enabled and active after pairing; after a reboot the link and an allowed service come back, with the firewall table installed before the interface; `systemctl stop/start/restart meshly` leave the configuration unchanged; `meshly stop` survives a reboot; an operation crashed before a reboot is recovered at boot and does not take effect; `nftables.service` start, reload and restart with `flush ruleset` keep the meshly table and the service reachable; the check timer is scheduled, and `meshly-check.service` restores a deleted table; after safe mode, `meshly-check.service` brings the link back from the saved configuration without the failed change. |
+| `TestSystemdUFW` | With UFW enabled, after a reboot UFW and meshly are active, meshly's rule is first and the allowed service is reachable. A unit named `netfilter-persistent.service` that runs `iptables-restore` (a stand-in for the real package, which cannot be installed next to UFW) removes the rule on restart, and meshly's drop-in puts it back at once (a `service-reload` that integrates the chains is journaled). `systemctl restart ufw` keeps the rule first. `reset` warns when `/etc/iptables/rules.v4` still holds the rule and removes it from the kernel. |
 | `TestInstallUpgradeUninstall` | `install.sh` installs from a local release tree and refuses a tampered `SHA256SUMS` or binary; `upgrade --check`, `upgrade` (needs `--yes` non-interactively), `.prev` kept, repeated upgrade is a no-op; the service is reachable after the upgrade; a downgrade needs `--force` (exit 5); a modified `SHA256SUMS` (signature mismatch) is refused (exit 1) without changing the binary; `reset` removes units, kernel objects and state without touching foreign state. |
 
 A full run takes about 9 minutes on an Apple-silicon laptop with OrbStack.
@@ -194,9 +201,11 @@ care, and please report results from real systems.
 - **No real reboot.** A container restart recreates the network namespace and
   boots systemd, but no kernel, initramfs or real boot ordering with
   networkd/NetworkManager and cloud-init is involved.
-- **firewalld and UFW are simulated.** Detection is tested with firewalld's pid
-  file and UFW's `ENABLED=yes`, and with captured rulesets in unit tests. Real
-  firewalld and UFW were not installed.
+- **firewalld is simulated.** Detection is tested with firewalld's pid file and
+  with captured rulesets in unit tests. Real firewalld was not installed.
+- **netfilter-persistent is simulated.** The real `iptables-persistent`
+  package conflicts with UFW and is not installed; a unit with its name runs
+  `iptables-restore`. `iptables-restore` by hand is tested with the real tool.
 - **NetworkManager and systemd-networkd** are not running in the test images;
   only the installation of the "unmanaged" files is unit-tested.
 - **Upgrade rollback after a failed service start** (restore `.prev`, restart,
@@ -206,8 +215,11 @@ care, and please report results from real systems.
   scheduled and starts `meshly-check.service` by hand.
 - **Distribution coverage.** Only Debian 12 (nftables 1.0.6) and Ubuntu 24.04
   (nftables 1.0.9). `TestPolicy`, which pairs the nodes with `invite` and
-  `join`, runs on both; all other integration tests, including all systemd
-  tests, run on Debian 12 only.
+  `join`, and `TestUFW` run on both; all other integration tests, including
+  all systemd tests, run on Debian 12 only. Debian 13 (iptables 1.8.11,
+  nftables 1.1.3) is covered only by the UFW captures above; by hand, meshly's
+  rule there shows in `iptables -S`, survives `ufw reload`, `disable` and
+  `enable`, and `iptables-save | iptables-restore`.
 - **Two nodes racing for one invite.** The `used` answer to a second node
   that reaches the invite before it closes is tested only on fake kernels
   (`TestJoinCodeUsed`). With real packets, the second node tries only after

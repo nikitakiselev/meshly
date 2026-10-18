@@ -127,6 +127,7 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 	a.printf("  this node:    %s  %s on %s\n", *name, selfAddr, *ifname)
 	a.printEndpoint(ep, lp, auto, found)
 	a.printf("  firewall:     profile %s; all inbound VPN traffic is denied until `meshly allow`\n", cfg.Firewall.Profile)
+	a.printIptables(ctx, cfg, "  iptables:     ")
 	a.printf("  public key:   %s\n", cfg.Self.WGPublicKey)
 	if ep.IsValid() {
 		a.printf("\nNext: run `sudo meshly invite` on this node and `sudo meshly join` on the other.\n")

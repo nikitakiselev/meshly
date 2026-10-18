@@ -1,21 +1,25 @@
 # Firewall
 
 meshly enforces its policy in nftables. This document covers the table it owns, the path a packet takes through
-it, how meshly coexists with a host firewall (the *profiles*), what it refuses to run alongside, and Docker.
+it, how meshly coexists with a host firewall (the *profiles*, iptables and UFW), what it refuses to run alongside,
+and Docker.
 
 - [The `inet meshly` table](#the-inet-meshly-table)
 - [Packet path](#packet-path)
 - [During an invite](#during-an-invite)
 - [Per-interface sysctls](#per-interface-sysctls)
 - [Profiles](#profiles)
+- [iptables and UFW](#iptables-and-ufw)
 - [Unsupported configurations](#unsupported-configurations)
 - [Docker](#docker)
 - [When the table disappears](#when-the-table-disappears)
 
 ## The `inet meshly` table
 
-meshly owns exactly one nftables table, `inet meshly`, and never modifies any other table or chain. Each change
-replaces the whole table in a single nft transaction:
+meshly owns exactly one nftables table, `inet meshly`. Outside it, meshly adds a single rule at the top of the
+iptables `INPUT` and `OUTPUT` chains when the host filters with iptables or UFW (see
+[iptables and UFW](#iptables-and-ufw)), and modifies nothing else. Each change replaces the whole table in a single
+nft transaction:
 
 ```text
 table inet meshly          # make the delete below valid if the table does not exist
@@ -130,14 +134,18 @@ connections and NATed traffic, so the peer cannot obtain responses through any s
 binds each peer to its single `/32`.
 
 **WireGuard transport:** the encrypted UDP packets to and from the listen port are only marked (below), never
-filtered by meshly. Your own firewall decides whether the port is reachable.
+filtered by meshly. With the mark they pass the integration rule of your host firewall, so the host firewall needs
+no rule of its own for the port. A cloud firewall in front of the server still has to let them through.
 
 ### The meshly mark
 
 Every packet that meshly's policy accepts gets bit `0x10000000` set in the packet mark. In the native nftables
-profile, your own chains use this mark to let meshly traffic through without understanding the VPN themselves.
-meshly clears the bit at the start of its prerouting and output chains. A mark set by anything else, for example
-a local process using `SO_MARK`, therefore never passes the integration rule. The mark is part of the
+profile, your own chains use this mark to let meshly traffic through without understanding the VPN themselves; in
+iptables and UFW chains, meshly's own rule does the same.
+meshly clears the bit at the start of its prerouting and output chains. A mark set by anything else before them, for
+example a local process using `SO_MARK`, therefore never passes the integration rule. Your own rules must not set
+this bit: a `MARK` rule in `mangle` runs after meshly's chains, and a packet it marks passes the integration rule.
+The mark is part of the
 configuration (`firewall.mark`, exactly one bit). This version always uses `0x10000000` and has no command to
 change it.
 
@@ -203,7 +211,9 @@ meshly sets these on `meshly0` only. It changes no global sysctl.
 ## Profiles
 
 Preflight reads the whole ruleset (`nft -j list ruleset`) and classifies every foreign base chain on the
-`prerouting`, `input`, `output` and `postrouting` hooks in the `ip`, `ip6` and `inet` families:
+`prerouting`, `input`, `output` and `postrouting` hooks in the `ip`, `ip6` and `inet` families. The iptables
+`filter` chains `INPUT` and `OUTPUT` are classified too, but they are not part of the profile: meshly puts its rule
+into them itself (see [iptables and UFW](#iptables-and-ufw)).
 
 | Status | Meaning |
 |---|---|
@@ -211,19 +221,20 @@ Preflight reads the whole ruleset (`nft -j list ruleset`) and classifies every f
 | `needs-integration` | The chain may drop meshly traffic: policy drop, or rules that may match it |
 | `integrated` | The chain has the integration rule before any rule that could drop meshly traffic |
 | `misplaced-integration` | The integration rule exists, but a dropping rule comes before it |
-| `unsupported` | The chain is managed by iptables, or it runs before meshly (prerouting/output at priority ≤ −180), so integration is impossible |
+| `unsupported` | The chain may drop meshly traffic and integration is impossible: it belongs to iptables but is not `filter INPUT` or `filter OUTPUT` (a `DROP` in `mangle`, for example), or it runs before meshly (prerouting/output at priority ≤ −180) |
 
 The analysis is conservative. A rule matching a source range that could include the peer's public endpoint, or
 `udp dport 53 reject` where an allowed VPN service could be on 53, counts as "may drop".
 
-The profile is chosen with `--firewall` at `init`/`join`. `auto` (the default) picks `nftables` when any chain
-needs, has, or misplaces integration, and `none` otherwise.
+The profile is chosen with `--firewall` at `init`/`join`. `auto` (the default) picks `nftables` when any native
+nftables chain needs, has, or misplaces integration, and `none` otherwise.
 
-### `none`: no filtering firewall on the host
+### `none`: no native nftables firewall on the host
 
-The host has no chain that could drop meshly traffic, which covers most fresh VPS images and Docker hosts that run
-only Docker's own chains. meshly's table is the entire policy for VPN traffic. If a filtering chain appears later,
-`meshly doctor` reports it as a problem.
+The host has no native nftables chain that could drop meshly traffic. This covers most fresh VPS images, Docker
+hosts that run only Docker's own chains, and hosts that filter only with iptables or UFW. Without iptables rules,
+meshly's table is the entire policy for VPN traffic. If a native filtering chain appears later, `meshly doctor`
+reports it as a problem.
 
 ### `nftables`: your own nftables ruleset
 
@@ -255,16 +266,63 @@ everything on the VPN.
 This profile **fails closed**: if the meshly table is missing, no packet carries the mark, so your `policy drop`
 blocks all VPN traffic until meshly re-applies its table.
 
+## iptables and UFW
+
+UFW is a front end to iptables. On Debian 12 and Ubuntu 24.04, iptables writes its rules into nftables tables (the
+`iptables-nft` backend, the default): `ip filter` and `ip6 filter`. meshly handles them the same way whatever wrote
+the rules: UFW, `iptables-persistent`, or a script.
+
+Into every `filter` chain `INPUT` and `OUTPUT`, IPv4 and IPv6, that has a `DROP` policy or any rule, meshly puts
+one rule at the top and keeps it there:
+
+```text
+-A INPUT -m mark --mark 0x10000000/0x10000000 -m comment --comment "meshly:v1 integration" -j ACCEPT
+```
+
+It is the integration rule of the `nftables` profile, added by meshly itself. It accepts only packets that meshly's
+table already accepted: VPN traffic allowed by `meshly allow`, and the WireGuard transport on the listen port. You
+need no `ufw allow 51820/udp` and no rule for the VPN. Your rules still decide all other traffic: a port that UFW
+opens to the internet stays closed to the peer through the VPN until `meshly allow` opens it.
+
+meshly writes no file of UFW or iptables: the rule lives in the kernel. `ufw status` does not list it;
+`iptables -S INPUT` shows it. `meshly status` shows each chain as `ok`, `MISSING` or `NOT FIRST`. `meshly stop` and
+`meshly reset` remove the rule.
+
+If you save the iptables rules (`netfilter-persistent save`), the saved file contains meshly's rule too. While meshly
+is installed this does no harm: at boot meshly replaces the restored copy, or removes it when the link is stopped.
+After `meshly reset` it would come back at every boot, so `reset` warns when `/etc/iptables/rules.v4` or `rules.v6`
+contains it: run `sudo netfilter-persistent save` again to save the rules without it.
+
+The rule can disappear when something reloads the iptables rules. meshly puts it back:
+
+| Event | What happens |
+|---|---|
+| `ufw allow`, `ufw reload`, `ufw disable` and `enable`, `systemctl restart ufw` | Nothing: UFW rewrites only its own `ufw-*` chains, and the rule stays |
+| Reboot | UFW and netfilter-persistent load their rules before `network-pre.target`; `meshly.service` starts after them and adds the rule |
+| `systemctl restart netfilter-persistent` | `iptables-restore` removes the rule; the drop-in `/etc/systemd/system/netfilter-persistent.service.d/50-meshly.conf` asks `meshly.service` to put it back at once |
+| `iptables-restore` or `netfilter-persistent reload` by hand, `iptables -F` | `meshly-check.timer` puts it back within about a minute |
+| A rule inserted above it (`iptables -I INPUT 1 …`) | `meshly-check.timer` moves meshly's rule back to the top |
+| UFW enabled after meshly | `meshly-check.timer` adds the rule within about a minute; `sudo systemctl reload meshly` adds it at once |
+
+Until the rule is back, VPN packets meet your own rules and your `DROP` policy: the VPN **fails closed**. Ports
+that your firewall opens on all interfaces stay as reachable to the peer as to any internet host.
+
+meshly integrates only `filter INPUT` and `filter OUTPUT`. A chain of another iptables table that may drop meshly
+traffic (a `DROP` in `mangle`, for example) is refused, and so are rules of the legacy backend (see below).
+
+`TestUFW` checks this with real UFW 0.36.2 on Debian 12 and Ubuntu 24.04, `TestIptablesHost` with hand-written
+iptables rules, and `TestSystemdUFW` across a reboot and a restart of `netfilter-persistent.service` (see
+[testing.md](testing.md)).
+
 ## Unsupported configurations
 
 These are detected before any change. `init`, `invite` and `join` then exit with code 3 and change nothing.
 
 | Configuration | Why |
 |---|---|
-| **ufw** enabled | ufw rewrites its iptables chains on its own schedule; meshly cannot guarantee its policy next to them |
-| **firewalld** active | Same; firewalld has no meshly adapter in this version |
-| **iptables-legacy** rules | Invisible to nftables. meshly cannot analyse them |
-| **iptables-nft** chains that may drop meshly traffic (`ip filter INPUT` with policy drop, …) | Managed by iptables, which would remove an integration rule. Not supported in this version |
+| **firewalld** active | firewalld rewrites its tables on its own schedule and has no meshly adapter in this version |
+| **iptables-legacy** rules (also UFW on the legacy backend) | Invisible to nftables. meshly cannot analyse them. Switch to the default backend: `update-alternatives --set iptables /usr/sbin/iptables-nft` (and `ip6tables`), then reload the rules |
+| **iptables-nft** chains outside `filter INPUT`/`OUTPUT` that may drop meshly traffic (a `DROP` in `mangle`, …) | meshly integrates only the `filter` chains `INPUT` and `OUTPUT` |
 | Foreign chains before meshly (prerouting/output at priority ≤ −180) that may drop | They run before meshly's guard, so no integration rule can help |
 | A **flowtable** containing `meshly0` | Offloaded flows bypass the policy |
 | A foreign table named `inet meshly` | Ownership conflict (exit code 5) |
@@ -305,8 +363,8 @@ follows:
 Until the table is back:
 
 - With profile **`nftables`**, VPN traffic is blocked: no mark, so your `policy drop` applies.
-- With profile **`none`**, nothing filters the VPN interface. During that window, the peer can reach every host
-  service that listens on all addresses (`0.0.0.0`). The window lasts until the next check (at most about a
+- With profile **`none`**, nothing filters the VPN interface unless iptables or UFW do. Without them, during that
+  window, the peer can reach every host service that listens on all addresses (`0.0.0.0`). The window lasts until the next check (at most about a
   minute), or is near zero after a `systemctl restart nftables`. If that window is unacceptable, use the
   `nftables` profile with a `policy drop` input chain, or bind host services to specific addresses. The
   [threat model](threat-model.md) lists this as a known limitation.

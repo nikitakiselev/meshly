@@ -324,6 +324,9 @@ func TestAutoProfile(t *testing.T) {
 		{[]nft.ChainFinding{chain("compatible"), chain("integrated")}, model.ProfileNftables},
 		{[]nft.ChainFinding{chain("needs-integration")}, model.ProfileNftables},
 		{[]nft.ChainFinding{chain("misplaced-integration")}, model.ProfileNftables},
+		// iptables chains get meshly's rule from meshly itself.
+		{[]nft.ChainFinding{{Family: "ip", Table: "filter", Chain: "INPUT", Status: "needs-integration", ByMeshly: true}}, model.ProfileNone},
+		{[]nft.ChainFinding{{Family: "ip", Table: "filter", Chain: "INPUT", Status: "integrated", ByMeshly: true}, chain("needs-integration")}, model.ProfileNftables},
 	}
 	for _, tt := range tests {
 		if got := AutoProfile(&nft.Analysis{Chains: tt.chains}); got != tt.want {
@@ -337,6 +340,10 @@ func TestEvaluateFirewall(t *testing.T) {
 	rule := nft.IntegrationRule(mark)
 	chain := func(status string) nft.ChainFinding {
 		return nft.ChainFinding{Family: "inet", Table: "filter", Chain: "input", Hook: "input", Policy: "drop", Status: status, Detail: "policy drop"}
+	}
+	ipt := func(family, name, status string) nft.ChainFinding {
+		return nft.ChainFinding{Family: family, Table: "filter", Chain: name, Hook: strings.ToLower(name), Policy: "drop", Status: status,
+			IptablesManaged: true, ByMeshly: true, Detail: "policy drop"}
 	}
 	type want struct {
 		id     string
@@ -356,7 +363,17 @@ func TestEvaluateFirewall(t *testing.T) {
 		{name: "compatible chains, profile none", a: nft.Analysis{Chains: []nft.ChainFinding{chain("compatible")}}, profile: model.ProfileNone, strict: true,
 			want: []want{{"firewall-profile", OK, ""}}},
 		{name: "profile nftables without chains", a: nft.Analysis{}, profile: model.ProfileNftables, strict: true,
-			want: []want{{"firewall-profile", Warn, "no foreign chain needs integration"}}},
+			want: []want{{"firewall-profile", Warn, "no native nftables chain needs integration"}}},
+		{name: "iptables chains, profile none", a: nft.Analysis{Chains: []nft.ChainFinding{ipt("ip", "INPUT", "needs-integration"), ipt("ip6", "INPUT", "integrated")}},
+			profile: model.ProfileNone, strict: true,
+			want:   []want{{"firewall-iptables", Info, "ip filter INPUT, ip6 filter INPUT"}, {"firewall-profile", OK, "profile none"}},
+			absent: []string{"firewall-integration", "firewall-chain"}},
+		{name: "iptables chain and a native chain", a: nft.Analysis{Chains: []nft.ChainFinding{ipt("ip", "INPUT", "misplaced-integration"), chain("integrated")}},
+			profile: model.ProfileNftables, strict: true,
+			want:   []want{{"firewall-iptables", Info, "ip filter INPUT"}, {"firewall-profile", OK, "1 chain(s)"}},
+			absent: []string{"firewall-integration"}},
+		{name: "compatible iptables chain", a: nft.Analysis{Chains: []nft.ChainFinding{ipt("ip", "OUTPUT", "compatible")}}, profile: model.ProfileNone, strict: true,
+			absent: []string{"firewall-iptables"}},
 		{name: "integrated", a: nft.Analysis{Chains: []nft.ChainFinding{chain("integrated"), chain("integrated")}}, profile: model.ProfileNftables, strict: true,
 			want: []want{{"firewall-profile", OK, "2 chain(s)"}}},
 		{name: "needs integration, nftables, strict", a: nft.Analysis{Chains: []nft.ChainFinding{chain("needs-integration")}}, profile: model.ProfileNftables, strict: true,
@@ -423,15 +440,16 @@ func TestManagers(t *testing.T) {
 		systemd bool
 		exec    map[string]string // command path -> output ("" = error)
 		want    map[string]Status // id -> worst expected status
+		absent  []string
 		texts   []string
 	}{
 		{name: "nothing", want: map[string]Status{"firewall-manager": OK}},
 		{name: "ufw enabled in config", files: map[string]string{"etc/ufw/ufw.conf": "ENABLED=yes\n"},
-			want: map[string]Status{"firewall-manager": Fail}, texts: []string{"UFW is enabled"}},
+			want: map[string]Status{"firewall-manager": OK, "ufw": Info}, texts: []string{"UFW is enabled", "top of the iptables INPUT and OUTPUT chains"}},
 		{name: "ufw disabled in config", files: map[string]string{"etc/ufw/ufw.conf": "ENABLED=no\n"},
-			want: map[string]Status{"firewall-manager": OK}},
+			want: map[string]Status{"firewall-manager": OK}, absent: []string{"ufw"}},
 		{name: "ufw chains in ruleset", a: &nft.Analysis{UFWChains: true},
-			want: map[string]Status{"firewall-manager": Fail}, texts: []string{"UFW"}},
+			want: map[string]Status{"firewall-manager": OK, "ufw": Info}, texts: []string{"UFW"}},
 		{name: "firewalld pid file", files: map[string]string{"run/firewalld/firewalld.pid": "123\n"},
 			want: map[string]Status{"firewall-manager": Fail}, texts: []string{"firewalld is active"}},
 		{name: "firewalld tables", a: &nft.Analysis{FirewalldTables: true},
@@ -445,7 +463,7 @@ func TestManagers(t *testing.T) {
 		{name: "legacy tables with rules",
 			files: map[string]string{"proc/net/ip_tables_names": "filter\n", "usr/sbin/iptables-legacy-save": ""},
 			exec:  map[string]string{"/usr/sbin/iptables-legacy-save": rules},
-			want:  map[string]Status{"iptables-legacy": Fail}, texts: []string{"rules are present"}},
+			want:  map[string]Status{"iptables-legacy": Fail}, texts: []string{"rules are present", "update-alternatives --set iptables /usr/sbin/iptables-nft"}},
 		{name: "legacy tables without rules",
 			files: map[string]string{"proc/net/ip_tables_names": "filter\n", "usr/sbin/iptables-legacy-save": ""},
 			exec:  map[string]string{"/usr/sbin/iptables-legacy-save": "*filter\n:INPUT ACCEPT [0:0]\nCOMMIT\n"},
@@ -479,6 +497,11 @@ func TestManagers(t *testing.T) {
 				c, ok := checkByID(r, id)
 				if !ok || c.Status != st {
 					t.Errorf("check %s = %+v (present %v), want %s; all: %+v", id, c, ok, st, r.Checks)
+				}
+			}
+			for _, id := range tt.absent {
+				if c, ok := checkByID(r, id); ok {
+					t.Errorf("unexpected check %+v", c)
 				}
 			}
 			var all strings.Builder

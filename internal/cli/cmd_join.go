@@ -132,6 +132,7 @@ func (a *App) cmdJoin(ctx context.Context, args []string) error {
 	peer := member.Peers[0]
 	a.printf("Joined network %q as %q (%s).\n", member.Network.Name, member.Self.Name, member.Self.Address)
 	a.printf("  peer:  %s %s via %s\n", peer.Name, peer.Address, peer.Endpoint)
+	a.printIptables(ctx, member, "  iptables:  ")
 	a.printf("Inbound VPN traffic to this node is denied until you run `meshly allow` here.\n")
 	return nil
 }

@@ -128,6 +128,133 @@ func TestTeardownOrderTrafficPathFirst(t *testing.T) {
 	}
 }
 
+// ufwHost gives the fake kernel the iptables chains UFW leaves behind:
+// INPUT with policy drop, OUTPUT with policy accept, each with jumps.
+func ufwHost(k *enginetest.Kernel) {
+	for _, f := range []string{"ip", "ip6"} {
+		k.AddIptables(f, "INPUT", "drop", 3)
+		k.AddIptables(f, "OUTPUT", "accept", 3)
+	}
+}
+
+func ours(rs []enginetest.IptablesRule) []int {
+	var out []int
+	for i, r := range rs {
+		if r.Comment == nft.IptablesComment {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// The meshly rule goes into the iptables chains right after the table and
+// before any traffic path, first in each chain; tear-down removes it after
+// the traffic path and before the table.
+func TestIptablesIntegration(t *testing.T) {
+	v := newEnv(t)
+	ufwHost(v.k)
+	v.k.AddIptables("ip", "FORWARD", "drop", 1) // not integrated
+	c := v.config()
+	want := []string{"firewall.apply", "iptables.integrate", "link.create", "link.sysctl", "link.address", "wireguard.configure", "link.up", "routes.sync"}
+	if got := v.plan(c); !slices.Equal(got, want) {
+		t.Fatalf("plan %v, want %v", got, want)
+	}
+	v.commit(c)
+	for _, f := range []string{"ip", "ip6"} {
+		for _, ch := range []string{"INPUT", "OUTPUT"} {
+			rs := v.k.IptablesRules(f, ch)
+			if got := ours(rs); !slices.Equal(got, []int{0}) || rs[0].Mark != model.DefaultFirewallMark || len(rs) != 4 {
+				t.Fatalf("%s filter %s: %+v", f, ch, rs)
+			}
+		}
+	}
+	if rs := v.k.IptablesRules("ip", "FORWARD"); len(ours(rs)) != 0 {
+		t.Fatalf("FORWARD integrated: %+v", rs)
+	}
+	if p := v.plan(c); len(p) != 0 {
+		t.Fatalf("second plan not empty: %v", p)
+	}
+
+	// Removed by iptables-restore: drift, repaired by a reconcile.
+	v.k.SetIptablesRules("ip", "INPUT", v.k.IptablesRules("ip", "INPUT")[1:])
+	drift, err := v.e.Drift(context.Background(), c)
+	if err != nil || len(drift) != 1 || !strings.Contains(drift[0], "ip filter INPUT") {
+		t.Fatalf("drift %v, %v", drift, err)
+	}
+	if _, err := v.e.Reconcile(context.Background(), c, "meshly0", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := ours(v.k.IptablesRules("ip", "INPUT")); !slices.Equal(got, []int{0}) {
+		t.Fatalf("not repaired: %v", got)
+	}
+
+	// Moved down by a foreign rule inserted above it, and duplicated:
+	// one rule again, first.
+	rs := v.k.IptablesRules("ip6", "INPUT")
+	rs = append([]enginetest.IptablesRule{{Handle: 900}}, append(rs, enginetest.IptablesRule{Handle: 901, Comment: nft.IptablesComment, Mark: model.DefaultFirewallMark})...)
+	v.k.SetIptablesRules("ip6", "INPUT", rs)
+	if got := v.plan(c); !slices.Equal(got, []string{"iptables.integrate"}) {
+		t.Fatalf("plan %v", got)
+	}
+	if _, err := v.e.Reconcile(context.Background(), c, "meshly0", nil); err != nil {
+		t.Fatal(err)
+	}
+	if rs := v.k.IptablesRules("ip6", "INPUT"); !slices.Equal(ours(rs), []int{0}) || len(rs) != 5 || rs[1].Handle != 900 {
+		t.Fatalf("not first and unique: %+v", rs)
+	}
+
+	down := c.Clone()
+	down.AdminState = model.AdminDown
+	want = []string{"link.down", "link.delete", "iptables.remove", "firewall.remove"}
+	if got := v.plan(down); !slices.Equal(got, want) {
+		t.Fatalf("plan %v, want %v", got, want)
+	}
+	if _, err := v.e.Reconcile(context.Background(), down, "meshly0", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, ch := range v.k.Iptables {
+		if len(ours(ch.Rules)) != 0 || len(ch.Rules) == 0 {
+			t.Fatalf("%s filter %s after tear-down: %+v", ch.Family, ch.Chain, ch.Rules)
+		}
+	}
+}
+
+// Chains that cannot drop anything are left alone (Docker leaves an empty
+// INPUT behind, for example).
+func TestIptablesEmptyChainsUntouched(t *testing.T) {
+	v := newEnv(t)
+	v.k.AddIptables("ip", "INPUT", "accept", 0)
+	c := v.config()
+	if got := v.plan(c); slices.Contains(got, "iptables.integrate") {
+		t.Fatalf("plan %v", got)
+	}
+	v.commit(c)
+	if rs := v.k.IptablesRules("ip", "INPUT"); len(rs) != 0 {
+		t.Fatalf("empty chain changed: %+v", rs)
+	}
+}
+
+// A failed integration rolls back like any other step: nothing of meshly
+// stays in the iptables chains.
+func TestIptablesIntegrationRollback(t *testing.T) {
+	v := newEnv(t)
+	ufwHost(v.k)
+	v.k.Fail("iptables.apply", 1)
+	_, err := v.e.Execute(context.Background(), v.j, Op{Name: "init", Recovery: journal.Backward, Target: v.config()})
+	var ae *ApplyError
+	if !errors.As(err, &ae) || !ae.RolledBack {
+		t.Fatalf("err = %v", err)
+	}
+	for _, ch := range v.k.Iptables {
+		if len(ours(ch.Rules)) != 0 {
+			t.Fatalf("%s filter %s: %+v", ch.Family, ch.Chain, ch.Rules)
+		}
+	}
+	if v.k.Table != "" {
+		t.Fatal("table left after rollback")
+	}
+}
+
 func TestIdempotent(t *testing.T) {
 	v := newEnv(t)
 	c := v.config()
@@ -265,6 +392,28 @@ func TestSafeModeWhenRollbackFails(t *testing.T) {
 	recs, _ := v.j.Read()
 	if recs[len(recs)-1].Event != journal.EventSafeMode {
 		t.Fatalf("journal: %+v", recs[len(recs)-1])
+	}
+}
+
+// Safe mode leaves the iptables rule alone but marks no transport, so the
+// rule lets nothing of meshly through the chains of UFW.
+func TestSafeModeIptables(t *testing.T) {
+	v := newEnv(t)
+	ufwHost(v.k)
+	c := v.config()
+	v.commit(c)
+	n := len(v.k.Scripts)
+	if err := v.e.SafeMode(context.Background(), c, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.k.Scripts) != n+1 {
+		t.Fatalf("want one lockdown script, got %d", len(v.k.Scripts)-n)
+	}
+	if s := v.k.Scripts[n]; strings.Contains(s, "wireguard transport") || !strings.Contains(s, "table inet meshly") {
+		t.Fatalf("lockdown script:\n%s", s)
+	}
+	if got := ours(v.k.IptablesRules("ip", "INPUT")); !slices.Equal(got, []int{0}) {
+		t.Fatalf("iptables rule: %v", got)
 	}
 }
 

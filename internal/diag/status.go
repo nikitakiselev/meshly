@@ -129,6 +129,17 @@ type FirewallInfo struct {
 	AppliedAt       time.Time `json:"applied_at,omitzero"`
 	TransportPkts   *uint64   `json:"wireguard_udp_packets_received,omitempty"`
 	DeniedPkts      *uint64   `json:"vpn_packets_denied,omitempty"`
+	// Iptables are the iptables chains that need meshly's rule.
+	Iptables []IptablesInfo `json:"iptables_chains,omitempty"`
+}
+
+// IptablesInfo is an iptables chain into which meshly puts its rule.
+type IptablesInfo struct {
+	Chain string `json:"chain"`
+	// RulePresent: the chain has a meshly rule; RuleFirst: exactly one,
+	// for the configured mark, at the top of the chain.
+	RulePresent bool `json:"meshly_rule_present"`
+	RuleFirst   bool `json:"meshly_rule_first"`
 }
 
 // PeerInfo is one peer: configuration plus live WireGuard data.
@@ -249,6 +260,12 @@ func Collect(ctx context.Context, d Deps) *Status {
 		}
 		if n, ok := t.Counter("from_vpn", "default deny"); ok {
 			fw.DeniedPkts = &n
+		}
+	}
+	for _, c := range obs.Ruleset.IptablesChains(cfg.Firewall.Mark) {
+		// A stopped link has no rule on purpose; a leftover shows as drift.
+		if c.Needed && desired.Present {
+			fw.Iptables = append(fw.Iptables, IptablesInfo{Chain: c.String(), RulePresent: len(c.Ours) > 0, RuleFirst: c.First})
 		}
 	}
 	st.Firewall = fw

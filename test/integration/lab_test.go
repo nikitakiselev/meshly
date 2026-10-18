@@ -590,9 +590,29 @@ func (n *Node) KernelSnapshot() string {
 	return n.MustSh(`{ nft list table inet meshly 2>/dev/null | sed -E 's/counter packets [0-9]+ bytes [0-9]+/counter/'; ip -d link show meshly0 2>/dev/null | grep -v -E 'link/none|^ +(RX|TX)'; ip -4 addr show dev meshly0 2>/dev/null | grep inet; ip route show proto 109; wg show meshly0 allowed-ips 2>/dev/null; wg show meshly0 endpoints 2>/dev/null | cut -f1; } | sed -E 's/valid_lft.*//'`)
 }
 
-// Foreign captures state meshly must not touch.
+// Foreign captures state meshly must not touch: everything but the meshly
+// table and meshly's rule in the iptables chains.
 func (n *Node) Foreign() string {
-	return n.MustSh(`nft list ruleset | awk '/^table inet meshly/{skip=1} /^table/{if($0!~/inet meshly/)skip=0} !skip' | sed -E 's/counter packets [0-9]+ bytes [0-9]+/counter/'; ip route show table main | grep -v 'proto 109'; ip -br link | grep -v meshly0 | awk '{print $1, $2}'`)
+	return n.MustSh(`nft list ruleset | awk '/^table inet meshly/{skip=1} /^table/{if($0!~/inet meshly/)skip=0} !skip' | grep -v 'meshly:v1 integration' | sed -E 's/counter packets [0-9]+ bytes [0-9]+/counter/'; ip route show table main | grep -v 'proto 109'; ip -br link | grep -v meshly0 | awk '{print $1, $2}'`)
+}
+
+// IptablesFirst reports whether meshly's rule is the first rule of the
+// INPUT and OUTPUT chains, for IPv4 and IPv6.
+func (n *Node) IptablesFirst() bool {
+	return n.iptablesFirst("iptables -S INPUT", "iptables -S OUTPUT", "ip6tables -S INPUT", "ip6tables -S OUTPUT")
+}
+
+// IptablesFirst4 is IptablesFirst for the IPv4 INPUT chain only.
+func (n *Node) IptablesFirst4() bool { return n.iptablesFirst("iptables -S INPUT") }
+
+func (n *Node) iptablesFirst(cmds ...string) bool {
+	for _, c := range cmds {
+		lines := strings.Split(n.Sh(c).Out, "\n")
+		if len(lines) < 2 || lines[1] != `-A `+strings.Fields(c)[2]+` -m mark --mark 0x10000000/0x10000000 -m comment --comment "meshly:v1 integration" -j ACCEPT` {
+			return false
+		}
+	}
+	return true
 }
 
 func sha256hex(b []byte) string {

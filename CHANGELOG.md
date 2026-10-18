@@ -25,12 +25,15 @@ First public release.
   `revoke`. Per-packet decisions (deny cuts established flows), no forwarding, no LAN access, no IPv6 inside the
   VPN, DNAT/redirect from the tunnel refused, spoofing protection.
 - Firewall profiles `none` and `nftables` (integration through a packet mark), automatic selection, and refusal of
-  ufw, firewalld, iptables-legacy rules and non-integrable chains before any change.
+  firewalld, iptables-legacy rules and non-integrable chains before any change.
+- UFW and iptables (`iptables-nft`) hosts work without configuration: meshly keeps its integration rule at the top
+  of the `filter` chains `INPUT` and `OUTPUT` (IPv4 and IPv6), repairs it after `iptables-restore` and removes it on
+  `stop` and `reset`; `status` shows each chain.
 - Transactions with an operation journal, verification, rollback, forward recovery for operations that remove
   access, and safe mode; `recover` for interrupted operations.
 - Lifecycle commands `start`, `stop`, `restart`, `set` (mtu, keepalive, endpoint, peer-endpoint, cidr), `reset`.
-- systemd integration: `meshly.service`, `meshly-check.timer` (drift repair), nftables drop-in, networkd and
-  NetworkManager unmanaged files, unit hardening.
+- systemd integration: `meshly.service`, `meshly-check.timer` (drift repair), nftables and netfilter-persistent
+  drop-ins, networkd and NetworkManager unmanaged files, unit hardening.
 - Diagnostics: `status` and `doctor` with `--json` (schemas `meshly.status/v1`, `meshly.doctor/v1`), `doctor --probe`,
   `logs`, stable exit codes.
 - Signed self-upgrade from GitHub releases (`upgrade`), `install.sh` with signature verification, reproducible

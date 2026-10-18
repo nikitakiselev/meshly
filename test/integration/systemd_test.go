@@ -302,3 +302,86 @@ func TestInstallUpgradeUninstall(t *testing.T) {
 		}
 	})
 }
+
+// UFW across a reboot: UFW loads its chains at boot, meshly.service puts
+// its rule on top afterwards, and the allowed service is reachable. A
+// restart of netfilter-persistent.service (simulated: a unit of that name
+// that runs iptables-restore) removes the rule, and meshly's drop-in puts
+// it back right away.
+func TestSystemdUFW(t *testing.T) {
+	l := newSystemdLab(t)
+	vps, home := l.Node("vps"), l.Node("home")
+	vps.MustSh("ufw allow 22/tcp && ufw --force enable")
+	vps, home = l.Pair()
+	vps.MustMeshly("allow", "8080/tcp", "from", "home")
+	vps.Listen("tcp", 8080)
+	if !vps.IptablesFirst() || !home.Probe("tcp", "10.100.0.1", 8080) {
+		t.Fatal("allowed service unreachable through UFW")
+	}
+
+	vps.Reboot()
+	if out := vps.MustSh("systemctl is-active ufw.service meshly.service"); strings.Join(strings.Fields(out), " ") != "active active" {
+		t.Fatalf("units after reboot:\n%s", out)
+	}
+	if !vps.IptablesFirst() {
+		t.Fatalf("meshly rule not first after reboot:\n%s", vps.Sh("iptables -S; ip6tables -S").Out)
+	}
+	l.WaitHandshake(home, 30*time.Second)
+	vps.Listen("tcp", 8080)
+	if !home.Probe("tcp", "10.100.0.1", 8080) {
+		t.Fatal("allowed service unreachable after reboot")
+	}
+	vps.MustSh("systemctl restart ufw.service")
+	if !vps.IptablesFirst() {
+		t.Fatalf("meshly rule not first after restarting UFW:\n%s", vps.Sh("iptables -S; ip6tables -S").Out)
+	}
+	vps.Listen("tcp", 8080)
+	if !home.Probe("tcp", "10.100.0.1", 8080) {
+		t.Fatal("allowed service unreachable after restarting UFW")
+	}
+
+	home.MustSh(`mkdir -p /etc/iptables && iptables -A INPUT -i lo -j ACCEPT && iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT && iptables -P INPUT DROP && iptables-save > /etc/iptables/rules.v4
+printf '%s\n' '[Unit]' 'Description=simulated netfilter-persistent' '[Service]' 'Type=oneshot' 'RemainAfterExit=yes' 'ExecStart=/usr/sbin/iptables-restore /etc/iptables/rules.v4' > /etc/systemd/system/netfilter-persistent.service
+systemctl daemon-reload && systemctl start netfilter-persistent.service`)
+	waitFor(t, "meshly rule on home after netfilter-persistent start", 15*time.Second, home.IptablesFirst4)
+	reloads := home.reloads()
+	home.MustSh("systemctl restart netfilter-persistent.service")
+	waitFor(t, "meshly rule on home after netfilter-persistent restart", 15*time.Second, func() bool {
+		return home.IptablesFirst4() && home.reloads() > reloads
+	})
+	home.Listen("tcp", 9090)
+	home.MustMeshly("allow", "9090/tcp", "from", "vps")
+	if !vps.Probe("tcp", "10.100.0.2", 9090) {
+		t.Fatal("service on home unreachable through its iptables policy")
+	}
+
+	// Rules saved while meshly runs contain its rule; reset says so.
+	home.MustSh("iptables-save > /etc/iptables/rules.v4")
+	if r := home.MustMeshly("reset", "--yes"); !strings.Contains(r.Err, "meshly's iptables rule is still saved in /etc/iptables/rules.v4") {
+		t.Fatalf("reset gave no warning about the saved rules:\n%s", r.Err)
+	}
+	if home.Sh("iptables -S INPUT | grep -q 'meshly:v1 integration'").Code == 0 {
+		t.Fatal("meshly rule left in the kernel after reset")
+	}
+}
+
+// reloads counts the `service-reload` operations that put meshly's rule
+// back into the iptables chains.
+func (n *Node) reloads() int {
+	var logs struct {
+		Records []struct {
+			Event, Op string
+			Plan      []string
+		}
+	}
+	if err := json.Unmarshal([]byte(n.MustMeshly("logs", "--json", "-n", "200").Out), &logs); err != nil {
+		n.lab.t.Fatal(err)
+	}
+	c := 0
+	for _, r := range logs.Records {
+		if r.Event == "begin" && r.Op == "service-reload" && slices.Contains(r.Plan, "iptables.integrate") {
+			c++
+		}
+	}
+	return c
+}

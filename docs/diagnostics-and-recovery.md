@@ -139,13 +139,15 @@ never contains private keys.
 | `config` | `/etc/meshly/meshly.json` is valid (or: not initialized). | Restore from `/var/lib/meshly/history/`, or `meshly reset`. Not initialized: `meshly init` or `sudo meshly join`. |
 | `keys` | The key file is root-owned `0600` in a `0700` directory and matches the public key in the configuration. | Restore the original key; changing the key requires pairing again (`meshly reset`, then `join` again). |
 | `nftables-ruleset` | The ruleset could not be read. | Check that `nf_tables` is available in the kernel. |
-| `firewall-manager` | firewalld or UFW is active; there is no adapter for them. | Disable them and use native nftables, or do not use meshly on this host. |
-| `iptables-legacy` | Legacy iptables rules exist (or cannot be inspected). | Migrate them to nftables manually. |
+| `firewall-manager` | firewalld is active; there is no adapter for it. | Disable it and use UFW, iptables or native nftables, or do not use meshly on this host. |
+| `ufw` | UFW is enabled (information): meshly keeps its rule at the top of the iptables `INPUT` and `OUTPUT` chains. | — |
+| `iptables-legacy` | Legacy iptables rules exist (or cannot be inspected). | Switch iptables to the `iptables-nft` backend (`update-alternatives --set iptables /usr/sbin/iptables-nft`, the same for `ip6tables`) and reload the rules. |
 | `firewall-table` | A table `inet meshly` exists that meshly did not create. | Rename or delete it; meshly never takes over foreign objects. |
 | `flowtable` | A flowtable offloads traffic of the meshly interface, which would bypass the policy. | Remove the interface from the flowtable devices. |
-| `firewall-chain` | A foreign chain is outside the supported profiles (for example an iptables-nft chain that drops). | See [firewall.md](firewall.md). |
+| `firewall-chain` | A foreign chain is outside the supported profiles (for example an iptables-nft `mangle` chain that drops). | See [firewall.md](firewall.md). |
+| `firewall-iptables` | iptables chains filter traffic (information): meshly keeps its rule at the top of them. | — |
 | `firewall-integration` | A foreign base chain would drop meshly traffic: integration rule missing, misplaced (after a drop), or profile `none` on a host with a filtering firewall. | Add `meta mark & 0x10000000 == 0x10000000 accept comment "meshly"` before any drop/reject rule in that chain and reload nftables. |
-| `firewall-profile` | Summary of the firewall profile (`none` or native `nftables`). | — |
+| `firewall-profile` | Summary of the firewall profile (`none` or native `nftables`; iptables chains are not part of it). | — |
 | `docker` | Docker rules were detected. Published container ports are not reachable through the VPN; forwarding and DNAT from the VPN are blocked. | — |
 | `netdev` | A netdev chain exists; it runs before meshly and may drop WireGuard transport. | Review that chain. |
 | `nftables-reload` | `/etc/nftables.conf` contains `flush ruleset` and nftables.service is enabled. Starting or reloading nftables removes the meshly table until meshly re-applies it. With profile `none` the VPN is unfiltered during that window; with profile `nftables` it is closed. | Prefer `table inet filter; delete table inet filter` over `flush ruleset`. |
@@ -249,7 +251,9 @@ If an operation fails and the rollback (or, for access-reducing operations,
 the retry) fails too, meshly enters safe mode and exits with 8:
 
 - the meshly table is replaced by a lockdown version (no peers, no rules: all
-  traffic on the interface is dropped);
+  traffic on the interface is dropped). It does not mark the WireGuard
+  transport either, so the integration rule of your firewall, or meshly's
+  rule in the iptables chains, no longer opens the listen port;
 - the WireGuard interface is deleted;
 - nothing else on the host is changed, and the saved configuration is kept.
 

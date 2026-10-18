@@ -162,7 +162,8 @@ Recovery directions:
 If the rollback or retry also fails, the engine enters **safe mode**,
 records `safe-mode` and exits with 8: it applies a lockdown table (same
 guards, no peers and no allow rules, so everything on the interface is
-dropped), but only if no foreign table with the same name exists, then
+dropped, and no mark on the WireGuard transport, so the host firewall closes
+the listen port again), but only if no foreign table with the same name exists, then
 deletes the interface (falling back to removing all peers). Nothing else is
 touched and the saved configuration is kept. `meshly start` re-applies it.
 
@@ -317,13 +318,13 @@ Each entry: context, decision, consequences.
   `iptables` chains) is fragile and makes uninstalling unsafe.
 - **Decision.** meshly owns exactly one table, `inet meshly`, marked by a
   comment rule, and always replaces it as a whole in one nft transaction. It
-  never modifies, flushes or deletes other tables, and never uses
-  `flush ruleset`. A table with the same name but without the marker is a
-  conflict.
+  never flushes or deletes other tables, and never uses `flush ruleset`. The
+  only object it adds elsewhere is its rule in the iptables chains (D6). A
+  table with the same name but without the marker is a conflict.
 - **Consequences.** Packets see either the old or the new policy, never a
-  partial one. Removing meshly removes only its own objects. A host
-  firewall that drops traffic in its own base chains needs one integration
-  rule, added by the administrator (D3).
+  partial one. Removing meshly removes only its own objects. A native
+  nftables firewall that drops traffic in its own base chains needs one
+  integration rule, added by the administrator (D3).
 
 ### D2. Per-packet policy instead of an "established" shortcut
 
@@ -359,16 +360,45 @@ Each entry: context, decision, consequences.
 
 ### D4. Refuse unsupported firewall setups before any change
 
-- **Context.** UFW, firewalld, legacy iptables rules and iptables-nft chains
-  that drop traffic manage rules that meshly cannot safely integrate with.
-- **Decision.** Preflight detects them (UFW config, firewalld pid file / unit
-  state / tables, `ip_tables_names` with rules, iptables-managed base chains)
-  and stops with exit 3 and an actionable message, before anything is
-  changed, including with `--dry-run`. Operations that only reduce access are
-  never blocked; they print a warning instead.
+- **Context.** firewalld, legacy iptables rules and iptables-nft chains
+  outside `filter INPUT`/`OUTPUT` that drop traffic manage rules that meshly
+  cannot safely integrate with.
+- **Decision.** Preflight detects them (firewalld pid file / unit state /
+  tables, `ip_tables_names` with rules, iptables-managed base chains that may
+  drop meshly traffic) and stops with exit 3 and an actionable message,
+  before anything is changed, including with `--dry-run`. Operations that
+  only reduce access are never blocked; they print a warning instead.
 - **Consequences.** meshly does not run on such hosts until the
-  administrator switches to native nftables. No automatic firewall
-  migration.
+  administrator changes the setup. No automatic firewall migration.
+
+### D6. meshly keeps its own rule in the iptables chains (UFW, iptables)
+
+- **Context.** UFW is the usual firewall on Ubuntu servers, and many hosts
+  carry hand-written iptables rules. On Debian 12 and Ubuntu 24.04 iptables
+  writes them into nftables tables (`iptables-nft`), with `policy DROP` on
+  `INPUT`. They drop VPN traffic that meshly accepted (see D3). Asking the
+  administrator to add the integration rule there does not work:
+  `iptables-restore` and a reboot remove it, and UFW users are not expected
+  to write iptables rules.
+- **Decision.** In every `filter` chain `INPUT` and `OUTPUT` of the
+  iptables tables (IPv4 and IPv6) that has a drop policy or any rule, meshly
+  keeps the integration rule as the first rule, with the comment
+  `meshly:v1 integration`. It is a step of the normal reconcile
+  (`iptables.integrate` after `firewall.apply`, `iptables.remove` on tear-down),
+  so the check timer repairs it like any other drift, and a duplicated or
+  misplaced rule is replaced by one at the top. The rule is written with
+  nft into the iptables-nft table; iptables reads it as `-m mark … -m comment
+  … -j ACCEPT`, and UFW leaves the built-in chains alone on `allow`,
+  `reload`, `disable` and `enable` (checked with UFW 0.36.2 on both
+  distributions). No file of UFW or iptables is written. The profile stays
+  about native nftables chains only.
+- **Consequences.** UFW and iptables hosts work without configuration,
+  including the WireGuard port. The VPN fails closed while the rule is gone
+  (after `iptables-restore`, until the check, at most about a minute;
+  restarting `netfilter-persistent.service` triggers a re-apply at once).
+  Placing the rule first means that the host's own drop rules cannot block
+  traffic that meshly allowed, which is the same contract as D3. Other
+  iptables tables are not integrated (D4).
 
 ### D5. IPv4 only inside the VPN
 

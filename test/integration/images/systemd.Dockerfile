@@ -3,9 +3,10 @@
 # with it the interface and every nftables table) is recreated empty.
 ARG BASE=debian:12
 FROM ${BASE}
+# UFW is installed but not enabled; the tests that need it turn it on.
 RUN apt-get update -qq \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-      systemd systemd-sysv dbus nftables iproute2 wireguard-tools netcat-openbsd iputils-ping procps \
+      systemd systemd-sysv dbus nftables iptables ufw iproute2 wireguard-tools netcat-openbsd iputils-ping procps \
       ca-certificates openssl curl \
  && rm -rf /var/lib/apt/lists/* \
  && systemctl mask getty@tty1.service console-getty.service systemd-logind.service \

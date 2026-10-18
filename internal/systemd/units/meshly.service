@@ -4,8 +4,9 @@
 Description=Meshly WireGuard link
 Documentation=https://github.com/nikitakiselev/meshly
 # Our nftables table must be loaded after the system ruleset, because
-# nftables.service usually starts with "flush ruleset".
-After=nftables.service network-pre.target
+# nftables.service usually starts with "flush ruleset"; and our rule in the
+# iptables chains after UFW or netfilter-persistent has loaded them.
+After=nftables.service ufw.service netfilter-persistent.service network-pre.target
 Wants=network-pre.target
 Before=network-online.target
 # Restarting/stopping the system firewall restarts/stops meshly; reloading

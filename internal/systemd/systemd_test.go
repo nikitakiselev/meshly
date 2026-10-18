@@ -25,7 +25,7 @@ func TestUnitFiles(t *testing.T) {
 	slices.Sort(names)
 	want := []string{
 		"10-meshly-unmanaged.network", "meshly-check.service", "meshly-check.timer",
-		"meshly.service", "networkmanager-meshly.conf", "nftables-meshly.conf",
+		"meshly.service", "netfilter-persistent-meshly.conf", "networkmanager-meshly.conf", "nftables-meshly.conf",
 	}
 	if !slices.Equal(names, want) {
 		t.Fatalf("unit files = %v, want %v", names, want)
@@ -45,7 +45,7 @@ func TestUnitFiles(t *testing.T) {
 		"ExecStop=/usr/local/bin/meshly service stop",
 		"CapabilityBoundingSet=CAP_NET_ADMIN",
 		"NoNewPrivileges=yes",
-		"After=nftables.service network-pre.target",
+		"After=nftables.service ufw.service netfilter-persistent.service network-pre.target",
 		"Also=meshly-check.timer",
 	} {
 		if !strings.Contains(svc, line+"\n") {
@@ -61,8 +61,10 @@ func TestUnitFiles(t *testing.T) {
 	if !strings.Contains(string(files["networkmanager-meshly.conf"]), "unmanaged-devices=interface-name:meshly0\n") {
 		t.Error("NetworkManager file does not match the interface")
 	}
-	if !strings.Contains(string(files["nftables-meshly.conf"]), "ExecStartPost=-/usr/bin/systemctl --no-block try-reload-or-restart meshly.service") {
-		t.Error("nftables drop-in content unexpected")
+	for _, f := range []string{"nftables-meshly.conf", "netfilter-persistent-meshly.conf"} {
+		if !strings.Contains(string(files[f]), "\nExecStartPost=-/usr/bin/systemctl --no-block try-reload-or-restart meshly.service\n") {
+			t.Errorf("%s: drop-in content unexpected", f)
+		}
 	}
 
 	other, err := UnitFiles("/opt/meshly/bin/meshly-1.2", "wg7")
@@ -127,6 +129,9 @@ func newManager(t *testing.T) (*Manager, *fakeRun) {
 func (m *Manager) nftDropIn() string {
 	return filepath.Join(m.UnitDir, "nftables.service.d", "50-meshly.conf")
 }
+func (m *Manager) netfilterDropIn() string {
+	return filepath.Join(m.UnitDir, "netfilter-persistent.service.d", "50-meshly.conf")
+}
 func (m *Manager) networkdFile() string {
 	return filepath.Join(m.Root, "etc/systemd/network/10-meshly-unmanaged.network")
 }
@@ -146,10 +151,11 @@ func TestInstall(t *testing.T) {
 		t.Fatalf("Install = %v, %v", changed, err)
 	}
 	for name, path := range map[string]string{
-		"meshly.service":       filepath.Join(m.UnitDir, Unit),
-		"meshly-check.service": filepath.Join(m.UnitDir, CheckUnit),
-		"meshly-check.timer":   filepath.Join(m.UnitDir, TimerUnit),
-		"nftables-meshly.conf": m.nftDropIn(),
+		"meshly.service":                   filepath.Join(m.UnitDir, Unit),
+		"meshly-check.service":             filepath.Join(m.UnitDir, CheckUnit),
+		"meshly-check.timer":               filepath.Join(m.UnitDir, TimerUnit),
+		"nftables-meshly.conf":             m.nftDropIn(),
+		"netfilter-persistent-meshly.conf": m.netfilterDropIn(),
 	} {
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -327,6 +333,7 @@ func TestUninstall(t *testing.T) {
 	for _, p := range []string{
 		filepath.Join(m.UnitDir, Unit), filepath.Join(m.UnitDir, CheckUnit), filepath.Join(m.UnitDir, TimerUnit),
 		m.nftDropIn(), filepath.Join(m.UnitDir, "nftables.service.d"), m.networkdFile(), m.nmFile(),
+		m.netfilterDropIn(), filepath.Join(m.UnitDir, "netfilter-persistent.service.d"),
 	} {
 		if exists(p) {
 			t.Errorf("%s still exists", p)

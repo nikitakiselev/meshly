@@ -4,7 +4,8 @@
 // Meshly owns exactly one table, "inet meshly". It is always replaced as a
 // whole in one nft transaction ("add; delete; define"), so packets observe
 // either the old or the new policy, never a partial one. No other table is
-// ever modified.
+// ever modified, except for one rule that Meshly keeps at the top of the
+// iptables filter INPUT and OUTPUT chains (see iptables.go).
 package nft
 
 import (
@@ -54,10 +55,15 @@ type Input struct {
 	// through Interface: guard_in drops every other packet for it, from
 	// loopback or after DNAT too. Each must also be in Allow.
 	Exclusive []AllowEntry
+	// Lockdown leaves the WireGuard transport unmarked: in safe mode the
+	// interface is gone, and the integration rule must not keep the listen
+	// port open for whatever else binds it.
+	Lockdown bool
 }
 
 // InputFromConfig derives the renderer input from a config. With lockdown
-// set, peers and rules are omitted: everything on the interface is dropped.
+// set, peers and rules are omitted: everything on the interface is dropped,
+// and the WireGuard transport is not marked.
 func InputFromConfig(c *model.Config, lockdown bool) Input {
 	in := Input{
 		NetworkID:  c.Network.ID,
@@ -66,6 +72,7 @@ func InputFromConfig(c *model.Config, lockdown bool) Input {
 		CIDR:       c.Network.CIDR,
 		ListenPort: c.Self.ListenPort,
 		Mark:       c.Firewall.Mark,
+		Lockdown:   lockdown,
 	}
 	if lockdown {
 		return in
@@ -191,7 +198,9 @@ func Render(in Input) (Rendered, error) {
 	w("\t\tiifname %s jump from_vpn", ifname)
 	w("\t\tiifname != { \"lo\", %s } ip daddr %s counter drop comment \"vpn address reachable only through the vpn\"", ifname, local)
 	w("\t\tiifname != { \"lo\", %s } ip saddr %s counter drop comment \"spoofed vpn source\"", ifname, in.CIDR)
-	w("\t\tudp dport %d fib daddr type local counter %s comment \"wireguard transport\"", in.ListenPort, setMark)
+	if !in.Lockdown {
+		w("\t\tudp dport %d fib daddr type local counter %s comment \"wireguard transport\"", in.ListenPort, setMark)
+	}
 	w("\t}")
 	w("")
 	w("\tchain from_vpn {")
@@ -228,7 +237,9 @@ func Render(in Input) (Rendered, error) {
 	w("\t\ttype filter hook output priority %d; policy accept;", PolicyPriority)
 	w("\t\tmeta mark & %s == %s meta mark set meta mark & %s", m, m, nm)
 	w("\t\toifname %s jump to_vpn", ifname)
-	w("\t\tudp sport %d %s comment \"wireguard transport\"", in.ListenPort, setMark)
+	if !in.Lockdown {
+		w("\t\tudp sport %d %s comment \"wireguard transport\"", in.ListenPort, setMark)
+	}
 	w("\t}")
 	w("")
 	w("\tchain to_vpn {")

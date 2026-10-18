@@ -5,10 +5,12 @@
 // result and either commits, rolls back or enters safe mode. Ordering
 // invariants:
 //
-//   - bring-up: firewall first, then interface, addresses, WireGuard
-//     peers, link up, routes — protection exists before any traffic path;
+//   - bring-up: firewall first (the table, then Meshly's rule in the
+//     iptables chains), then interface, addresses, WireGuard peers, link
+//     up, routes — protection exists before any traffic path;
 //   - tear-down: traffic path first (interface with its peers and routes),
-//     protective firewall table last.
+//     then Meshly's rule in the iptables chains, protective firewall table
+//     last.
 package engine
 
 import (
@@ -242,6 +244,12 @@ func (e *Engine) Plan(d *Desired, o *Observed) ([]Step, error) {
 		fw := d.Firewall
 		steps = append(steps, Step{Name: "firewall.apply", Desc: desc, run: func(ctx context.Context) error { return e.applyFirewall(ctx, fw) }})
 	}
+	if ipt := pendingIptables(o, d.Config.Firewall.Mark); len(ipt) > 0 {
+		mark := d.Config.Firewall.Mark
+		steps = append(steps, Step{Name: "iptables.integrate", Desc: "put the meshly rule at the top of iptables chain(s) " + nft.IptablesNames(ipt), run: func(ctx context.Context) error {
+			return e.integrateIptables(ctx, mark)
+		}})
+	}
 	created := !o.Link.Exists
 	if created {
 		steps = append(steps, Step{Name: "link.create", Desc: fmt.Sprintf("create WireGuard interface %s (down, mtu %d)", name, d.MTU), run: func(context.Context) error {
@@ -282,6 +290,18 @@ func (e *Engine) planTeardown(d *Desired, o *Observed) []Step {
 			return e.Links.SetDown(name)
 		}})
 		steps = append(steps, Step{Name: "link.delete", Desc: "delete interface " + name + " with its peers and routes", run: func(context.Context) error { return e.Links.Delete(name) }})
+	}
+	if ipt := iptablesWithOurs(o); len(ipt) > 0 {
+		steps = append(steps, Step{Name: "iptables.remove", Desc: "remove the meshly rule from iptables chain(s) " + nft.IptablesNames(ipt), run: func(ctx context.Context) error {
+			rs, err := e.FW.ListRuleset(ctx)
+			if err != nil {
+				return err
+			}
+			if script := nft.IptablesRemoveScript(rs.IptablesChains(0)); script != "" {
+				return e.FW.ApplyScript(ctx, script)
+			}
+			return nil
+		}})
 	}
 	if o.TablePresent && o.TableOwned {
 		steps = append(steps, Step{Name: "firewall.remove", Desc: "remove firewall table inet meshly", run: func(ctx context.Context) error {
@@ -324,6 +344,53 @@ func (e *Engine) applyFirewall(ctx context.Context, fw nft.Rendered) error {
 	}
 	rt.FirewallLiveHash, rt.FirewallAppliedAt = t.ContentHash(), e.Now()
 	return e.Paths.SaveRuntime(rt)
+}
+
+// pendingIptables lists the iptables chains whose meshly rule is missing,
+// misplaced or duplicated.
+func pendingIptables(o *Observed, mark uint32) []nft.IptablesChain {
+	if o.Ruleset == nil {
+		return nil
+	}
+	var out []nft.IptablesChain
+	for _, c := range o.Ruleset.IptablesChains(mark) {
+		if !c.OK() {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// iptablesWithOurs lists the iptables chains that contain a meshly rule.
+func iptablesWithOurs(o *Observed) []nft.IptablesChain {
+	if o.Ruleset == nil {
+		return nil
+	}
+	var out []nft.IptablesChain
+	for _, c := range o.Ruleset.IptablesChains(0) {
+		if len(c.Ours) > 0 {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// integrateIptables puts the meshly rule first in the iptables chains. The
+// ruleset is read again here: iptables or UFW may have changed the chains
+// since the plan was made.
+func (e *Engine) integrateIptables(ctx context.Context, mark uint32) error {
+	rs, err := e.FW.ListRuleset(ctx)
+	if err != nil {
+		return err
+	}
+	script := nft.IptablesScript(rs.IptablesChains(mark), mark)
+	if script == "" {
+		return nil
+	}
+	if err := e.FW.Check(ctx, script); err != nil {
+		return fmt.Errorf("kernel rejected the meshly rule for the iptables chains (nothing applied): %w", err)
+	}
+	return e.FW.ApplyScript(ctx, script)
 }
 
 func (e *Engine) configureWG(name string, d *Desired) error {

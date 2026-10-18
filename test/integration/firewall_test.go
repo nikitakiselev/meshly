@@ -5,6 +5,7 @@ package integration
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 const integrationRule = `meta mark & 0x10000000 == 0x10000000 accept comment "meshly"`
@@ -34,10 +35,9 @@ func TestUnsupportedFirewalls(t *testing.T) {
 	cases := []struct {
 		name, setup, undo, want string
 	}{
-		{"ufw", "mkdir -p /etc/ufw && printf 'ENABLED=yes\\n' > /etc/ufw/ufw.conf", "rm -rf /etc/ufw", "UFW"},
 		{"firewalld", "mkdir -p /run/firewalld && echo 1 > /run/firewalld/firewalld.pid", "rm -rf /run/firewalld", "firewalld"},
 		{"iptables-legacy", "iptables-legacy -A INPUT -p tcp --dport 25 -j DROP", "iptables-legacy -F INPUT", "legacy iptables"},
-		{"iptables-nft-drop", "iptables-nft -P INPUT DROP && iptables-nft -A INPUT -p tcp --dport 22 -j ACCEPT", "iptables-nft -P INPUT ACCEPT && iptables-nft -F INPUT && nft delete table ip filter", "chain ip filter INPUT"},
+		{"iptables-nft mangle drop", "iptables-nft -t mangle -A INPUT -p udp -j DROP", "iptables-nft -t mangle -F INPUT && nft delete table ip mangle", "chain ip mangle INPUT"},
 	}
 	for _, c := range cases {
 		l.Run(c.name, func(t *testing.T) {
@@ -141,5 +141,146 @@ func TestNativeNftablesProfile(t *testing.T) {
 	vps.MustMeshly("revoke", "home", "--yes")
 	if r := vps.Meshly("doctor"); r.Code != 12 || !strings.Contains(r.Out, integrationRule) {
 		t.Fatalf("doctor does not report the missing integration rule:\n%s", r)
+	}
+}
+
+// UFW on both nodes (default deny incoming, SSH allowed on the vps):
+// pairing and allowed services work without any UFW rule for meshly, UFW
+// still closes everything else, UFW's own commands keep meshly's rule, and
+// the rule comes back after iptables-restore removes it.
+func TestUFW(t *testing.T) {
+	forDistros(t, func(t *testing.T, distro string) {
+		l := newLab(t, distro)
+		vps, home, attacker := l.Node("vps"), l.Node("home"), l.Node("attacker")
+		vps.MustSh("ufw allow 22/tcp && ufw --force enable")
+		home.MustSh("ufw --force enable")
+		vps.Listen("tcp", 22)
+		vps.Listen("tcp", 8080)
+		before := vps.Foreign()
+
+		r := vps.MustMeshly("init", "homelab", "--name", "vps", "--endpoint", "198.51.100.10:51820")
+		if !strings.Contains(r.Out, "meshly rule first in ip filter INPUT, ip filter OUTPUT, ip6 filter INPUT, ip6 filter OUTPUT; UFW is enabled") {
+			t.Fatalf("init does not say what it did with the UFW chains:\n%s", r)
+		}
+		code := vps.Invite()
+		if r := home.Join(code, "--name", "home"); r.Code != 0 {
+			t.Fatalf("join through UFW: %s\n%s", r, vps.Sh("cat /root/invite.err").Out)
+		}
+		if c, inv := vps.InviteExit(30 * time.Second); c != 0 {
+			t.Fatalf("invite: exit %d\n%s", c, inv)
+		}
+		l.WaitHandshake(home, 20*time.Second)
+		for _, n := range []*Node{vps, home} {
+			if !n.IptablesFirst() {
+				t.Fatalf("%s: meshly rule not first:\n%s", n.Name, n.Sh("iptables -S; ip6tables -S").Out)
+			}
+		}
+
+		vps.MustMeshly("allow", "8080/tcp", "from", "home")
+		if !home.Probe("tcp", "10.100.0.1", 8080) {
+			t.Fatal("allowed service unreachable through UFW")
+		}
+		if home.Probe("tcp", "10.100.0.1", 22) {
+			t.Fatal("SSH reachable through the VPN without a meshly rule (UFW allows it on all interfaces)")
+		}
+		if attacker.Probe("tcp", "198.51.100.10", 8080) {
+			t.Fatal("the application port is open publicly")
+		}
+		if !attacker.Probe("tcp", "198.51.100.10", 22) {
+			t.Fatal("public SSH broken")
+		}
+		if after := vps.Foreign(); after != before {
+			t.Fatalf("UFW rules changed:\n%s\n---\n%s", before, after)
+		}
+
+		// UFW's own commands leave the rule in place.
+		vps.MustSh("ufw allow 80/tcp && ufw reload && ufw disable && ufw --force enable")
+		if !vps.IptablesFirst() || !home.Probe("tcp", "10.100.0.1", 8080) {
+			t.Fatalf("meshly rule lost after UFW commands:\n%s", vps.Sh("iptables -S INPUT").Out)
+		}
+		if r := vps.MustMeshly("status"); strings.Contains(r.Out, "MISSING") || !strings.Contains(r.Out, "none: kernel state matches the configuration") {
+			t.Fatalf("status after UFW commands:\n%s", r.Out)
+		}
+
+		// iptables-restore without the rule: closed, until the check puts
+		// it back.
+		vps.MustSh("iptables-save | grep -v 'meshly:v1 integration' | iptables-restore")
+		if home.Probe("tcp", "10.100.0.1", 8080) {
+			t.Fatal("VPN service reachable through UFW without meshly's rule")
+		}
+		if r := vps.MustMeshly("status"); !strings.Contains(r.Out, "ip filter INPUT MISSING") {
+			t.Fatalf("status does not show the missing rule:\n%s", r.Out)
+		}
+		vps.MustMeshly("service", "check")
+		if !vps.IptablesFirst() || !home.Probe("tcp", "10.100.0.1", 8080) {
+			t.Fatal("not repaired by the check")
+		}
+
+		// stop removes the rule, start puts it back, reset leaves UFW as
+		// it was (iptables-restore above reordered the tables, hence a new
+		// snapshot).
+		before = vps.Foreign()
+		vps.MustMeshly("stop")
+		if strings.Contains(vps.MustSh("iptables-save; ip6tables-save"), "meshly") {
+			t.Fatal("meshly rule left after stop")
+		}
+		vps.MustMeshly("start")
+		if !vps.IptablesFirst() || !home.Probe("tcp", "10.100.0.1", 8080) {
+			t.Fatal("start did not bring the rule back")
+		}
+		vps.MustMeshly("reset", "--yes")
+		if strings.Contains(vps.MustSh("iptables-save; ip6tables-save"), "meshly") {
+			t.Fatal("meshly rule left after reset")
+		}
+		if after := vps.Foreign(); after != before {
+			t.Fatalf("UFW rules changed by reset:\n%s\n---\n%s", before, after)
+		}
+	})
+}
+
+// Hand-written iptables rules (policy DROP, as with iptables-persistent):
+// the WireGuard port needs no rule, allowed services work, and reset
+// leaves the rules exactly as they were.
+func TestIptablesHost(t *testing.T) {
+	l := newLab(t, distros[0])
+	vps, home, attacker := l.Node("vps"), l.Node("home"), l.Node("attacker")
+	for _, ipt := range []string{"iptables", "ip6tables"} {
+		vps.MustSh(ipt + " -A INPUT -i lo -j ACCEPT && " + ipt + " -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT && " +
+			ipt + " -A INPUT -p tcp --dport 22 -j ACCEPT && " + ipt + " -P INPUT DROP")
+	}
+	vps.Listen("tcp", 22)
+	vps.Listen("tcp", 8080)
+	save := func() string {
+		return vps.MustSh(`iptables-save | grep -v '^#' | sed -E 's/\[[0-9]+:[0-9]+\]//'; ip6tables-save | grep -v '^#' | sed -E 's/\[[0-9]+:[0-9]+\]//'`)
+	}
+	before := save()
+
+	vps, home = l.Pair()
+	// INPUT has rules and policy DROP; OUTPUT (accept, empty) is left alone.
+	if !vps.iptablesFirst("iptables -S INPUT", "ip6tables -S INPUT") || strings.Contains(vps.MustSh("iptables -S OUTPUT; ip6tables -S OUTPUT"), "meshly") {
+		t.Fatalf("meshly rule not first in INPUT only:\n%s", vps.Sh("iptables -S; ip6tables -S").Out)
+	}
+	vps.MustMeshly("allow", "8080/tcp", "from", "home")
+	if !home.Probe("tcp", "10.100.0.1", 8080) {
+		t.Fatal("allowed service unreachable through iptables")
+	}
+	if home.Probe("tcp", "10.100.0.1", 22) {
+		t.Fatal("SSH reachable through the VPN without a meshly rule")
+	}
+	if attacker.Probe("tcp", "198.51.100.10", 8080) || !attacker.Probe("tcp", "198.51.100.10", 22) {
+		t.Fatal("public ports changed")
+	}
+	// A rule inserted above meshly's: the check moves meshly's back up.
+	vps.MustSh("iptables -I INPUT 1 -p tcp --dport 9 -j DROP")
+	vps.MustMeshly("service", "check")
+	if !vps.IptablesFirst4() {
+		t.Fatalf("meshly rule not moved back to the top:\n%s", vps.Sh("iptables -S INPUT").Out)
+	}
+	vps.MustSh("iptables -D INPUT -p tcp --dport 9 -j DROP")
+
+	vps.MustMeshly("revoke", "home", "--yes")
+	vps.MustMeshly("reset", "--yes")
+	if after := save(); after != before {
+		t.Fatalf("iptables rules changed:\n%s\n---\n%s", before, after)
 	}
 }
