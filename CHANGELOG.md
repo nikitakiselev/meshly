@@ -7,6 +7,8 @@ on-disk formats.
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-10-19
+
 ### Added
 
 - A network has more than two nodes, around the node that created it (hub and spokes). `meshly invite` on that node
@@ -144,7 +146,8 @@ First public release.
 - Signed self-upgrade from GitHub releases (`upgrade`), `install.sh` with signature verification, reproducible
   release builds for linux/amd64 and linux/arm64.
 
-[Unreleased]: https://github.com/nikitakiselev/meshly/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/nikitakiselev/meshly/compare/v0.0.6...HEAD
+[0.0.6]: https://github.com/nikitakiselev/meshly/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/nikitakiselev/meshly/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/nikitakiselev/meshly/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/nikitakiselev/meshly/compare/v0.0.2...v0.0.3
