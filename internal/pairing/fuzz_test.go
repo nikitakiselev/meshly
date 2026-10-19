@@ -11,13 +11,13 @@ import (
 func FuzzParseCode(f *testing.F) {
 	now := testExp.Add(-time.Minute)
 	for _, s := range []string{
-		"", "m1", "hello", "m2abc",
+		"", "m2", "hello", "m1abc",
 		forge([]byte{4, 203, 0, 113, 10, 0xCA, 0x6C}),
 	} {
 		f.Add(s)
 	}
 	for _, ep := range []string{"203.0.113.10:51820", "[2001:db8::1]:51820"} {
-		c, _ := NewCode(netip.MustParseAddrPort(ep), testKey, netip.MustParsePrefix("10.100.0.0/24"), testExp)
+		c, _ := NewCode(netip.MustParseAddrPort(ep), testKey, netip.MustParsePrefix("10.100.0.0/24"), testJoiner, testExp)
 		f.Add(c.String())
 	}
 	f.Fuzz(func(t *testing.T, s string) {

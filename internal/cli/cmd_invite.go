@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
@@ -46,18 +47,25 @@ func (a *App) cmdInvite(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	first, err := model.FirstHost(cfg.Network.CIDR)
+	if err != nil {
+		return err
+	}
+	joiner, free := cfg.NextAddress()
 	switch {
-	case len(cfg.Peers) > 0:
-		return errorf(ExitConflict, "network %q already has peer %s and this version connects exactly two nodes; run `sudo meshly revoke %s` first to replace it", cfg.Network.Name, peerNames(cfg), cfg.Peers[0].Name)
+	case cfg.Self.Address != first:
+		return notInviter(cfg, first)
+	case !free:
+		return errorf(ExitConflict, "network %q has no free address left in %s; revoke a node first (sudo meshly revoke <node>), or create the network with a larger --cidr", cfg.Network.Name, cfg.Network.CIDR)
 	case cfg.AdminState != model.AdminUp:
 		return errorf(ExitConflict, "the link is stopped (meshly stop); run `sudo meshly start` first")
 	case !cfg.Self.Endpoint.IsValid():
-		return errorf(ExitUsage, "this node has no public endpoint, so the other node cannot reach it; run the invite on a node the other one reaches over UDP, or set this node's public address: sudo meshly set endpoint IP")
+		return errorf(ExitUsage, "this node has no public endpoint, so a new node cannot reach it; set this node's public address: sudo meshly set endpoint IP")
 	}
 	if err := a.preflight(ctx, cfg, pfOpts{strict: true}); err != nil {
 		return err
 	}
-	code, err := pairing.NewCode(cfg.Self.Endpoint, cfg.Self.WGPublicKey, cfg.Network.CIDR, a.Now().Add(*ttl))
+	code, err := pairing.NewCode(cfg.Self.Endpoint, cfg.Self.WGPublicKey, cfg.Network.CIDR, joiner, a.Now().Add(*ttl))
 	if err != nil {
 		return err
 	}
@@ -75,6 +83,18 @@ func (a *App) cmdInvite(ctx context.Context, args []string) error {
 	a.ensureService(ctx, cfg.Interface.Name)
 	a.printf("Node %q (%s) joined. The invite is closed.\n", peer.Name, peer.Address)
 	return nil
+}
+
+// notInviter refuses an invite on a node that joined the network: new
+// nodes join through the node that created it, the one with the first
+// address.
+func notInviter(cfg *model.Config, first netip.Addr) error {
+	for _, p := range cfg.Peers {
+		if p.Address == first {
+			return errorf(ExitConflict, "this node joined network %q through %s, and new nodes join there: run `sudo meshly invite` on %s", cfg.Network.Name, p.Name, p.Name)
+		}
+	}
+	return errorf(ExitConflict, "this node joined network %q and cannot add nodes to it; to create a new network on this node, run `sudo meshly reset`, then `sudo meshly init`", cfg.Network.Name)
 }
 
 // runInvite opens the invite and serves it until a node has joined and
@@ -112,7 +132,7 @@ func (a *App) runInvite(ctx context.Context, cfg *model.Config, code *pairing.Co
 	expired := a.after(code.ExpiresAt.Sub(a.Now()))
 
 	fmt.Fprintf(a.Stderr, "Waiting for a node to join network %q until %s (%s). Ctrl+C cancels.\n", cfg.Network.Name, clockTime(code.ExpiresAt), humanDuration(ttl))
-	fmt.Fprintf(a.Stderr, "On the other node run `sudo meshly join` and paste this code:\n\n")
+	fmt.Fprintf(a.Stderr, "On the new node run `sudo meshly join` and paste this code:\n\n")
 	fmt.Fprintln(a.Stdout, code.String())
 	fmt.Fprintln(a.Stderr)
 
@@ -229,8 +249,12 @@ func (s *inviteSession) answer(c net.Conn, req *pairing.Request) (bool, error) {
 		reject(pairing.ReasonInvalid, "no join is waiting for a confirmation")
 	case s.member == nil && h.Name == self.Name:
 		reject(pairing.ReasonNameTaken, "the name %q is already used by the inviting node; choose another one with --name", h.Name)
-	case s.member == nil && (h.WGPublicKey == self.WGPublicKey || h.WGPublicKey == s.sec.TempPublicKey()):
-		reject(pairing.ReasonInvalid, "the joining node presents a key of the inviting node or of the invite itself")
+	case s.member == nil && slices.ContainsFunc(s.base.Peers, func(p model.Peer) bool { return p.Name == h.Name }):
+		// At most 173 bytes with the longest name: a reject carries 200.
+		reject(pairing.ReasonNameTaken, "the name %q is already used by another node; choose another one with --name or run `sudo meshly revoke %s` there", h.Name, h.Name)
+	case s.member == nil && (h.WGPublicKey == self.WGPublicKey || h.WGPublicKey == s.sec.TempPublicKey() ||
+		slices.ContainsFunc(s.base.Peers, func(p model.Peer) bool { return p.WGPublicKey == h.WGPublicKey })):
+		reject(pairing.ReasonInvalid, "the joining node presents a key of a node of this network or of the invite itself")
 	case s.member == nil:
 		return false, s.admit(c, h)
 	case h != nil:

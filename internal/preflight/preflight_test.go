@@ -684,7 +684,7 @@ func TestForwardWarnings(t *testing.T) {
 }
 
 func TestEvaluateFirewallDockerMessages(t *testing.T) {
-	const networks = "Docker networks docker0, br-3f1c2a9b7d01: published container ports are reachable through the VPN after meshly allow <port>; containers reach the other node like programs on this host"
+	const networks = "Docker networks docker0, br-3f1c2a9b7d01: published container ports are reachable through the VPN after meshly allow <port>; containers reach the other nodes like programs on this host"
 	const noBridge = "Docker rules found but no Docker bridge network (docker0, br-<id>): containers on networks with custom bridge names cannot use the VPN"
 	const off = "routing table 109 has routes that meshly did not create, so meshly leaves the Docker networks docker0, br-3f1c2a9b7d01 out: published container ports and container connections do not work through the VPN; the tunnel between the hosts works"
 	const offFix = "remove the routes that meshly did not create from table 109 (`ip route show table 109`; meshly's have proto 109); meshly then serves the Docker networks within a minute"

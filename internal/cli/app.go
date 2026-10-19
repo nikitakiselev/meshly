@@ -142,7 +142,7 @@ type command struct {
 func commands() []command {
 	return []command{
 		{"init", "create a network on this node (usually the server with a public UDP endpoint)", false, (*App).cmdInit},
-		{"invite", "wait for the second node to join with a one-time code", false, (*App).cmdInvite},
+		{"invite", "wait for a new node to join with a one-time code", false, (*App).cmdInvite},
 		{"join", "join a network with the code printed by meshly invite", false, (*App).cmdJoin},
 		{"allow", "allow a peer to reach a local service through the VPN", false, (*App).cmdAllow},
 		{"deny", "remove an allow rule (existing connections stop as well)", false, (*App).cmdDeny},

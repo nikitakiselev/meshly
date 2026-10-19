@@ -13,16 +13,17 @@
 
 </div>
 
-meshly объединяет два Linux-сервера в одну приватную сеть: они видят друг друга
-по адресам `10.100.0.1` и `10.100.0.2`, как будто стоят в одной локальной сети.
-Связь зашифрована (WireGuard), а по умолчанию всё закрыто: вы сами решаете, к
-каким портам один сервер может подключаться на другом.
+meshly объединяет Linux-серверы в одну приватную сеть: они видят друг друга по
+адресам `10.100.0.1`, `10.100.0.2` и так далее, как будто стоят в одной локальной
+сети. Связь зашифрована (WireGuard), а по умолчанию всё закрыто: вы сами решаете,
+к каким портам один сервер может подключаться на другом.
 
 Например, у вас есть VPS с белым IP и домашний homelab за роутером, и вы хотите,
 чтобы они безопасно общались между собой: SSH, база данных, мониторинг, бэкапы.
 meshly соединит их за несколько команд, без конфигов и ручной настройки WireGuard
 и firewall. Через канал будет доступно только то, что вы разрешили, например
-`meshly allow 22/tcp from home`.
+`meshly allow 22/tcp from home`. Другие серверы подключаются к VPS так же, каждый
+своим туннелем; подключившиеся серверы друг друга не видят.
 
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 400}}}%%
@@ -58,9 +59,12 @@ flowchart LR
   `meshly deny` обрывает и уже установленные соединения.
 - **Никаких случайных утечек.** Нет доступа к локальной сети за сервером, ничего не пересылается из локальной сети в
   туннель, нет IPv6 внутри VPN. Контейнер Docker — как программа на сервере: опубликованный им порт открывается
-  только через `meshly allow`, а контейнеры подключаются ко второму серверу только туда, куда он разрешил. Пакеты с
+  только через `meshly allow`, а контейнеры подключаются к другим серверам только туда, куда те разрешили. Пакеты с
   подменённым адресом отбрасываются.
-- **Безопасное подключение без сервера.** `meshly invite` печатает одноразовый код, а `meshly join` на втором
+- **Один VPS, несколько серверов.** Каждый сервер подключается к тому, который создал сеть, и получает следующий
+  адрес. В правилах указан сервер, поэтому VPS открывает порт одному из них, а не остальным, а подключившиеся
+  серверы друг друга не видят.
+- **Безопасное подключение без сервера.** `meshly invite` печатает одноразовый код, а `meshly join` на новом
   сервере просит его ввести. Серверы обмениваются ключами через уже открытый порт WireGuard, поэтому ничего нового не
   становится доступно ни из интернета, ни другим пользователям сервера, даже пока приглашение ждёт. Код срабатывает
   один раз, живёт 10 минут и никогда не передаётся в аргументах командной строки.
@@ -91,7 +95,7 @@ flowchart LR
 | Архитектура | `amd64`, `arm64` |
 | Ядро | WireGuard в ядре (встроенный или модулем; подойдёт любое ядро дистрибутива 5.6+) |
 | Firewall | нужен nftables ≥ 1.0.6 (`/usr/sbin/nft`). Firewall сервера: никакого, UFW, правила iptables (`iptables-nft`, бэкенд по умолчанию) или собственный набор правил nftables, с fail2ban или без. Не поддерживаются: firewalld, правила iptables-legacy |
-| Сеть | Одному узлу нужен публичный UDP-порт (по умолчанию `51820`), доступный второму узлу |
+| Сеть | Одному узлу нужен публичный UDP-порт (по умолчанию `51820`), доступный остальным узлам |
 | Утилиты | `curl` или `wget`, `openssl`, `sha256sum` (только для установщика) |
 
 meshly работает от root (`sudo`). Он не ставит пакеты и не меняет глобальные sysctl. Облачные firewall и группы
@@ -99,7 +103,7 @@ meshly работает от root (`sudo`). Он не ставит пакеты 
 
 ## Установка
 
-Выполните на **обоих** серверах:
+Выполните на **каждом** сервере:
 
 ```sh
 curl -fsSL https://github.com/nikitakiselev/meshly/releases/latest/download/install.sh | sudo sh
@@ -161,7 +165,7 @@ Network "homelab" created.
   firewall:     profile none; all inbound VPN traffic is denied until `meshly allow`
   public key:   bWcWhZaUNdCDGVVlpXq8o/ep9g9jtumd2jC7Zsju9C4=
 
-Next: run `sudo meshly invite` on this node and `sudo meshly join` on the other.
+Next: run `sudo meshly invite` on this node and `sudo meshly join` on the node to add, once for each node.
 ```
 
 Искать адрес VPS не нужно: meshly сам находит публичный IP на его сетевом интерфейсе и берёт стандартный порт WireGuard
@@ -173,9 +177,9 @@ Next: run `sudo meshly invite` on this node and `sudo meshly join` on the other.
 ```console
 admin@vps:~$ sudo meshly invite
 Waiting for a node to join network "homelab" until 20:40 UTC (10 minutes). Ctrl+C cancels.
-On the other node run `sudo meshly join` and paste this code:
+On the new node run `sudo meshly join` and paste this code:
 
-m1atfqa4ikzjwg2zywqwljinoqqmmvkznfpk6kh55j6yhwhnxjtxndbo3gzdxpilqkmqaaagdk2uxkasjvuxzmxu2ljlylk2tq5xtgw2omnywbs
+m2atfqa4ikzjwgpbrtj3phaxmxkj7mzkcutbejgrbusyvju73zukbjrppgtl6q4yakmqaaegdk2uxkamwtchm7oqnrrkialyu6jp4zrk7wlzcjm
 
 Node "home" (10.100.0.2) joined. The invite is closed.
 ```
@@ -187,7 +191,7 @@ Node "home" (10.100.0.2) joined. The invite is closed.
 
 ```console
 admin@home:~$ sudo meshly join
-Invite code: m1atfqa4ikzjwg2zywqwljinoqqmmvkznfpk6kh55j6yhwhnxjtxndbo3gzdxpilqkmqaaagdk2uxkasjvuxzmxu2ljlylk2tq5xtgw2omnywbs
+Invite code: m2atfqa4ikzjwgpbrtj3phaxmxkj7mzkcutbejgrbusyvju73zukbjrppgtl6q4yakmqaaegdk2uxkamwtchm7oqnrrkialyu6jp4zrk7wlzcjm
 Connecting to 203.0.113.10:51820...
 Joined network "homelab" as "home" (10.100.0.2).
   peer:  vps 10.100.0.1 via 203.0.113.10:51820
@@ -215,6 +219,11 @@ sudo meshly status     # конфигурация, интерфейс, руко�
 sudo meshly doctor     # все проверки с вердиктом; код 0 = проблем нет
 ```
 
+**6. Добавьте другие серверы.** Снова выполните `sudo meshly invite` на vps и `sudo meshly join` на новом сервере,
+например office. Он получит следующий адрес, `10.100.0.3`, и туннель до vps. Home всё это время работает. В правилах
+указан сервер, поэтому `sudo meshly allow 9108/tcp from office` на vps открывает порт office, но не home. Office и
+home друг друга не видят.
+
 Канал поднимается при загрузке через `meshly.service`. Для скриптов `meshly join` читает код и из stdin: см.
 [подключение из скрипта](docs/cli.md#pairing-from-a-script).
 
@@ -226,13 +235,14 @@ sudo meshly doctor     # все проверки с вердиктом; код 0
 | Закрыть (обрывает и установленные соединения) | `sudo meshly deny 5432/tcp from home` |
 | Список правил | `sudo meshly rules` |
 | Кто в сети, работает ли связь | `sudo meshly nodes`, `sudo meshly ping home` |
+| Добавить сервер | `sudo meshly invite` (на vps), `sudo meshly join` (на новом сервере) |
 | Состояние и диагностика | `sudo meshly status`, `sudo meshly doctor`, `sudo meshly doctor --probe 22/tcp` |
 | Остановить или запустить канал (stop сохраняется после перезагрузки) | `sudo meshly stop`, `sudo meshly start`, `sudo meshly restart` |
 | У VPS сменился IP | `sudo meshly set peer-endpoint vps 198.51.100.7` (на home) |
-| Путь с меньшим MTU | `sudo meshly set mtu 1380` (на обоих узлах) |
+| Путь с меньшим MTU | `sudo meshly set mtu 1380` (на каждом узле) |
 | Кто и что менял | `sudo meshly logs` |
 | Обновиться до последнего релиза | `sudo meshly upgrade` (`--check` — только проверить) |
-| Удалить соседа | `sudo meshly revoke home` |
+| Убрать сервер из сети | `sudo meshly revoke home` (на vps) |
 | Удалить meshly с узла | `sudo meshly reset` |
 
 `init`, `allow`, `deny`, `revoke`, `start`, `stop` и `set` поддерживают `--dry-run`. Подробности — в
@@ -275,7 +285,7 @@ sudo meshly doctor     # все проверки с вердиктом; код 0
 |---|---|
 | [docs/cli.md](docs/cli.md) | Все команды, флаги, коды выхода и JSON-вывод |
 | [docs/architecture.md](docs/architecture.md) | Компоненты, состояние на диске, транзакции, systemd, обновление; проектные решения |
-| [docs/pairing-protocol.md](docs/pairing-protocol.md) | Код приглашения и то, как `invite` и `join` соединяют два узла |
+| [docs/pairing-protocol.md](docs/pairing-protocol.md) | Код приглашения и то, как `invite` и `join` добавляют узел в сеть |
 | [docs/firewall.md](docs/firewall.md) | Путь пакета, таблица `inet meshly`, поддерживаемые профили firewall, Docker |
 | [docs/threat-model.md](docs/threat-model.md) | Активы, нарушители, гарантии и что вне рамок |
 | [docs/diagnostics-and-recovery.md](docs/diagnostics-and-recovery.md) | Как читать `status` и `doctor`; инструкции; восстановление и safe mode |
@@ -286,26 +296,29 @@ sudo meshly doctor     # все проверки с вердиктом; код 0
 ## Вопросы и ответы
 
 **Чем это лучше `wg-quick`?** `wg-quick` поднимает туннель. Он не решает, что через этот туннель можно, не закрывает
-второму серверу вашу локальную сеть, когда ваш сервер пересылает пакеты (как любой сервер с Docker), и не откатывает
+другим серверам вашу локальную сеть, когда ваш сервер пересылает пакеты (как любой сервер с Docker), и не откатывает
 наполовину применённое изменение. meshly делает всё это.
 
 **`meshly join` пишет, что VPS не ответил.** Либо приглашение уже закрыто (истекло, отменено или использовано), либо
 UDP 51820 не доходит до VPS: проверьте его облачный firewall. На home при этом ничего не изменилось. Если приглашение
 закрылось, снова запустите `sudo meshly invite` на VPS, затем `sudo meshly join` на home.
 
-**Можно ли соединить больше двух серверов?** Пока нет. В 0.0.x в сети ровно два узла. См. [roadmap](docs/roadmap.md).
+**Можно ли соединить больше двух серверов?** Да, вокруг одного сервера с публичным IP. Выполните `sudo meshly invite`
+на сервере, который создал сеть, по разу для каждого нового сервера, и `sudo meshly join` на новом. Каждый сервер
+получает туннель до первого и доступ там только к тому, что вы ему разрешили. Подключившиеся серверы друг друга не
+видят; это есть в [roadmap](docs/roadmap.md).
 
 **Работает ли с UFW, iptables или fail2ban?** Да, и настраивать ничего не нужно. meshly держит одно правило в начале
 цепочек `INPUT` и `OUTPUT` (и `FORWARD` на сервере с Docker), которое пропускает только то, что разрешила политика
 самого meshly, включая порт WireGuard, и возвращает его, если перезагрузка правил его удалила. Весь остальной трафик
-по-прежнему решает UFW. Баны fail2ban продолжают действовать; если бан задел второй узел, meshly предупредит и
+по-прежнему решает UFW. Баны fail2ban продолжают действовать; если бан задел другой узел, meshly предупредит и
 подскажет, как его снять. firewalld и бэкенд iptables-legacy не поддерживаются: meshly их обнаруживает и ничего не
 меняет. Подробнее в [документации по firewall](docs/firewall.md#iptables-and-ufw).
 
 **Доступны ли мои Docker-контейнеры через VPN?** Да, как программы на сервере. Порт, опубликованный через
 `-p 9104:9104` (или `ports:` в compose), открывается для home командой `sudo meshly allow 9104/tcp from home` на VPS:
-в `allow` указывается порт хоста, левое число. Контейнеры сами подключаются ко второму серверу, к портам, которые он
-разрешил. В Docker и compose ничего настраивать не нужно, а новые сети начинают работать через несколько секунд.
+в `allow` указывается порт хоста, левое число. Контейнеры сами подключаются к другим серверам, к портам, которые те
+разрешили. В Docker и compose ничего настраивать не нужно, а новые сети начинают работать через несколько секунд.
 Локальная сеть, адреса контейнеров и порты без `meshly allow` остаются закрыты.
 
 Учтите: `-p 9104:9104` открывает порт и в интернет, потому что Docker обходит UFW. Чтобы опубликовать порт только в

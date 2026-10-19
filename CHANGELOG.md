@@ -7,6 +7,30 @@ on-disk formats.
 
 ## [Unreleased]
 
+### Added
+
+- A network has more than two nodes, around the node that created it (hub and spokes). `meshly invite` on that node
+  adds one node per invite while the nodes already there keep working:
+  - The new node gets the lowest free address of the network (`10.100.0.3`, then `10.100.0.4`); an address freed by
+    `meshly revoke` goes to the next node that joins.
+  - Every node that joined has one peer, the first node, and reaches there only what `meshly allow … from <node>`
+    opens to it. The nodes that joined do not reach each other, also not through the first node.
+  - `meshly invite` on a node that joined names the node to run it on, and in a network without a free address it
+    stops with exit 5 before printing a code. A name that another node uses is refused at `join` with exit 5, and the
+    invite waits on.
+  See [hub and spokes](docs/architecture.md#d13-hub-and-spokes).
+
+### Changed
+
+- Invite codes start with `m2` (pairing protocol `meshly-pair/2`): the code carries the address of the joining node.
+  The inviting and the joining node both need this version; a code of 0.0.5 or earlier is refused with
+  `made by another meshly version`. Nodes that joined before keep working without an upgrade.
+- The whole VPN network is routed into `meshly0`: a packet for a VPN address that is not a peer meets meshly's drop
+  there and never leaves unencrypted through the default route. `meshly upgrade` adds the route when it restarts the
+  service.
+- `meshly doctor --probe` needs `--peer <name>` when the node has more than one peer.
+- Messages and help name the new node or the other nodes instead of the second node.
+
 ## [0.0.5] - 2026-10-19
 
 ### Added

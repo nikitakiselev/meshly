@@ -37,7 +37,8 @@ name is a conflict (exit code 5), not something to overwrite. The hash covers th
 check timer can tell when the table was modified outside meshly.
 
 This is the table for a node `10.100.0.1` with peer `10.100.0.2` and the rules `allow 22/tcp`, `allow 53/udp` and
-`allow ping` from that peer:
+`allow ping` from that peer. On a hub with several nodes, `@peers` has the address of each, and the allow sets name
+each node by its address: a rule for one node opens nothing to another.
 
 ```nft
 table inet meshly {
@@ -142,8 +143,9 @@ same as before meshly supported Docker (see [Docker](#docker)):
 
 1. `guard_pre` (prerouting, priority −180) runs after conntrack (−200) and before mangle (−150) and DNAT (−100).
    The policy therefore sees the *original* destination, before any DNAT rule (Docker's included) can rewrite it.
-2. `from_vpn` allows only IPv4 from a known peer address to this node's own VPN address. Inside those limits it
-   accepts:
+2. `from_vpn` allows only IPv4 from a known peer address to this node's own VPN address. On the hub, this keeps the
+   nodes that joined apart: a packet from one of them for another is not for the hub's address and is dropped here,
+   before routing. Inside those limits it accepts:
    - replies to connections this node started;
    - ICMP errors related to them;
    - new or established flows that match `allow_in` exactly (peer, protocol, port);
@@ -159,8 +161,10 @@ same as before meshly supported Docker (see [Docker](#docker)):
    [Docker](#docker)). The peer cannot reach the LAN, a container's own address or anything else behind this
    node.
 
-**Outbound into the tunnel:** `guard_out` sends packets for `meshly0` to `to_vpn`. That chain allows packets that
-this node originates and replies to connections the peer was allowed to open. It drops replies of denied
+**Outbound into the tunnel:** the whole VPN network is routed into `meshly0`, not only the peers. `guard_out` sends
+packets for `meshly0` to `to_vpn`, which drops a packet for an address that is not a peer (`ip daddr != @peers`),
+such as another node that joined the same hub: it never leaves through the default route unencrypted. `to_vpn`
+allows packets that this node originates and replies to connections the peer was allowed to open. It drops replies of denied
 connections and NATed traffic, so the peer cannot obtain responses through any side path. What containers send
 into the tunnel is forwarded, not sent by this node: `guard_fwd`, `nat_out` and `guard_post` decide it (see
 [Docker](#docker)).
@@ -188,8 +192,8 @@ change it.
 ## During an invite
 
 While `meshly invite` waits, the table of the inviting node carries temporary elements and one temporary rule for
-the address the joining node will get (here `10.100.0.2`). With no peer yet, the sets and `guard_in` look like
-this:
+the address the joining node will get, the lowest free one, which the code carries (here `10.100.0.2`). The nodes
+that joined before keep their elements and rules. With no peer yet, the sets and `guard_in` look like this:
 
 ```nft
 	set peers      { type ipv4_addr; elements = { 10.100.0.2 } }

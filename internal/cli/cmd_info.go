@@ -145,7 +145,7 @@ func (a *App) renderStatus(st *diag.Status) {
 		p("Transaction\n  none pending; last: %s %s at %s\n", t.LastOp, t.LastEvent, t.LastTime.Format(time.RFC3339))
 	}
 	if st.Invite != nil {
-		p("Invite open until %s: waiting for a node to join (run `sudo meshly join` on the other node).\n", st.Invite.ExpiresAt.Local().Format(time.RFC3339))
+		p("Invite open until %s: waiting for a node to join (run `sudo meshly join` on the new node).\n", st.Invite.ExpiresAt.Local().Format(time.RFC3339))
 	} else if st.Privileged {
 		if len(st.Drift) == 0 {
 			p("Drift\n  none: kernel state matches the configuration\n")
@@ -196,8 +196,12 @@ func (a *App) cmdDoctor(ctx context.Context, args []string) error {
 			return err
 		}
 		name := *peer
-		if name == "" && len(cfg.Peers) > 0 {
+		switch {
+		case name != "":
+		case len(cfg.Peers) == 1:
 			name = cfg.Peers[0].Name
+		case len(cfg.Peers) > 1:
+			return errorf(ExitUsage, "name the peer to probe with --peer: %s", peerNames(cfg))
 		}
 		r, err := model.ParseRule([]string{*probe, "from", name})
 		if err != nil || r.Proto == model.ProtoPing {

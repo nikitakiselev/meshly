@@ -1,6 +1,6 @@
 # Roadmap
 
-meshly 0.0.x is deliberately narrow: two nodes, IPv4 inside the tunnel, nftables only. This page lists what is
+meshly 0.0.x is deliberately narrow: one hub with the nodes that joined it, IPv4 inside the tunnel, nftables only. This page lists what is
 planned, roughly in order. Nothing here is a commitment to a date. Suggestions are welcome in
 [issues](https://github.com/nikitakiselev/meshly/issues).
 
@@ -18,8 +18,9 @@ planned, roughly in order. Nothing here is a commitment to a date. Suggestions a
 
 ## Later
 
-- **More than two nodes.** Hub-and-spoke first (one public node, several nodes behind NAT), with per-peer rules.
-  This needs invites that add a node to an existing network and policy sets keyed by peer.
+- **Nodes that joined reaching each other.** Today every node that joined has a tunnel to the hub alone (since the
+  release after 0.0.5). Next: let the hub forward between two of them for rules that name both, or give them a
+  tunnel of their own where one of them has a public endpoint.
 - **Host names in endpoints.** Resolve DNS names for `--endpoint` / `set peer-endpoint`, with re-resolution when
   the handshake goes stale.
 - **IPv6.** IPv6 transport endpoints are accepted today but not yet covered by integration tests; IPv6 *inside* the tunnel is blocked. Dual-stack VPN

@@ -15,7 +15,7 @@ import (
 
 const (
 	// Protocol identifies the pairing protocol and its version.
-	Protocol = "meshly-pair/1"
+	Protocol = "meshly-pair/2"
 	// Port is the TCP pairing port, bound to the inviter's VPN address only.
 	Port = 51820
 	// MaxMessageSize bounds one wire message, newline included.

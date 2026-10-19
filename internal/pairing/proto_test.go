@@ -115,7 +115,7 @@ func feed(t *testing.T, data string, keepOpen bool) net.Conn {
 
 func TestHostilePeer(t *testing.T) {
 	const (
-		hello   = `{"name":"homelab","protocol":"meshly-pair/1","wg_public_key":"` + testKey + `"}`
+		hello   = `{"name":"homelab","protocol":"meshly-pair/2","wg_public_key":"` + testKey + `"}`
 		confirm = `{"wg_public_key":"` + testKey + `"}`
 	)
 	helloWith := func(body string) string { return `{"type":"hello","hello":` + body + `}` + "\n" }
@@ -130,12 +130,12 @@ func TestHostilePeer(t *testing.T) {
 		"ok to server":      `{"type":"ok"}` + "\n",
 		"welcome to server": wire(t, message{Type: "welcome", Welcome: &wl}),
 		"duplicate key":     `{"type":"hello","type":"hello","hello":` + hello + `}` + "\n",
-		"unknown field":     helloWith(`{"x":1,"name":"homelab","protocol":"meshly-pair/1","wg_public_key":"` + testKey + `"}`),
+		"unknown field":     helloWith(`{"x":1,"name":"homelab","protocol":"meshly-pair/2","wg_public_key":"` + testKey + `"}`),
 		"capitalised key":   `{"Type":"hello","hello":` + hello + `}` + "\n",
-		"bad name":          helloWith(`{"name":"Bad!","protocol":"meshly-pair/1","wg_public_key":"` + testKey + `"}`),
-		"zero key":          helloWith(`{"name":"homelab","protocol":"meshly-pair/1","wg_public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}`),
-		"port 0 endpoint":   helloWith(`{"name":"homelab","protocol":"meshly-pair/1","wg_public_key":"` + testKey + `","endpoint":"198.51.100.7:0"}`),
-		"bad protocol":      helloWith(`{"name":"homelab","protocol":"meshly-pair/2","wg_public_key":"` + testKey + `"}`),
+		"bad name":          helloWith(`{"name":"Bad!","protocol":"meshly-pair/2","wg_public_key":"` + testKey + `"}`),
+		"zero key":          helloWith(`{"name":"homelab","protocol":"meshly-pair/2","wg_public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}`),
+		"port 0 endpoint":   helloWith(`{"name":"homelab","protocol":"meshly-pair/2","wg_public_key":"` + testKey + `","endpoint":"198.51.100.7:0"}`),
+		"bad protocol":      helloWith(`{"name":"homelab","protocol":"meshly-pair/1","wg_public_key":"` + testKey + `"}`),
 		"unknown type":      `{"type":"bye"}` + "\n",
 		"deep nesting":      `{"type":"hello","hello":{"a":{"a":{"a":{"a":{"a":{"a":{"a":{}}}}}}}}}` + "\n",
 		"trailing data":     `{"type":"ok"} x` + "\n",

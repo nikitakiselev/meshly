@@ -441,7 +441,7 @@ func EvaluateFirewall(r *Report, a *nft.Analysis, profile string, mark uint32, s
 		r.add("docker", Warn, fmt.Sprintf("routing table %d has routes that meshly did not create, so meshly leaves the Docker networks %s out: published container ports and container connections do not work through the VPN; the tunnel between the hosts works", netstack.RouteTable, strings.Join(a.DockerOff, ", ")),
 			fmt.Sprintf("remove the routes that meshly did not create from table %d (`ip route show table %d`; meshly's have proto %d); meshly then serves the Docker networks within a minute", netstack.RouteTable, netstack.RouteTable, netstack.RouteProtocol))
 	case len(a.DockerBridges) > 0:
-		r.add("docker", Info, "Docker networks "+strings.Join(a.DockerBridges, ", ")+": published container ports are reachable through the VPN after meshly allow <port>; containers reach the other node like programs on this host", "")
+		r.add("docker", Info, "Docker networks "+strings.Join(a.DockerBridges, ", ")+": published container ports are reachable through the VPN after meshly allow <port>; containers reach the other nodes like programs on this host", "")
 	case a.DockerDetected:
 		r.add("docker", Warn, "Docker rules found but no Docker bridge network (docker0, br-<id>): containers on networks with custom bridge names cannot use the VPN", "")
 	}

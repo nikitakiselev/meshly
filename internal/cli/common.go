@@ -183,7 +183,7 @@ func (a *App) ensureService(ctx context.Context, iface string) {
 func (a *App) loadConfig() (*model.Config, error) {
 	c, err := a.Paths.LoadConfig()
 	if errors.Is(err, store.ErrNotInitialized) {
-		return nil, withCode(ExitNotInit, errors.New("meshly is not initialized on this node: run `sudo meshly init` (first node) or `sudo meshly join` (second node)"))
+		return nil, withCode(ExitNotInit, errors.New("meshly is not initialized on this node: run `sudo meshly init` (the first node) or `sudo meshly join` (every other node)"))
 	}
 	return c, err
 }

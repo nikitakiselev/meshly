@@ -228,7 +228,7 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
-var codeRe = regexp.MustCompile(`^m1[a-z2-7]+$`)
+var codeRe = regexp.MustCompile(`^m2[a-z2-7]+$`)
 
 // terminal is where a command in the background writes: once gone, every
 // write fails the way it does to the terminal of a closed SSH session.
@@ -890,11 +890,7 @@ func TestInviteRefusals(t *testing.T) {
 		t.Errorf("invite on a stopped link:\n%s", out)
 	}
 
-	vps, _ := pair(t)
-	if out := vps.expect(ExitConflict, "invite"); !strings.Contains(out, "home") {
-		t.Errorf("invite with a peer:\n%s", out)
-	}
-	for _, n := range []*testNode{n, stopped, vps} {
+	for _, n := range []*testNode{n, stopped} {
 		if _, err := n.app.Paths.LoadInviteMarker(); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("a refused invite left a marker: %v", err)
 		}
@@ -919,7 +915,7 @@ func TestJoinCodeInput(t *testing.T) {
 	}{
 		{"hello", ExitInvalidCode, "damaged"},
 		{string(b), ExitInvalidCode, "damaged"},
-		{"m2" + inv.code[2:], ExitInvalidCode, "upgrade"},
+		{"m1" + inv.code[2:], ExitInvalidCode, "upgrade"},
 		{strings.Repeat("a", 2000), ExitInvalidCode, "damaged"},
 		{"", ExitUsage, "no invite code"},
 	} {
@@ -984,7 +980,7 @@ func TestJoinCodeWrapped(t *testing.T) {
 			return 0, ""
 		}
 	}
-	for _, first := range []string{"garbage\n", "m2" + inv.code[2:half] + "\n", inv.code[:half] + "\n\n"} {
+	for _, first := range []string{"garbage\n", "m1" + inv.code[2:half] + "\n", inv.code[:half] + "\n\n"} {
 		if code, errOut := joinFrom(first); code != ExitInvalidCode {
 			t.Errorf("join with %.20q: exit %d, want %d\n%s", first, code, ExitInvalidCode, errOut)
 		}
@@ -1125,7 +1121,7 @@ func TestJoinNameFromHostname(t *testing.T) {
 	n := newTestNode(t, start)
 	n.app.Hostname = func() (string, error) { return "123", nil }
 	key, _ := wgtypes.GeneratePrivateKey()
-	c, err := pairing.NewCode(netip.MustParseAddrPort("203.0.113.10:51820"), key.PublicKey().String(), netip.MustParsePrefix("10.100.0.0/24"), start.Add(10*time.Minute))
+	c, err := pairing.NewCode(netip.MustParseAddrPort("203.0.113.10:51820"), key.PublicKey().String(), netip.MustParsePrefix("10.100.0.0/24"), homeVPN, start.Add(10*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1444,7 +1440,7 @@ func TestJoinIgnoresTemporaryHandshake(t *testing.T) {
 func TestJoinCodeUsed(t *testing.T) {
 	vps, home, mem := newPair(t)
 	cfg := vps.config()
-	c, err := pairing.NewCode(cfg.Self.Endpoint, cfg.Self.WGPublicKey, cfg.Network.CIDR, start.Add(10*time.Minute))
+	c, err := pairing.NewCode(cfg.Self.Endpoint, cfg.Self.WGPublicKey, cfg.Network.CIDR, homeVPN, start.Add(10*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1521,7 +1517,7 @@ func TestInviteIgnoresForeignSource(t *testing.T) {
 func TestJoinWelcomeMismatch(t *testing.T) {
 	vps, home, mem := newPair(t)
 	cfg := vps.config()
-	c, err := pairing.NewCode(cfg.Self.Endpoint, cfg.Self.WGPublicKey, cfg.Network.CIDR, start.Add(10*time.Minute))
+	c, err := pairing.NewCode(cfg.Self.Endpoint, cfg.Self.WGPublicKey, cfg.Network.CIDR, homeVPN, start.Add(10*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1617,13 +1613,14 @@ func TestInviteOpenUntilConfirmDeadline(t *testing.T) {
 	}
 }
 
-// testSession is an armed invite of network homelab on node vps, with no
-// engine behind it: enough for the answers that change nothing.
+// testSession is an armed invite of network homelab on node vps, which
+// already has the peer office (10.100.0.2), with no engine behind it: enough
+// for the answers that change nothing.
 func testSession(t *testing.T) *inviteSession {
 	t.Helper()
 	inviterKey := testPublicKey(t)
 	cidr := netip.MustParsePrefix("10.100.0.0/24")
-	code, err := pairing.NewCode(netip.MustParseAddrPort("203.0.113.10:51820"), inviterKey, cidr, time.Now().Add(time.Hour))
+	code, err := pairing.NewCode(netip.MustParseAddrPort("203.0.113.10:51820"), inviterKey, cidr, netip.MustParseAddr("10.100.0.3"), time.Now().Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1637,6 +1634,7 @@ func testSession(t *testing.T) *inviteSession {
 	base := &model.Config{
 		Network: model.Network{Name: "homelab", CIDR: cidr},
 		Self:    model.Self{Name: "vps", Address: inviter, WGPublicKey: inviterKey},
+		Peers:   []model.Peer{{Name: "office", Address: netip.MustParseAddr("10.100.0.2"), WGPublicKey: testPublicKey(t)}},
 	}
 	return &inviteSession{a: &App{}, ctx: context.Background(), code: code, sec: sec, joiner: joiner, base: base}
 }
@@ -1644,7 +1642,7 @@ func testSession(t *testing.T) *inviteSession {
 // commitForTest moves s to the committed state with node home of key.
 func commitForTest(t *testing.T, s *inviteSession, key string) {
 	m := s.base.Clone()
-	m.Peers = []model.Peer{{Name: "home", Address: s.joiner, WGPublicKey: key}}
+	m.Peers = append(m.Peers, model.Peer{Name: "home", Address: s.joiner, WGPublicKey: key})
 	s.member, s.timer = m, time.NewTimer(time.Hour)
 	t.Cleanup(s.stopTimer)
 }
@@ -1719,12 +1717,21 @@ func TestInviteSessionAnswers(t *testing.T) {
 	if ok, err := ask(confirmWith(home)); ok || refused(err) != pairing.ReasonInvalid {
 		t.Errorf("confirm while armed: %v, %v", ok, err)
 	}
-	if ok, err := ask(helloWith("vps", home)); ok || refused(err) != pairing.ReasonNameTaken {
-		t.Errorf("hello with the inviter's name: %v, %v", ok, err)
+	for _, name := range []string{"vps", "office"} {
+		if ok, err := ask(helloWith(name, home)); ok || refused(err) != pairing.ReasonNameTaken {
+			t.Errorf("hello with the name of %s: %v, %v", name, ok, err)
+		}
 	}
-	for _, key := range []string{s.base.Self.WGPublicKey, s.sec.TempPublicKey()} {
+	// The refusal fits into a reject message also for the longest name.
+	long := strings.Repeat("n", 32)
+	s.base.Peers = append(s.base.Peers, model.Peer{Name: long, Address: netip.MustParseAddr("10.100.0.4"), WGPublicKey: testPublicKey(t)})
+	if ok, err := ask(helloWith(long, home)); ok || refused(err) != pairing.ReasonNameTaken {
+		t.Errorf("hello with the name of %s: %v, %v", long, ok, err)
+	}
+	s.base.Peers = s.base.Peers[:1]
+	for _, key := range []string{s.base.Self.WGPublicKey, s.sec.TempPublicKey(), s.base.Peers[0].WGPublicKey} {
 		if ok, err := ask(helloWith("home", key)); ok || refused(err) != pairing.ReasonInvalid {
-			t.Errorf("hello with a key of the invite: %v, %v", ok, err)
+			t.Errorf("hello with a key of the invite or of a node: %v, %v", ok, err)
 		}
 	}
 	if s.member != nil {
@@ -1879,7 +1886,7 @@ func TestLeftoverInviteClosed(t *testing.T) {
 		t.Run(strings.Join(cmd, " "), func(t *testing.T) {
 			vps.t = t
 			cfg := vps.config()
-			code, err := pairing.NewCode(cfg.Self.Endpoint, cfg.Self.WGPublicKey, cfg.Network.CIDR, vps.now.Add(pairing.DefaultTTL))
+			code, err := pairing.NewCode(cfg.Self.Endpoint, cfg.Self.WGPublicKey, cfg.Network.CIDR, homeVPN, vps.now.Add(pairing.DefaultTTL))
 			if err != nil {
 				t.Fatal(err)
 			}

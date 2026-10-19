@@ -88,7 +88,7 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	selfAddr, _, err := model.AllocateAddresses(cidr)
+	selfAddr, err := model.FirstHost(cidr)
 	if err != nil {
 		return withCode(ExitUsage, err)
 	}
@@ -130,9 +130,9 @@ func (a *App) cmdInit(ctx context.Context, args []string) error {
 	a.printIptables(ctx, cfg, "  iptables:     ")
 	a.printf("  public key:   %s\n", cfg.Self.WGPublicKey)
 	if ep.IsValid() {
-		a.printf("\nNext: run `sudo meshly invite` on this node and `sudo meshly join` on the other.\n")
+		a.printf("\nNext: run `sudo meshly invite` on this node and `sudo meshly join` on the node to add, once for each node.\n")
 	} else {
-		a.printf("\nNext: once this node has a public endpoint (sudo meshly set endpoint IP), run `sudo meshly invite` on it and `sudo meshly join` on the other.\n")
+		a.printf("\nNext: once this node has a public endpoint (sudo meshly set endpoint IP), run `sudo meshly invite` on it and `sudo meshly join` on the node to add.\n")
 	}
 	return nil
 }

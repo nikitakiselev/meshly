@@ -192,10 +192,10 @@ func (a *App) cmdSet(ctx context.Context, args []string) error {
 			return withCode(ExitUsage, err)
 		}
 		if len(cfg.Peers) > 0 {
-			return errorf(ExitConflict, "the network can only be renumbered before a peer joins (revoke the peer first)")
+			return errorf(ExitConflict, "the network can only be renumbered before a peer joins (revoke the peers first)")
 		}
 		t.Network.CIDR = cidr
-		t.Self.Address, _, _ = model.AllocateAddresses(cidr)
+		t.Self.Address, _ = model.FirstHost(cidr)
 		conflicts = true
 	default:
 		return errorf(ExitUsage, "unknown setting; see `meshly help set`")
@@ -211,7 +211,7 @@ func (a *App) cmdSet(ctx context.Context, args []string) error {
 	}
 	a.printf("Setting %s updated.\n", key)
 	if key == "mtu" {
-		a.printf("Set the same MTU on the peer as well.\n")
+		a.printf("Set the same MTU on the other nodes as well.\n")
 	}
 	return nil
 }

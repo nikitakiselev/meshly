@@ -2,7 +2,7 @@
 
 meshly is a single static Go binary that turns a small declarative
 configuration (`/etc/meshly/meshly.json`) into kernel state on one Linux host:
-a WireGuard interface, its address and host routes, a few per-interface
+a WireGuard interface, its address and routes, a few per-interface
 sysctls, and one nftables table; on a host with Docker networks also one
 policy routing rule and its routing table. Every change runs as a journaled transaction
 that either completes, rolls back, or closes the VPN path (safe mode). This
@@ -14,8 +14,10 @@ documents: [pairing protocol](pairing-protocol.md),
 
 ## Scope
 
-- Exactly two nodes per network in this version (`model.MaxPeers = 1`):
-  typically a VPS with a reachable UDP port and a home server behind NAT.
+- Hub and spokes: the node that created the network, typically a VPS with a
+  reachable UDP port, is the hub. Every other node, for example a server
+  behind NAT, joins through it and has a tunnel to it alone; the nodes that
+  joined do not reach each other (D13).
 - IPv4 inside the VPN (default `10.100.0.0/24`, each node a `/32`).
 - Kernel WireGuard, nftables ≥ 1.0.6, systemd. Target distributions:
   Debian 12 and Ubuntu 24.04 on amd64 and arm64 (what was actually tested
@@ -98,6 +100,10 @@ meshly never runs a shell and never executes user-supplied commands.
   [firewall.md](firewall.md#policy-routing-table-109).
 - **WireGuard**: generic netlink via `wgctrl`. The private key travels only
   over netlink. Each peer gets exactly its `/32` as allowed IP.
+- **Routes**: the VPN network and each peer's `/32` go into the interface,
+  with the node's VPN address as source. A packet for an address of the
+  network that is not a peer meets the firewall there and never leaves
+  through the default route (D13).
 - **nftables**: the fixed binary `/usr/sbin/nft` with fixed argument vectors
   (`--version`, `-c -f -`, `-f -`, `-j list ruleset`), the ruleset on stdin,
   and a minimal environment. Every value in the rendered table is typed and
@@ -313,18 +319,20 @@ disables and removes them.
 
 ## Pairing
 
-The second node joins with a one-time code. `meshly invite`, on the node
-with the public endpoint, prints the code, holds the lock and waits (10
-minutes by default, at most 1 hour). `meshly join`, on the other node, reads
-the code from a prompt or stdin, never from its arguments.
+Every other node joins with a one-time code, one invite per node.
+`meshly invite`, on the node that created the network, prints the code,
+holds the lock and waits (10 minutes by default, at most 1 hour). `meshly
+join`, on the new node, reads the code from a prompt or stdin, never from
+its arguments.
 
 The code carries the inviting node's endpoint and WireGuard public key, the
-network CIDR, the expiry and a 128-bit secret. Both nodes derive a temporary
+network CIDR, the joining node's address (the lowest free one), the expiry
+and a 128-bit secret. Both nodes derive a temporary
 WireGuard key and a preshared key from the secret and build a temporary
 tunnel with them (overlays, see above) through the WireGuard port that is
 already open. Inside it the joining node sends its name and WireGuard public
 key over TCP to the inviting node's VPN address and receives the network's
-settings and its address. Each node then commits the other as its peer in a
+settings. Each node then commits the other as its peer in a
 journaled transaction (`invite` and `join`), the joining node switches to its
 own key and confirms the connection through the real tunnel, and the invite
 closes. If the confirmation does not come, both sides undo the join
@@ -459,7 +467,7 @@ Each entry: context, decision, consequences.
 
 ### D5. IPv4 only inside the VPN
 
-- **Context.** Two nodes need two addresses. Dual-stack policy, router
+- **Context.** A few nodes need a few addresses. Dual-stack policy, router
   advertisements and link-local addresses would double the policy surface.
 - **Decision.** VPN addresses and rules are IPv4. IPv6 on the meshly
   interface is disabled by sysctl and dropped by the table. The outer
@@ -491,8 +499,8 @@ Each entry: context, decision, consequences.
   even for a few minutes, would be new attack surface. The administrator
   should not have to look up or type addresses, ports or keys.
 - **Decision.** The inviting node prints a one-time code with everything the
-  joining node needs: endpoint, WireGuard public key, CIDR, expiry and a
-  128-bit secret. Keys derived from the secret open a temporary WireGuard
+  joining node needs: endpoint, WireGuard public key, CIDR, the joining
+  node's address, expiry and a 128-bit secret. Keys derived from the secret open a temporary WireGuard
   tunnel to the WireGuard port that is already open, and the two nodes
   exchange keys and settings inside it, over TCP on the inviting node's VPN
   address. The code is the only thing the administrator copies, from one
@@ -616,3 +624,31 @@ project owner.
   Docker networks gets exactly the table, sysctls and routes it had before.
   Details: [firewall.md](firewall.md#docker),
   [threat model](threat-model.md).
+
+### D13. Hub and spokes
+
+- **Context.** Monitoring setups need more than two servers: a VPS whose
+  exporters other servers scrape, or several servers behind NAT that one
+  public server collects from. A full mesh would make every node exchange
+  keys with every other and find endpoints between nodes behind NAT, and
+  each node would have more peers to trust.
+- **Decision.** The node that created the network, the one with the first
+  host address of the CIDR, is the hub and the only node that invites. It
+  gives each new node the lowest free address, which the invite code carries
+  (format `m2`), and keeps one peer per node. A node that joined knows only
+  the hub: one peer, one host route. Policy stays per peer and local, so the
+  hub decides for each node which of its services it may use. The hub never
+  forwards between nodes: `from_vpn` admits only packets for its own VPN
+  address, and `guard_fwd` drops forwarding from and into the tunnel apart
+  from the Docker paths of D12. Every node routes the whole VPN network into
+  its interface, so a packet for an address that is not a peer meets the
+  firewall's drop in `to_vpn` instead of leaving through the default route
+  unencrypted. An address that `revoke` frees goes to the next node.
+- **Consequences.** A node is added with one invite on the hub and one join
+  on the new node; the other nodes are not touched and stay connected. Two
+  nodes that joined cannot talk to each other through meshly. The hub is a
+  single point: without it no node reaches another, and a compromised hub
+  reaches what every node allows it ([threat model](threat-model.md)).
+  `m1` codes of meshly 0.0.5 and earlier are refused, so the inviting and
+  the joining node need the same version; nodes that joined before keep
+  working without an upgrade.

@@ -122,13 +122,18 @@ func FuzzParseCIDR(f *testing.F) {
 		if err != nil || again != p {
 			t.Fatalf("round trip of %s: %s, %v", p, again, err)
 		}
-		a, b, err := AllocateAddresses(p)
+		first, err := FirstHost(p)
 		if err != nil {
-			t.Fatalf("AllocateAddresses(%s): %v", p, err)
+			t.Fatalf("FirstHost(%s): %v", p, err)
 		}
-		for _, x := range []netip.Addr{a, b} {
+		c := &Config{Network: Network{CIDR: p}, Self: Self{Address: first}}
+		next, ok := c.NextAddress()
+		if !ok || next == first {
+			t.Fatalf("NextAddress in %s after %s = %s, %v", p, first, next, ok)
+		}
+		for _, x := range []netip.Addr{first, next} {
 			if err := ValidateHostAddress(p, x); err != nil {
-				t.Fatalf("AllocateAddresses(%s) gave unusable %s: %v", p, x, err)
+				t.Fatalf("%s: allocated %s is not a usable host: %v", p, x, err)
 			}
 		}
 		if cs := FindConflicts(p, []UsedPrefix{{Prefix: p, Source: "self"}}); len(cs) != 1 {

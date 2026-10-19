@@ -32,12 +32,13 @@ Examples:
   meshly init homelab --name vps --endpoint 203.0.113.10`,
 	"invite": `meshly invite [--ttl DURATION]
 
-Wait for the second node to join this network. Prints a one-time code, then
+Wait for a new node to join this network. Prints a one-time code, then
 waits until a node joins with it, the code expires or Ctrl+C. Run it on the
-node the other one reaches over UDP (it needs a public endpoint). Nothing new
-is reachable meanwhile, from the internet or by local users: the exchange
-runs through the WireGuard port, over a temporary peer that only the code
-unlocks.
+node that created the network (it needs a public endpoint), once for each
+node to add: every node joins through it, and the nodes that joined reach
+only it. Nothing new is reachable meanwhile, from the internet or by local
+users: the exchange runs through the WireGuard port, over a temporary peer
+that only the code unlocks.
 
   --ttl DURATION   how long the code is valid (default 10m, 1m to 1h)
 
@@ -90,13 +91,13 @@ service are dropped as well.`,
 	"status":  "meshly status [--json]\n\nShow saved configuration, interface, peer, routes, firewall, last handshake,\ntransfer counters, interrupted operations and drift. Runs without root with\nreduced detail.",
 	"nodes":   "meshly nodes [--json]\n\nList the nodes of the network: name, VPN address, public address, whether\nthe node is connected (from the last WireGuard handshake) and what it may\nuse on this node. Without root the connection is unknown.",
 	"ping":    "meshly ping [<node>] [-c N] [--json]\n\nSend N (default 4) ICMP echo requests to the node through the VPN, from\nthis node's VPN address. <node> is a name or a VPN address; without it, the\nonly other node. If no reply comes, meshly says why: no connection at all,\nor a working link whose node does not allow ping\n(`meshly allow ping from <this node>` there). Needs root.\n\nExit codes: 0 at least one reply, 13 no reply.",
-	"doctor":  "meshly doctor [--json] [--probe <port>/<tcp|udp>] [--peer NAME]\n\nDiagnose problems. Each finding says whether it is observed or inferred.\n--probe connects to the peer's service through the VPN (no port is opened\nlocally).\n\nExit codes: 0 no problems, 11 warnings, 12 problems.",
+	"doctor":  "meshly doctor [--json] [--probe <port>/<tcp|udp>] [--peer NAME]\n\nDiagnose problems. Each finding says whether it is observed or inferred.\n--probe connects to the peer's service through the VPN (no port is opened\nlocally); with several peers, --peer names the one to probe.\n\nExit codes: 0 no problems, 11 warnings, 12 problems.",
 	"start":   "meshly start [--dry-run]\n\nBring the link up from the saved configuration and enable autostart.",
 	"stop":    "meshly stop [--dry-run]\n\nStop the link: traffic path first, protective firewall last. The link stays\nstopped after reboot until `meshly start`.",
 	"restart": "meshly restart\n\nTear the link down and bring it up again.",
 	"set": `meshly set <setting> <value> [--dry-run]
 
-  mtu <1280-8920>                 interface MTU (set the same value on both nodes)
+  mtu <1280-8920>                 interface MTU (set the same value on every node)
   keepalive <seconds>             persistent keepalive towards all peers (0 = off)
   endpoint <IP[:PORT]|auto|none>  this node's public address (used in new invites;
                                   the port defaults to the listen port)

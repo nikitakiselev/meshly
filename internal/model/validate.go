@@ -113,15 +113,13 @@ func ValidateHostAddress(cidr netip.Prefix, a netip.Addr) error {
 	return nil
 }
 
-// AllocateAddresses returns the deterministic addresses for the two nodes:
-// the first and second host of the prefix.
-func AllocateAddresses(cidr netip.Prefix) (first, second netip.Addr, err error) {
+// FirstHost returns the first host address of the prefix: the address of
+// the node that creates the network, through which every other node joins.
+func FirstHost(cidr netip.Prefix) (netip.Addr, error) {
 	if err := ValidateCIDR(cidr); err != nil {
-		return first, second, err
+		return netip.Addr{}, err
 	}
-	first = cidr.Addr().Next()
-	second = first.Next()
-	return first, second, nil
+	return cidr.Addr().Next(), nil
 }
 
 func lastAddr(p netip.Prefix) netip.Addr {

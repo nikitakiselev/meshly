@@ -104,7 +104,7 @@ Firewall
   table inet meshly  present, with the open invite's temporary rules
 Transaction
   none pending; last: init commit at 2026-10-18T20:30:00Z
-Invite open until 2026-10-18T20:40:00Z: waiting for a node to join (run `sudo meshly join` on the other node).
+Invite open until 2026-10-18T20:40:00Z: waiting for a node to join (run `sudo meshly join` on the new node).
 ```
 
 `status --json` then has an `invite` object with `expires_at`. Only the
@@ -192,7 +192,7 @@ never contains private keys.
 | `invite` | An invite is open until the time shown; the drift check is skipped while it waits (info). | *"let it finish, or cancel it with Ctrl+C in its terminal"* |
 | `drift` | The kernel differs from the configuration; the finding lists the differences. | `meshly start` (or wait for the check timer). |
 | `routes` | Routes on the meshly interface that meshly did not create; traffic to them is dropped. | Remove them (`ip route show dev meshly0`). |
-| `mtu` | The interface MTU is larger than the smallest outer MTU minus 80 bytes of WireGuard overhead. | `meshly set mtu <n>` on both nodes. |
+| `mtu` | The interface MTU is larger than the smallest outer MTU minus 80 bytes of WireGuard overhead. | `meshly set mtu <n>` on every node. |
 | `peer` | No peer yet. | `sudo meshly invite` on this node and `sudo meshly join` on the other. |
 | `peer:<name>` | Handshake state of the peer; see [No handshake](#no-handshake). | Depends on the finding. |
 | `policy` | Number of packets from the VPN dropped by the default-deny policy since the table was loaded. | If a peer needs a service: `meshly allow <port>/<proto> from <peer>`. |
@@ -208,6 +208,8 @@ in use).
 
 `meshly doctor --probe <port>/<tcp|udp> [--peer NAME]` connects from this
 node's VPN address to the peer's VPN address. It opens no listening port.
+With several peers, `--peer` names the one to probe (exit code 2 without
+it).
 
 | Result | Meaning |
 |---|---|
@@ -420,7 +422,8 @@ Run `sudo meshly doctor` on both nodes and look at `peer:<name>`:
    or the peer revoked this node. Check the peer with `meshly status`; fix the
    endpoint with `meshly set peer-endpoint`.
 4. *No handshake yet and no traffic was attempted*. Generate traffic, for
-   example with `meshly doctor --probe 22/tcp`, or wait for the keepalive.
+   example with `meshly doctor --probe 22/tcp --peer home`, or wait for the
+   keepalive.
 
 `sudo wg show meshly0` is a safe read-only cross-check. Do not change the
 interface with `wg set`: meshly treats it as drift and reverts it.

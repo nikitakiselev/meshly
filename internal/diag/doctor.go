@@ -152,7 +152,7 @@ func RunDoctor(ctx context.Context, d Deps, sys *preflight.System, probe *Probe)
 	}
 	checkMTU(doc, cfg)
 	if len(cfg.Peers) == 0 {
-		doc.add("peer", "info", Fact, "no peer yet", "run `sudo meshly invite` on this node and `sudo meshly join` on the other")
+		doc.add("peer", "info", Fact, "no peer yet", "run `sudo meshly invite` on this node and `sudo meshly join` on the new one")
 	}
 	for _, p := range st.Peers {
 		peerFindings(doc, cfg, st, p)
@@ -209,7 +209,7 @@ func peerFindings(doc *Doctor, cfg *model.Config, st *Status, p PeerInfo) {
 				fmt.Sprintf("handshake initiations are sent to %s but nothing comes back", p.ConfiguredEndpoint),
 				"possible causes (meshly cannot tell them apart from here): the peer is down, UDP is blocked on the path or by the peer's cloud firewall, the endpoint is wrong (`meshly set peer-endpoint`), or the peer revoked this node")
 		default:
-			doc.add(id, "warn", Possible, "no handshake yet and no traffic was attempted", "generate traffic (e.g. `meshly doctor --probe 22/tcp`) or wait for keepalive")
+			doc.add(id, "warn", Possible, "no handshake yet and no traffic was attempted", "generate traffic (e.g. `meshly doctor --probe 22/tcp --peer "+p.Name+"`) or wait for keepalive")
 		}
 	}
 	if st.Firewall != nil && st.Firewall.DeniedPkts != nil && *st.Firewall.DeniedPkts > 0 {
@@ -316,7 +316,7 @@ func checkMTU(doc *Doctor, cfg *model.Config) {
 		}
 	}
 	if minOuter > 0 && cfg.Interface.MTU > minOuter-80 {
-		doc.add("mtu", "warn", Likely, fmt.Sprintf("interface MTU %d is larger than the smallest outer MTU %d minus WireGuard overhead (80)", cfg.Interface.MTU, minOuter), fmt.Sprintf("meshly set mtu %d   (on both nodes)", minOuter-80))
+		doc.add("mtu", "warn", Likely, fmt.Sprintf("interface MTU %d is larger than the smallest outer MTU %d minus WireGuard overhead (80)", cfg.Interface.MTU, minOuter), fmt.Sprintf("meshly set mtu %d   (on every node)", minOuter-80))
 	}
 }
 

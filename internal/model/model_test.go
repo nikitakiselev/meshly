@@ -35,6 +35,15 @@ func validConfig() *Config {
 	}
 }
 
+// gamma is a third node, 10.100.0.3, changed by mutate when it is not nil.
+func gamma(mutate func(p *Peer)) Peer {
+	p := Peer{Name: "gamma", Address: netip.MustParseAddr("10.100.0.3"), WGPublicKey: b64(5, 32), Keepalive: DefaultKeepalive}
+	if mutate != nil {
+		mutate(&p)
+	}
+	return p
+}
+
 func TestConfigValidateValid(t *testing.T) {
 	variants := map[string]func(c *Config){
 		"full":               func(*Config) {},
@@ -48,6 +57,10 @@ func TestConfigValidateValid(t *testing.T) {
 		"lowest mark bit":    func(c *Config) { c.Firewall.Mark = 1 },
 		"same port both ways": func(c *Config) {
 			c.Rules = []Rule{{Peer: "beta", Proto: ProtoTCP, Port: 53}, {Peer: "beta", Proto: ProtoUDP, Port: 53}}
+		},
+		"several peers": func(c *Config) {
+			c.Peers = append(c.Peers, gamma(nil))
+			c.Rules = append(c.Rules, Rule{Peer: "gamma", Proto: ProtoTCP, Port: 22})
 		},
 	}
 	for name, mutate := range variants {
@@ -90,11 +103,11 @@ func TestConfigValidateInvalid(t *testing.T) {
 		{"profile empty", func(c *Config) { c.Firewall.Profile = "" }, "firewall.profile"},
 		{"mark zero", func(c *Config) { c.Firewall.Mark = 0 }, "firewall.mark"},
 		{"mark two bits", func(c *Config) { c.Firewall.Mark = 0x30000000 }, "firewall.mark"},
-		{"two peers", func(c *Config) {
-			p := c.Peers[0]
-			p.Name, p.Address, p.WGPublicKey = "gamma", netip.MustParseAddr("10.100.0.3"), b64(5, 32)
-			c.Peers = append(c.Peers, p)
-		}, "at most 1 peer"},
+		{"peer name equals another peer", func(c *Config) { c.Peers = append(c.Peers, gamma(func(p *Peer) { p.Name = "beta" })) }, `peers[1].name "beta" is not unique`},
+		{"peer address equals another peer", func(c *Config) {
+			c.Peers = append(c.Peers, gamma(func(p *Peer) { p.Address = netip.MustParseAddr("10.100.0.2") }))
+		}, "peers[1].address 10.100.0.2 is not unique"},
+		{"peer wg key equals another peer", func(c *Config) { c.Peers = append(c.Peers, gamma(func(p *Peer) { p.WGPublicKey = b64(3, 32) })) }, "peers[1].wg_public_key is not unique"},
 		{"peer name invalid", func(c *Config) { c.Peers[0].Name = "-x" }, "peers[0].name"},
 		{"peer name equals self", func(c *Config) { c.Peers[0].Name = "alpha"; c.Rules = nil }, `peers[0].name "alpha" is not unique`},
 		{"peer address equals self", func(c *Config) { c.Peers[0].Address = c.Self.Address }, "peers[0].address 10.100.0.1 is not unique"},

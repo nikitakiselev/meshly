@@ -17,9 +17,13 @@ const testKey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
 
 var testExp = time.Date(2026, 10, 18, 20, 40, 0, 0, time.UTC)
 
+// testJoiner is the joining node's address in the codes of the tests: not
+// the second host, as for a network whose second host is taken.
+var testJoiner = netip.MustParseAddr("10.100.0.3")
+
 func mustCode(t *testing.T, ep string) *Code {
 	t.Helper()
-	c, err := NewCode(netip.MustParseAddrPort(ep), testKey, netip.MustParsePrefix("10.100.0.0/24"), testExp)
+	c, err := NewCode(netip.MustParseAddrPort(ep), testKey, netip.MustParsePrefix("10.100.0.0/24"), testJoiner, testExp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +31,7 @@ func mustCode(t *testing.T, ep string) *Code {
 }
 
 func TestCodeRoundTrip(t *testing.T) {
-	re := regexp.MustCompile(`^m1[a-z2-7]+$`)
+	re := regexp.MustCompile(`^m2[a-z2-7]+$`)
 	for _, tc := range []struct {
 		ep  string
 		len int
@@ -48,8 +52,9 @@ func TestCodeRoundTrip(t *testing.T) {
 			t.Fatalf("%s: round trip mismatch:\n got %+v\nwant %+v", tc.ep, got, c)
 		}
 		inv, joi := got.Addresses()
-		if inv != netip.MustParseAddr("10.100.0.1") || joi != netip.MustParseAddr("10.100.0.2") {
-			t.Fatalf("%s: addresses %s %s", tc.ep, inv, joi)
+		if inv != netip.MustParseAddr("10.100.0.1") || joi != netip.MustParseAddr("10.100.0.3") ||
+			got.CIDR != netip.MustParsePrefix("10.100.0.0/24") {
+			t.Fatalf("%s: addresses %s %s in %s", tc.ep, inv, joi, got.CIDR)
 		}
 	}
 }
@@ -57,14 +62,24 @@ func TestCodeRoundTrip(t *testing.T) {
 func TestNewCodeRejects(t *testing.T) {
 	ep := netip.MustParseAddrPort("203.0.113.10:51820")
 	cidr := netip.MustParsePrefix("10.100.0.0/24")
+	joiner := func(a string) (*Code, error) { return NewCode(ep, testKey, cidr, netip.MustParseAddr(a), testExp) }
 	for name, f := range map[string]func() (*Code, error){
-		"endpoint": func() (*Code, error) { return NewCode(netip.AddrPort{}, testKey, cidr, testExp) },
+		"endpoint": func() (*Code, error) { return NewCode(netip.AddrPort{}, testKey, cidr, testJoiner, testExp) },
 		"port 0": func() (*Code, error) {
-			return NewCode(netip.MustParseAddrPort("203.0.113.10:0"), testKey, cidr, testExp)
+			return NewCode(netip.MustParseAddrPort("203.0.113.10:0"), testKey, cidr, testJoiner, testExp)
 		},
-		"key":    func() (*Code, error) { return NewCode(ep, "nope", cidr, testExp) },
-		"cidr":   func() (*Code, error) { return NewCode(ep, testKey, netip.MustParsePrefix("10.0.0.0/8"), testExp) },
-		"expiry": func() (*Code, error) { return NewCode(ep, testKey, cidr, time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)) },
+		"key": func() (*Code, error) { return NewCode(ep, "nope", cidr, testJoiner, testExp) },
+		"cidr": func() (*Code, error) {
+			return NewCode(ep, testKey, netip.MustParsePrefix("10.0.0.0/8"), netip.MustParseAddr("10.0.0.2"), testExp)
+		},
+		"expiry": func() (*Code, error) {
+			return NewCode(ep, testKey, cidr, testJoiner, time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC))
+		},
+		"joiner outside":           func() (*Code, error) { return joiner("10.100.1.3") },
+		"joiner is the inviter":    func() (*Code, error) { return joiner("10.100.0.1") },
+		"joiner network address":   func() (*Code, error) { return joiner("10.100.0.0") },
+		"joiner broadcast address": func() (*Code, error) { return joiner("10.100.0.255") },
+		"joiner missing":           func() (*Code, error) { return NewCode(ep, testKey, cidr, netip.Addr{}, testExp) },
 	} {
 		if c, err := f(); err == nil || c != nil {
 			t.Errorf("%s: got %v, %v; want error", name, c, err)
@@ -74,7 +89,7 @@ func TestNewCodeRejects(t *testing.T) {
 
 func TestNewCodeTruncatesExpiry(t *testing.T) {
 	c, err := NewCode(netip.MustParseAddrPort("203.0.113.10:51820"), testKey,
-		netip.MustParsePrefix("10.100.0.0/24"), testExp.Add(1500*time.Millisecond).In(time.FixedZone("x", 3600)))
+		netip.MustParsePrefix("10.100.0.0/24"), testJoiner, testExp.Add(1500*time.Millisecond).In(time.FixedZone("x", 3600)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,10 +114,10 @@ func TestParseCodeTolerantInput(t *testing.T) {
 // forge builds a code from raw bytes with a valid checksum.
 func forge(body []byte) string {
 	h := sha256.New()
-	h.Write([]byte("meshly-pair/1\x00"))
+	h.Write([]byte("meshly-pair/2\x00"))
 	h.Write(body)
 	raw := append(append([]byte{}, body...), h.Sum(nil)[:4]...)
-	return "m1" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw))
+	return "m2" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw))
 }
 
 func TestParseCodeErrors(t *testing.T) {
@@ -118,7 +133,7 @@ func TestParseCodeErrors(t *testing.T) {
 	body := func(mut func(b []byte)) string {
 		b := []byte{4, 203, 0, 113, 10, 0xCA, 0x6C}
 		b = append(b, bytes.Repeat([]byte{7}, 32)...)
-		b = append(b, 10, 100, 0, 0, 24, 0x69, 0x00, 0x00, 0x00)
+		b = append(b, 10, 100, 0, 3, 24, 0x69, 0x00, 0x00, 0x00)
 		b = append(b, bytes.Repeat([]byte{9}, 16)...)
 		mut(b)
 		return forge(b)
@@ -130,13 +145,19 @@ func TestParseCodeErrors(t *testing.T) {
 	}{
 		{"truncated", s[:len(s)-1], ErrMalformed},
 		{"swapped char", string(swapped), ErrMalformed},
-		{"version", "m2" + s[2:], ErrVersion},
+		{"version 1", "m1" + s[2:], ErrVersion},
+		{"version 3", "m3" + s[2:], ErrVersion},
 		{"empty", "", ErrMalformed},
 		{"garbage", "hello", ErrMalformed},
-		{"prefix only", "m1", ErrMalformed},
+		{"prefix only", "m2", ErrMalformed},
 		{"forged ok layout", body(func(b []byte) {}), nil},
 		{"zero key", body(func(b []byte) { clear(b[7:39]) }), ErrMalformed},
 		{"/8 cidr", body(func(b []byte) { b[43] = 8 }), ErrMalformed},
+		{"/33 cidr", body(func(b []byte) { b[43] = 33 }), ErrMalformed},
+		{"joiner is the inviter", body(func(b []byte) { b[42] = 1 }), ErrMalformed},
+		{"joiner network address", body(func(b []byte) { b[42] = 0 }), ErrMalformed},
+		{"joiner broadcast address", body(func(b []byte) { b[42] = 255 }), ErrMalformed},
+		{"public joiner", body(func(b []byte) { copy(b[39:43], []byte{8, 8, 8, 3}) }), ErrMalformed},
 		{"port 0", body(func(b []byte) { b[5], b[6] = 0, 0 }), ErrMalformed},
 		{"bad family", body(func(b []byte) { b[0] = 5 }), ErrMalformed},
 		{"trailing byte", forge(append([]byte{4, 203, 0, 113, 10, 0xCA, 0x6C}, make([]byte, 80)...)), ErrMalformed},
@@ -184,7 +205,7 @@ func TestPartial(t *testing.T) {
 			t.Errorf("%s: a wrapped start of the code is not partial", ep)
 		}
 	}
-	for _, s := range []string{"garbage", "hello", "m2", "m2aq", "m1a1", "m1ab", "m1aa", "x", "m1a=", "m1 aq!"} {
+	for _, s := range []string{"garbage", "hello", "m1", "m1aq", "m3", "m2a1", "m2ab", "m2aa", "x", "m2a=", "m2 aq!"} {
 		if Partial(s) {
 			t.Errorf("%q is partial", s)
 		}
@@ -236,8 +257,8 @@ func TestSecrets(t *testing.T) {
 }
 
 const (
-	goldenPublic    = "zAE0ndZdbAdgpInrR9cPB7WQFjH7sk4v/uGkoNtOahY="
-	goldenPreshared = "+RbP4ON7ecyDCkq5eJBPVKOIILoEvuTeihnVprBv3DI="
+	goldenPublic    = "eaRZKncuUz6YOlYY9jPnrh47SUJLVKPC3ukulvM8mgs="
+	goldenPreshared = "gMVyfhONv5kmy97O5iV8vDcgtehAYCz+/TjIh5oRVY0="
 )
 
 func TestWipe(t *testing.T) {

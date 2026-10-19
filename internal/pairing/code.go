@@ -1,5 +1,5 @@
-// Package pairing implements the one-time invite code that links two nodes:
-// the code format and the temporary keys derived from its secret.
+// Package pairing implements the one-time invite code that adds a node to a
+// network: the code format and the temporary keys derived from its secret.
 package pairing
 
 import (
@@ -38,8 +38,8 @@ var (
 )
 
 const (
-	prefix    = "m1"
-	domain    = "meshly-pair/1"
+	prefix    = "m2"
+	domain    = "meshly-pair/2"
 	checkLen  = 4
 	secretLen = 16
 	// bodyLen4 and bodyLen6 are the bytes before the checksum, by family.
@@ -55,17 +55,19 @@ type Code struct {
 	Endpoint   netip.AddrPort // inviter's public UDP endpoint
 	InviterKey string         // inviter's WireGuard public key, base64
 	CIDR       netip.Prefix
-	ExpiresAt  time.Time // whole seconds, UTC
+	Joiner     netip.Addr // the joining node's VPN address
+	ExpiresAt  time.Time  // whole seconds, UTC
 	Secret     [secretLen]byte
 }
 
 // NewCode validates the fields and returns a Code with a fresh random
 // secret. expiresAt is truncated to whole seconds.
-func NewCode(endpoint netip.AddrPort, inviterKey string, cidr netip.Prefix, expiresAt time.Time) (*Code, error) {
+func NewCode(endpoint netip.AddrPort, inviterKey string, cidr netip.Prefix, joiner netip.Addr, expiresAt time.Time) (*Code, error) {
 	c := &Code{
 		Endpoint:   endpoint,
 		InviterKey: inviterKey,
 		CIDR:       cidr,
+		Joiner:     joiner,
 		ExpiresAt:  expiresAt.Truncate(time.Second).UTC(),
 	}
 	if err := c.validate(); err != nil {
@@ -87,8 +89,15 @@ func (c *Code) validate() error {
 	if err := model.ValidateWGPublicKey(c.InviterKey); err != nil {
 		return fmt.Errorf("inviter key: %w", err)
 	}
-	if err := model.ValidateCIDR(c.CIDR); err != nil {
+	inviter, err := model.FirstHost(c.CIDR)
+	if err != nil {
 		return fmt.Errorf("CIDR: %w", err)
+	}
+	if err := model.ValidateHostAddress(c.CIDR, c.Joiner); err != nil {
+		return fmt.Errorf("joiner: %w", err)
+	}
+	if c.Joiner == inviter {
+		return errors.New("joiner: the inviter's address")
 	}
 	if u := c.ExpiresAt.Unix(); u < 0 || u > math.MaxUint32 {
 		return errors.New("expiry is out of range")
@@ -119,8 +128,8 @@ func (c *Code) String() string {
 	b = binary.BigEndian.AppendUint16(b, c.Endpoint.Port())
 	key, _ := wgtypes.ParseKey(c.InviterKey)
 	b = append(b, key[:]...)
-	base := c.CIDR.Addr().As4()
-	b = append(b, base[:]...)
+	joiner := c.Joiner.As4()
+	b = append(b, joiner[:]...)
 	b = append(b, byte(c.CIDR.Bits()))
 	b = binary.BigEndian.AppendUint32(b, uint32(c.ExpiresAt.Unix()))
 	b = append(b, c.Secret[:]...)
@@ -214,7 +223,8 @@ func ParseCode(s string, now time.Time) (*Code, error) {
 	}
 	c.Endpoint = netip.AddrPortFrom(ip, binary.BigEndian.Uint16(body))
 	c.InviterKey = wgtypes.Key(body[2:34]).String()
-	c.CIDR = netip.PrefixFrom(netip.AddrFrom4([4]byte(body[34:38])), int(body[38]))
+	c.Joiner = netip.AddrFrom4([4]byte(body[34:38]))
+	c.CIDR = netip.PrefixFrom(c.Joiner, int(body[38])).Masked()
 	c.ExpiresAt = time.Unix(int64(binary.BigEndian.Uint32(body[39:43])), 0).UTC()
 	copy(c.Secret[:], body[43:])
 	if c.validate() != nil {
@@ -227,10 +237,11 @@ func ParseCode(s string, now time.Time) (*Code, error) {
 	return &c, nil
 }
 
-// Addresses returns the VPN addresses of the inviter and the joiner.
+// Addresses returns the VPN addresses of the inviter, the first host of
+// the network, and the joiner.
 func (c *Code) Addresses() (inviter, joiner netip.Addr) {
-	inviter, joiner, _ = model.AllocateAddresses(c.CIDR)
-	return inviter, joiner
+	inviter, _ = model.FirstHost(c.CIDR)
+	return inviter, c.Joiner
 }
 
 // Wipe zeroes the secret.

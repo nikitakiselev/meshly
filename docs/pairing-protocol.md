@@ -1,14 +1,19 @@
-# Pairing protocol (`meshly-pair/1`)
+# Pairing protocol (`meshly-pair/2`)
 
-This document specifies how the second node joins a network. The node with
-a public endpoint (the **inviter**, for example a VPS) runs `meshly invite`,
-which prints a one-time code and waits. The other node (the **joiner**, for
-example a home server) runs `meshly join` and is given the code. The two
-nodes then exchange everything they need through the WireGuard UDP port that
-is already open, inside a temporary WireGuard tunnel that only the code
-unlocks. There is no server, nothing to copy but the code, and nothing new
-is reachable from the internet or by local users, even while the invite
-waits.
+This document specifies how a node joins a network. The node that created
+the network with `meshly init` and has a public endpoint (the **inviter**,
+for example a VPS) runs `meshly invite`, which prints a one-time code and
+waits. The new node (the **joiner**, for example a home server) runs
+`meshly join` and is given the code. The two nodes then exchange everything
+they need through the WireGuard UDP port that is already open, inside a
+temporary WireGuard tunnel that only the code unlocks. There is no server,
+nothing to copy but the code, and nothing new is reachable from the internet
+or by local users, even while the invite waits.
+
+Every node joins through the inviter, one invite per node, and gets a tunnel
+to it alone: the inviter is the hub of the network, and the nodes that
+joined do not know each other. Nodes that joined before stay connected while
+an invite waits.
 
 The implementation is in `internal/pairing` (the code, key derivation and
 messages), `internal/cli/cmd_invite.go` and `internal/cli/cmd_join.go` (the
@@ -21,8 +26,10 @@ See also: [architecture](architecture.md), [threat model](threat-model.md),
 
 ## Overview
 
-The addresses are those of the default network `10.100.0.0/24`: the
-inviter is `10.100.0.1`, the joiner `10.100.0.2`.
+The addresses are those of the default network `10.100.0.0/24` when the
+first node joins: the inviter is `10.100.0.1`, the joiner `10.100.0.2`. A
+later joiner gets the next free address, such as `10.100.0.3`, in place of
+`10.100.0.2`.
 
 ```mermaid
 sequenceDiagram
@@ -92,19 +99,22 @@ The code is the bytes below, followed by a checksum:
 | IP | 4 or 16 | The inviter's public endpoint address |
 | port | 2 | The endpoint's UDP port, big-endian |
 | key | 32 | The inviter's WireGuard public key |
-| CIDR address | 4 | Network address of the VPN CIDR |
+| joiner | 4 | The joiner's VPN address |
 | CIDR bits | 1 | Prefix length of the VPN CIDR |
 | expiry | 4 | Unix time in seconds (UTC), unsigned big-endian |
 | secret | 16 | The secret `S`, 128 random bits |
-| checksum | 4 | `SHA-256("meshly-pair/1" \|\| 0x00 \|\| all bytes above)[0:4]` |
+| checksum | 4 | `SHA-256("meshly-pair/2" \|\| 0x00 \|\| all bytes above)[0:4]` |
 
-The VPN addresses are not in the code: both nodes derive them from the
-CIDR. The inviter gets the first host address, the joiner the second
-(`model.AllocateAddresses`), for example `10.100.0.1` and `10.100.0.2`.
+The VPN network is the joiner's address with the CIDR bits, for example
+`10.100.0.0/24`. The inviter has the first host address of the network
+(`model.FirstHost`), `10.100.0.1`. It gives the joiner the lowest address
+that no node of the network has (`Config.NextAddress`): `10.100.0.2` for the
+first node to join, `10.100.0.3` for the second, and so on. An address that
+`meshly revoke` freed goes to the next joiner.
 
 ### Text form
 
-The text form is `m1` followed by the bytes in lowercase base32 without
+The text form is `m2` followed by the bytes in lowercase base32 without
 padding. Only `a`–`z` and `2`–`7` follow the prefix, so a double click in a
 terminal selects the whole code. An IPv4 code has 111 characters, an IPv6
 code 130. It cannot be much shorter without a server, because the 32 bytes
@@ -115,13 +125,15 @@ of the inviter's key must be in it.
 - whitespace anywhere and letter case are ignored, and `join` reads a code
   that a paste broke across lines whole (see
   [the joiner](#the-joiner-meshly-join), step 3);
-- `m` followed by a digit other than `1` is a code of another format
-  version: *"the invite code was made by another meshly version; upgrade
-  meshly on both nodes"*;
+- `m` followed by a digit other than `2` is a code of another format
+  version, such as an `m1` code of meshly 0.0.5 and earlier, which had no
+  joiner address: *"the invite code was made by another meshly version;
+  upgrade meshly on both nodes"*;
 - a missing prefix, invalid base32, a wrong length, an unknown family, a
   wrong checksum or an invalid field (the same validators as for the
-  configuration: endpoint, key, CIDR) give *"the invite code is damaged or
-  incomplete"*. The checksum tells a typo or a truncated paste from a valid
+  configuration: endpoint, key, CIDR, and a joiner address that is a host of
+  the network other than the inviter's) give *"the invite code is damaged
+  or incomplete"*. The checksum tells a typo or a truncated paste from a valid
   code. It is not a signature: it protects against mistakes, not against
   someone who writes a different code;
 - the code is refused as *expired* once the joiner's clock is more than
@@ -139,9 +151,9 @@ Each of these refusals exits with code 4, before anything is changed.
 Both nodes derive the same two keys from the secret `S`:
 
 ```
-K_t = HKDF-SHA256(secret = S, salt = none, info = "meshly-pair/1 wireguard-key", 32 bytes)
+K_t = HKDF-SHA256(secret = S, salt = none, info = "meshly-pair/2 wireguard-key", 32 bytes)
       clamped as a Curve25519 private key (RFC 7748)
-PSK = HKDF-SHA256(secret = S, salt = none, info = "meshly-pair/1 preshared-key", 32 bytes)
+PSK = HKDF-SHA256(secret = S, salt = none, info = "meshly-pair/2 preshared-key", 32 bytes)
 ```
 
 - `K_t` is the joiner's **temporary** WireGuard private key. The inviter
@@ -161,17 +173,21 @@ derivation (`TestSecrets`).
    invite ends: `meshly-check.timer` skips its run while it is held, and
    other changing commands exit 6 with *"meshly invite is waiting for a
    node to join until …; let it finish or cancel it with Ctrl+C"*.
-2. Refuse when the network already has a peer (exit 5), when the link is
-   stopped (exit 5, *"run `sudo meshly start` first"*) or when this node
-   has no public endpoint (exit 2, *"… sudo meshly set endpoint IP"*). Run
-   the strict preflight (exit 3), as for `init`.
+2. Refuse on a node that joined the network, whose address is not the
+   first host (exit 5, *"this node joined network … through vps, and new
+   nodes join there: run `sudo meshly invite` on vps"*), when the network
+   has no free address left (exit 5), when the link is stopped (exit 5,
+   *"run `sudo meshly start` first"*) or when this node has no public
+   endpoint (exit 2, *"… sudo meshly set endpoint IP"*). Run the strict
+   preflight (exit 3), as for `init`.
 3. Create the code: the endpoint, the WireGuard public key and the CIDR of
-   the saved configuration, the expiry, and a fresh secret `S`. Derive
-   `K_t` and the PSK.
+   the saved configuration, the joiner's address (the lowest free one), the
+   expiry, and a fresh secret `S`. Derive `K_t` and the PSK.
 4. Apply the temporary state on top of the saved configuration (an engine
-   *overlay*; it is never saved in `meshly.json` and never journaled):
+   *overlay*; it is never saved in `meshly.json` and never journaled). The
+   peers that joined before stay as they are:
    - a WireGuard peer with the public key of `K_t`, the PSK and allowed IP
-     `10.100.0.2/32`, without an endpoint;
+     `10.100.0.2/32`, the joiner's address, without an endpoint;
    - in the firewall table, `10.100.0.2` in `@peers`,
      `10.100.0.2 . tcp . 51820` in `allow_in`, and a rule in `guard_in`
      that drops every packet for TCP 51820 on the VPN address unless it
@@ -193,7 +209,8 @@ Each request is one TCP connection carrying one message (see
 |---|---|---|
 | any | a connection from another address than `10.100.0.2` | none: closed before it is read |
 | waiting | `hello` with the inviter's own name | `reject` `name-taken` |
-| waiting | `hello` with the inviter's key or the public key of `K_t` | `reject` `invalid` |
+| waiting | `hello` with the name of a node that joined before | `reject` `name-taken`, which names `meshly revoke <name>` |
+| waiting | `hello` with the inviter's key, the key of a node that joined before or the public key of `K_t` | `reject` `invalid` |
 | waiting | `hello`, valid | `welcome`; then the joiner is added (below) |
 | waiting | `confirm` | `reject` `invalid` (nobody has joined) |
 | joined | `hello` | `reject` `used` |
@@ -203,8 +220,8 @@ Each request is one TCP connection carrying one message (see
 
 **Adding the joiner.** After the `welcome`, a transaction `invite`
 (direction backward) adds the joiner to the saved configuration: name,
-address `10.100.0.2`, its WireGuard public key, its endpoint if it sent one,
-keepalive 25 seconds. In the kernel, its peer replaces the temporary one,
+the address from the code, its WireGuard public key, its endpoint if it sent
+one, keepalive 25 seconds. In the kernel, its peer replaces the temporary one,
 which goes with its PSK. The allow rule for TCP 51820 stays until the
 confirmation. If the transaction fails, the invite prints the error, puts
 the temporary peer back and keeps waiting.
@@ -251,7 +268,7 @@ joined <name>`, `cancelled`, `expired` or `failed`.
    pasted for nothing.
 3. Read the code: after the prompt `Invite code: ` when stdin and stderr
    are terminals, otherwise from stdin, the first line. While the input so
-   far is the start of a code (`m1`, base32, and fewer characters than its
+   far is the start of a code (`m2`, base32, and fewer characters than its
    family byte implies), `join` reads the next line too, after the prompt
    `> ` on a terminal: a console, a web terminal, a chat or a mail client
    may break the code, and the rest must not end up in the shell. It stops
@@ -270,7 +287,8 @@ joined <name>`, `cancelled`, `expired` or `failed`.
 6. Load this node's WireGuard key, or generate it. If it equals the
    inviter's key in the code, the code was made on this node: exit 4.
 7. Bring up the temporary tunnel through the engine (an overlay, never
-   saved or journaled): `meshly0` with address `10.100.0.2/32` and the
+   saved or journaled): `meshly0` with the joiner's address from the code,
+   `10.100.0.2/32`, and the
    private key `K_t`; one peer, the inviter, with its public key and the
    PSK, endpoint from the code, allowed IP `10.100.0.1/32`, keepalive
    25 seconds; the firewall table with `10.100.0.1` in `@peers` and no
@@ -331,7 +349,7 @@ bytes including the newline (`MaxMessageSize`). Its form is
 type; `ok` has no body. For example:
 
 ```json
-{"type":"hello","hello":{"protocol":"meshly-pair/1","name":"home","wg_public_key":"Z4YzTt5wXZdSfsyoVJhIk0Q8KYaqf3moKZi95pr9DmA="}}
+{"type":"hello","hello":{"protocol":"meshly-pair/2","name":"home","wg_public_key":"Z4YzTt5wXZdSfsyoVJhIk0Q8KYaqf3moKZi95pr9DmA="}}
 ```
 
 The decoder (`strictUnmarshal`) accepts exactly one JSON object and
@@ -357,7 +375,7 @@ code, but the other one may still be malicious.
 
 | Field | Check |
 |---|---|
-| `protocol` | must be `meshly-pair/1` |
+| `protocol` | must be `meshly-pair/2` |
 | `name` | node name: `^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$`, reserved names excluded |
 | `wg_public_key` | the joiner's own WireGuard public key: base64 of 32 bytes, not all zero |
 | `endpoint` | optional; the joiner's public `IP:port` (`--endpoint`). Unspecified, multicast, broadcast, link-local and zoned addresses are refused |
@@ -371,7 +389,7 @@ code, but the other one may still be malicious.
 | `cidr` | private IPv4, canonical, `/16`–`/30`; must equal the code |
 | `mtu` | 1280–8920 |
 | `inviter` | `name`, `address`, `wg_public_key`, `endpoint` (required); the address, key and endpoint must equal the code |
-| `address` | the joiner's VPN address; must equal the code's second host address and differ from the inviter's |
+| `address` | the joiner's VPN address; must equal the address in the code and differ from the inviter's |
 
 **`reject`** (inviter → joiner): `reason` is `name-taken`, `used` or
 `invalid`; `message` is printable ASCII of at most 200 bytes, so a hostile
@@ -461,7 +479,9 @@ While `meshly invite` waits:
   address that arrives on any interface but `meshly0` and `lo` is dropped by
   `guard_pre`, and the allow rule admits only the source `10.100.0.2`.
   WireGuard accepts that source only from the temporary peer, that is, from
-  a holder of `K_t` and the PSK, which only the code yields.
+  a holder of `K_t` and the PSK, which only the code yields. A node that
+  joined before cannot use the invite either: WireGuard drops a packet whose
+  source is not its own address.
 - Local processes reach the VPN address over `lo`, which `guard_pre` lets
   through. Two layers keep them out of the pairing port, root's processes
   included. In `guard_in`, the invite's rule drops every packet for TCP
@@ -497,10 +517,10 @@ unreachable.
 | code | whitespace and letter case ignored | — | unit `TestParseCodeTolerantInput` |
 | code | a code broken across lines is read whole; garbage on the first line is refused at once, a start of a code ended by a blank line or the end of input as incomplete | 4 | unit `TestPartial`, `FuzzParseCode`; CLI `TestJoinCodeWrapped` |
 | code | prefix, base32, length, family, checksum (typo, truncation) | 4 | unit `TestParseCodeErrors`, `FuzzParseCode`; CLI `TestJoinCodeInput`; integration `TestPairingRefusals` |
-| code | fields: endpoint, key, CIDR | 4 | unit `TestParseCodeErrors` |
-| code | another format version | 4 | unit `TestParseCodeErrors`; CLI `TestJoinCodeInput` |
+| code | fields: endpoint, key, CIDR, the joiner's address (a host of the network, not the inviter's) | 4 | unit `TestNewCodeRejects`, `TestParseCodeErrors` |
+| code | another format version, `m1` included | 4 | unit `TestParseCodeErrors`; CLI `TestJoinCodeInput` |
 | code | expired, beyond 5 minutes of clock skew; the message points to this node's clock | 4 | unit `TestParseCodeErrors`; CLI `TestJoinCodeInput`; integration `TestPairingRefusals` |
-| code | round trip, IPv4 (111 characters) and IPv6 (130) | — | unit `TestCodeRoundTrip` |
+| code | round trip, IPv4 (111 characters) and IPv6 (130), with the joiner's address | — | unit `TestCodeRoundTrip` |
 | code | derived keys: fixed test vectors, clamping | — | unit `TestSecrets` |
 | join | the code given as an argument | 2 | CLI `TestJoinCodeInput`; integration `TestPairingRefusals` |
 | join | no code on input | 2 | CLI `TestJoinCodeInput` |
@@ -510,7 +530,7 @@ unreachable.
 | join | already a member of a network | 5 | — |
 | join | the code was made on this node | 4 | — |
 | join | no answer within 30 seconds; nothing changed | 13 | CLI `TestJoinUnreachable`; integration `TestPairingUDPBlocked`, `TestPairingRefusals` |
-| join | name taken | 5 | CLI `TestJoinNameTaken` |
+| join | name taken by the inviter or by a node that joined before | 5 | CLI `TestJoinNameTaken`, `TestJoinNameOfAnotherNode` |
 | join | invite already used | 4 | CLI `TestJoinCodeUsed` |
 | join | malformed or hostile answer | 1 | unit `TestHostilePeer` |
 | join | `welcome` does not match the code | 1 | CLI `TestJoinWelcomeMismatch` |
@@ -521,10 +541,12 @@ unreachable.
 | join | crash in the `join` transaction | — | integration `TestFaultJoin` |
 | invite | not initialized | 9 | CLI `TestInviteRefusals` |
 | invite | arguments, `--ttl` outside 1 minute to 1 hour, no endpoint | 2 | CLI `TestInviteRefusals` |
-| invite | a peer exists; the link is stopped | 5 | CLI `TestInviteRefusals` |
+| invite | the link is stopped | 5 | CLI `TestInviteRefusals` |
+| invite | on a node that joined, also after it revoked the inviter; no free address left | 5 | CLI `TestInviteOnlyOnFirstNode`, `TestInviteNetworkFull` |
+| invite | a node joins a network with peers: the next free address, the peers keep their tunnels and know nothing of it, a freed address given out again | 0 | unit `TestNextAddress`; CLI `TestInviteAddsNode`, `TestRevokeOneOfSeveral`; integration `TestHubAndSpokes` |
 | invite | message size, framing, strict JSON, fields | — | unit `TestHostilePeer`, `TestMessageSizeBoundary`, `FuzzReadRequest` |
 | invite | a connection from another source than the joining node's address, local processes and root included: no answer, the invite waits on | — | unit `TestRenderExclusive`, `TestOverlayPeerAndAllow`, `TestMemoryNetwork`; CLI `TestInviteIgnoresForeignSource`; integration `TestPairingClosedToLocalUsers` |
-| invite | answers per state (name taken, keys of the invite, used, wrong key) | — | CLI `TestInviteSessionAnswers` |
+| invite | answers per state (name taken by the inviter or a node, keys of the invite or of a node, used, wrong key) | — | CLI `TestInviteSessionAnswers` |
 | invite | a confirmation at the deadline counts | — | CLI `TestInviteConfirmAtDeadline` |
 | invite | no confirmation: undo, wait again | — | CLI `TestConfirmFailureRollsBackBoth`; integration `TestFaultJoin` |
 | invite | Ctrl+C | 10 | CLI `TestInviteCancelAndExpiry`; integration `TestPairingCleanup` |

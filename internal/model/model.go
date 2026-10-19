@@ -16,9 +16,6 @@ import (
 // ConfigSchemaVersion is the only supported on-disk config schema.
 const ConfigSchemaVersion = 1
 
-// MaxPeers is the MVP limit: exactly two nodes per network.
-const MaxPeers = 1
-
 // Defaults.
 const (
 	DefaultInterface    = "meshly0"
@@ -58,7 +55,7 @@ type Config struct {
 	Rules         []Rule     `json:"rules"`
 }
 
-// Network describes the VPN network shared by both nodes.
+// Network describes the VPN network shared by its nodes.
 type Network struct {
 	ID   string       `json:"id"`
 	Name string       `json:"name"`
@@ -115,6 +112,24 @@ func (c *Config) Peer(name string) (*Peer, bool) {
 		}
 	}
 	return nil, false
+}
+
+// NextAddress returns the lowest host address of the network that neither
+// this node nor a peer has: the address of the next node to join. An
+// address freed by a revoke is given out again. ok is false when the
+// network is full.
+func (c *Config) NextAddress() (a netip.Addr, ok bool) {
+	used := map[netip.Addr]bool{c.Self.Address: true}
+	for _, p := range c.Peers {
+		used[p.Address] = true
+	}
+	cidr := c.Network.CIDR.Masked()
+	for a = cidr.Addr().Next(); cidr.Contains(a); a = a.Next() {
+		if !used[a] && ValidateHostAddress(cidr, a) == nil {
+			return a, true
+		}
+	}
+	return netip.Addr{}, false
 }
 
 // RulesFor returns the rules referencing the peer.
@@ -178,9 +193,6 @@ func (c *Config) Validate() error {
 	}
 	if err := ValidateMark(c.Firewall.Mark); err != nil {
 		add("firewall.mark: %v", err)
-	}
-	if len(c.Peers) > MaxPeers {
-		add("this version supports at most %d peer (two nodes per network)", MaxPeers)
 	}
 	names := map[string]bool{c.Self.Name: true}
 	addrs := map[netip.Addr]bool{c.Self.Address: true}

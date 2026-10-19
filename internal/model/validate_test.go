@@ -230,52 +230,70 @@ func TestValidateHostAddress(t *testing.T) {
 	}
 }
 
-func TestAllocateAddresses(t *testing.T) {
-	tests := []struct {
-		cidr, first, second string
-	}{
-		{"10.100.0.0/24", "10.100.0.1", "10.100.0.2"},
-		{"10.100.0.0/16", "10.100.0.1", "10.100.0.2"},
-		{"192.168.4.252/30", "192.168.4.253", "192.168.4.254"},
-		{"172.20.8.0/22", "172.20.8.1", "172.20.8.2"},
+func TestFirstHost(t *testing.T) {
+	tests := []struct{ cidr, first string }{
+		{"10.100.0.0/24", "10.100.0.1"},
+		{"10.100.0.0/16", "10.100.0.1"},
+		{"192.168.4.252/30", "192.168.4.253"},
+		{"172.20.8.0/22", "172.20.8.1"},
 	}
 	for _, tt := range tests {
-		p := netip.MustParsePrefix(tt.cidr)
-		a, b, err := AllocateAddresses(p)
-		if err != nil {
-			t.Errorf("AllocateAddresses(%s): %v", tt.cidr, err)
-			continue
-		}
-		if a.String() != tt.first || b.String() != tt.second {
-			t.Errorf("AllocateAddresses(%s) = %s, %s; want %s, %s", tt.cidr, a, b, tt.first, tt.second)
+		a, err := FirstHost(netip.MustParsePrefix(tt.cidr))
+		if err != nil || a.String() != tt.first {
+			t.Errorf("FirstHost(%s) = %s, %v; want %s", tt.cidr, a, err, tt.first)
 		}
 	}
-
-	// Every allowed prefix length yields two distinct usable host addresses.
-	for bits := 16; bits <= 30; bits++ {
-		p := netip.PrefixFrom(netip.MustParseAddr("10.64.0.0"), bits).Masked()
-		a, b, err := AllocateAddresses(p)
-		if err != nil {
-			t.Fatalf("/%d: %v", bits, err)
-		}
-		if a == b {
-			t.Errorf("/%d: identical addresses %s", bits, a)
-		}
-		for _, x := range []netip.Addr{a, b} {
-			if err := ValidateHostAddress(p, x); err != nil {
-				t.Errorf("/%d: allocated %s is not a usable host: %v", bits, x, err)
-			}
-		}
-	}
-
 	for _, bad := range []string{"10.100.0.0/31", "10.100.0.0/15", "8.8.8.0/24", "10.100.0.7/24"} {
-		if _, _, err := AllocateAddresses(netip.MustParsePrefix(bad)); err == nil {
-			t.Errorf("AllocateAddresses(%s) succeeded", bad)
+		if _, err := FirstHost(netip.MustParsePrefix(bad)); err == nil {
+			t.Errorf("FirstHost(%s) succeeded", bad)
 		}
 	}
-	if _, _, err := AllocateAddresses(netip.Prefix{}); err == nil {
-		t.Error("AllocateAddresses(zero) succeeded")
+	if _, err := FirstHost(netip.Prefix{}); err == nil {
+		t.Error("FirstHost(zero) succeeded")
 	}
+}
+
+func TestNextAddress(t *testing.T) {
+	tests := []struct {
+		name  string
+		cidr  string
+		self  string
+		peers []string
+		want  string // "" means the network is full
+	}{
+		{"first join", "10.100.0.0/24", "10.100.0.1", nil, "10.100.0.2"},
+		{"after one peer", "10.100.0.0/24", "10.100.0.1", []string{"10.100.0.2"}, "10.100.0.3"},
+		{"a revoked peer's gap", "10.100.0.0/24", "10.100.0.1", []string{"10.100.0.3", "10.100.0.4"}, "10.100.0.2"},
+		{"unordered peers", "10.100.0.0/24", "10.100.0.1", []string{"10.100.0.3", "10.100.0.2"}, "10.100.0.4"},
+		{"/30 with room", "192.168.4.252/30", "192.168.4.253", nil, "192.168.4.254"},
+		{"/30 full", "192.168.4.252/30", "192.168.4.253", []string{"192.168.4.254"}, ""},
+		{"/29 full", "10.100.0.0/29", "10.100.0.1", []string{"10.100.0.2", "10.100.0.3", "10.100.0.4", "10.100.0.5", "10.100.0.6"}, ""},
+		{"across an octet", "10.100.0.0/23", "10.100.0.1", fill("10.100.0.2", 254), "10.100.1.0"},
+	}
+	for _, tt := range tests {
+		c := &Config{Network: Network{CIDR: netip.MustParsePrefix(tt.cidr)}, Self: Self{Address: netip.MustParseAddr(tt.self)}}
+		for _, a := range tt.peers {
+			c.Peers = append(c.Peers, Peer{Address: netip.MustParseAddr(a)})
+		}
+		got, ok := c.NextAddress()
+		switch {
+		case tt.want == "" && ok:
+			t.Errorf("%s: NextAddress() = %s, want none", tt.name, got)
+		case tt.want != "" && (!ok || got.String() != tt.want):
+			t.Errorf("%s: NextAddress() = %s, %v; want %s", tt.name, got, ok, tt.want)
+		}
+	}
+}
+
+// fill returns n consecutive addresses from first on.
+func fill(first string, n int) []string {
+	a := netip.MustParseAddr(first)
+	var out []string
+	for range n {
+		out = append(out, a.String())
+		a = a.Next()
+	}
+	return out
 }
 
 func TestParseEndpoint(t *testing.T) {

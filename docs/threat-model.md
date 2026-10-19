@@ -14,16 +14,20 @@ Related: [architecture](architecture.md), [firewall](firewall.md),
 
 ## Scope
 
-meshly connects exactly two Linux nodes:
+meshly connects Linux nodes as a hub and spokes:
 
-- usually a VPS with a public UDP endpoint;
-- and a server behind NAT.
+- the hub, usually a VPS with a public UDP endpoint, which created the
+  network;
+- the nodes that joined it, for example servers behind NAT. Each of them
+  has a tunnel to the hub alone.
 
 They are connected over kernel WireGuard, and meshly manages the interface,
 address, routes, per-interface sysctls, one nftables table (`inet meshly`)
 and its systemd units, and on a node with Docker networks one policy routing
 rule and its routing table. The VPN gives each node access only to the
-services the *other* node explicitly allows. It is not a site-to-site VPN:
+services that the node at the other end of its tunnel explicitly allows. The
+nodes that joined do not reach each other: the hub does not forward between
+them. It is not a site-to-site VPN:
 there is no LAN access. The only forwarding is between the tunnel and the
 node's own Docker networks, because meshly treats a container like a program
 on the node: from the peer to a port that Docker publishes on the node and
@@ -38,7 +42,7 @@ node. Nothing else is forwarded in either direction.
 | Policy (allow rules, peer, addresses) | `/etc/meshly/meshly.json`, kernel `inet meshly` table | decides what the peer can reach |
 | Services on each node | local sockets, often bound to `0.0.0.0`, and container ports that Docker publishes | the thing being protected |
 | LAN behind each node | e.g. the home network | must never be reachable through the VPN |
-| Invite code | printed by `meshly invite`, valid once and for 10 minutes by default; then on screens, in clipboards, in whatever it is pasted into | whoever uses it first while the invite is open becomes the peer |
+| Invite code | printed by `meshly invite`, valid once and for 10 minutes by default; then on screens, in clipboards, in whatever it is pasted into | whoever uses it first while the invite is open becomes a node of the network, a peer of the hub |
 | Transaction state | `/var/lib/meshly/` (0700) | recovery |
 | The meshly binary and release key | `/usr/local/bin/meshly`, compiled-in public key | code that runs as root |
 
@@ -85,9 +89,19 @@ Scan the public addresses.
   new socket is on the VPN address; the public address does not accept the
   pairing port; a host with a route to the VPN address through the VPS is
   dropped by `guard_pre`).
+- A packet for an address of the VPN network never leaves unencrypted
+  through another interface while the link is up. The whole network is
+  routed into the meshly interface, where `to_vpn` drops what is not for a
+  peer, such as a node that joined the same hub. *Integration:*
+  `TestHubAndSpokes` (a connection from one node that joined to another
+  fails, and the counter of the first node's drop grows). *Unit:*
+  `TestRoutesCoverTheNetwork`.
 
 **Not protected:**
 
+- packets for VPN addresses while the link is stopped or in safe mode: the
+  interface is gone with its routes, so they follow the host's routing
+  table, like packets for any other address;
 - denial of service (the path can be cut);
 - traffic analysis: endpoints, volume, timing;
 - an attacker who reads or replaces the invite code on its way between the
@@ -211,7 +225,17 @@ peer's configuration does not matter):
   restores the rule (`lan-without-routing-rule`); a local `redirect` on an
   allowed port is dropped by `guard_in` (`local-redirect`).
 - **Revoke ends all access.** Rules are removed first, then the key and the
-  route. *Integration:* `TestPolicy`.
+  route. The other peers stay connected. *Integration:* `TestPolicy`,
+  `TestHubAndSpokes`.
+- **No path to other nodes through the hub.** A compromised node that
+  joined has no key or route for the other nodes that joined, and if it
+  sends packets for them into its tunnel anyway, the hub's `from_vpn`
+  accepts only packets for the hub's own VPN address and drops them before
+  routing, also when the hub forwards IPv4. Each node that joined admits only
+  the hub's address (`@peers`, cryptokey routing). *Integration:*
+  `TestHubAndSpokes` (root on home routes office's address into its tunnel,
+  the vps forwards IPv4: nothing reaches office, and the counter of the
+  vps's drop grows).
 
 **Not protected:**
 
@@ -222,7 +246,11 @@ peer's configuration does not matter):
 - outbound access: allow rules are per node, not per user, so on the
   attacked node any local process, and any container on its Docker
   networks, can still open connections to the services the *compromised*
-  peer allows.
+  peer allows;
+- a compromised hub: it is the peer of every node that joined, so it
+  reaches on each of them what that node allows the hub, and nothing more.
+  The nodes that joined are protected from it as from any peer, and no
+  node reaches another without it.
 
 ### 4. Attacker who obtains or substitutes an invite code
 
@@ -260,6 +288,12 @@ administrator of the joining node a code of their own.
   *Integration:* `TestPairingRefusals` (used code, expired invite, expired
   code; nothing changes on the refused node). *CLI:* `TestJoinCodeUsed`,
   `TestInviteSessionAnswers`, `TestInviteCancelAndExpiry`.
+- **A code cannot take the place of a node.** The joining node gets an
+  address that no node of the network has, and the invite refuses a name or
+  a WireGuard key of a node of the network. A node that joined before
+  cannot use the invite: WireGuard drops what it sends with the joining
+  node's address. *CLI:* `TestInviteSessionAnswers`,
+  `TestJoinNameOfAnotherNode`, `TestInviteAddsNode`.
 - **The joining node talks only to the inviting node of the code.** The code
   carries that node's WireGuard public key, so nobody else can answer
   through the temporary tunnel, and the `welcome` must match the code (CIDR,
@@ -301,6 +335,11 @@ administrator of the joining node a code of their own.
 - **The code where it was copied to.** Scrollback, clipboard history, chat
   logs keep it; it is a credential until the invite closes and useless
   after that.
+- **A freed address.** `revoke` frees the node's VPN address, and the next
+  node that joins gets it. meshly's own rules name nodes and go with the
+  revoked node, but a service that trusts a VPN address in its own
+  configuration, such as an allowlist, then trusts the new node: update it
+  after a revoke.
 
 ### 5. Local unprivileged user on a node
 
@@ -594,12 +633,12 @@ The fault-injection points exist only in builds with the
 ## Out of scope
 
 - **Root compromise of a node.** That node, its keys and its policy are lost.
-  The other node remains protected as described in model 3.
+  The other nodes remain protected as described in model 3.
 - **Kernel or WireGuard implementation bugs, and side channels.**
 - **The journal is not tamper-evident.** `meshly logs` is an audit aid
   against mistakes; root can rewrite it.
-- **More than two nodes, IPv6 inside the tunnel, and per-user policies.**
-  They are not supported in this version.
+- **Connections between nodes that joined (full mesh), IPv6 inside the
+  tunnel, and per-user policies.** They are not supported in this version.
 - **Time.** An invite ends at its expiry by the inviting node's clock; the
   joining node refuses the code more than 5 minutes past the expiry by its
   own clock, to allow for clocks that differ. An attacker who controls a

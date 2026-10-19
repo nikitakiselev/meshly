@@ -19,8 +19,10 @@ logs or JSON output. Private keys are never printed; the invite code is printed 
 
 ## Network setup
 
-The second node joins with a one-time code: run `meshly invite` on the node with the public endpoint and
-`meshly join` on the other one. The protocol behind these commands is specified in
+A network is created on one node with `init`, usually the server whose UDP port is reachable from the internet. Every
+other node joins it with a one-time code: run `meshly invite` on the first node and `meshly join` on the new one, once
+for each node. The first node is the hub: every node that joined has a tunnel to it and to no other node, so the
+nodes that joined do not reach each other. The protocol behind these commands is specified in
 [pairing-protocol.md](pairing-protocol.md).
 
 ### `meshly init <network> --name <node> [--endpoint IP[:PORT]|auto|none] [options]`
@@ -31,9 +33,9 @@ port is reachable from the internet. Keys are generated locally.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--name NAME` | (required) | Node name: `a-z`, `0-9`, `-` |
-| `--endpoint ADDR` | `auto` | Public address the other node connects to: `IP` or `IP:PORT` (numeric; host names are not supported; the port defaults to `--listen-port`), `auto` or `none`. See [Endpoint detection](#endpoint-detection) |
+| `--endpoint ADDR` | `auto` | Public address the other nodes connect to: `IP` or `IP:PORT` (numeric; host names are not supported; the port defaults to `--listen-port`), `auto` or `none`. See [Endpoint detection](#endpoint-detection) |
 | `--listen-port PORT` | endpoint port or `51820` | Local UDP port |
-| `--cidr CIDR` | `10.100.0.0/24` | VPN network: private IPv4, `/16`–`/30`, must not overlap local addresses or routes |
+| `--cidr CIDR` | `10.100.0.0/24` | VPN network: private IPv4, `/16`–`/30`, must not overlap local addresses or routes. It has an address for each node: 254 in a `/24`, 2 in a `/30` |
 | `--mtu N` | `1420` | Interface MTU |
 | `--interface NAME` | `meshly0` | Interface name |
 | `--firewall PROFILE` | `auto` | `auto`, `none` or `nftables`: how a native nftables firewall is integrated; UFW and iptables need nothing. See [firewall.md](firewall.md) |
@@ -46,8 +48,8 @@ top of their `INPUT` and `OUTPUT` chains (and of `FORWARD` while the node has Do
 chains. Docker needs nothing either; a forward chain that may drop container traffic is a warning, never a reason
 to stop (see [firewall.md](firewall.md#docker)).
 
-init ends with what to do next: `sudo meshly invite` on this node and `sudo meshly join` on the other. Without an
-endpoint it says that no other node can join until this node has one (`meshly set endpoint IP`).
+init ends with what to do next: `sudo meshly invite` on this node and `sudo meshly join` on the node to add. Without
+an endpoint it says that no other node can join until this node has one (`meshly set endpoint IP`).
 
 #### Endpoint detection
 
@@ -62,9 +64,14 @@ its own address only with `--endpoint auto`.
 
 ### `meshly invite [--ttl DURATION]`
 
-Waits for the second node to join this network. Run it on the node the other one reaches over UDP: it needs a
-public endpoint (exit code 2 otherwise, with a hint to `meshly set endpoint IP`), a running link (exit code 5 after
-`meshly stop`, with a hint to `meshly start`) and no peer yet (exit code 5; `meshly revoke` the old one first).
+Waits for a new node to join this network. Run it on the node that created the network with `init`; on a node that
+joined, it exits with code 5 and names the node to run it on. It needs a public endpoint (exit code 2 otherwise, with
+a hint to `meshly set endpoint IP`), a running link (exit code 5 after `meshly stop`, with a hint to `meshly start`)
+and a free address in the network (exit code 5; `meshly revoke` a node, or create the network with a larger
+`--cidr`). Nodes that joined before keep working while the invite waits.
+
+The new node gets the lowest free address of the network: `10.100.0.2` for the first, `10.100.0.3` for the second,
+and so on. The code carries it. An address that `meshly revoke` freed goes to the next node that joins.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -73,14 +80,14 @@ public endpoint (exit code 2 otherwise, with a hint to `meshly set endpoint IP`)
 ```console
 $ sudo meshly invite
 Waiting for a node to join network "homelab" until 20:40 UTC (10 minutes). Ctrl+C cancels.
-On the other node run `sudo meshly join` and paste this code:
+On the new node run `sudo meshly join` and paste this code:
 
-m1atfqa4ikzjwg2zywqwljinoqqmmvkznfpk6kh55j6yhwhnxjtxndbo3gzdxpilqkmqaaagdk2uxkasjvuxzmxu2ljlylk2tq5xtgw2omnywbs
+m2atfqa4ikzjwgpbrtj3phaxmxkj7mzkcutbejgrbusyvju73zukbjrppgtl6q4yakmqaaegdk2uxkamwtchm7oqnrrkialyu6jp4zrk7wlzcjm
 
 Node "home" (10.100.0.2) joined. The invite is closed.
 ```
 
-- **Output.** stdout gets the code, alone on one line, and at the end the `Node … joined` line. The code is `m1`
+- **Output.** stdout gets the code, alone on one line, and at the end the `Node … joined` line. The code is `m2`
   followed by lowercase letters and digits, 111 characters for an IPv4 endpoint (130 for IPv6); it is printed once
   and nowhere else. Everything else goes to stderr, including the engine's steps, which the sample leaves out.
 - **While it waits**, a temporary WireGuard peer that only the code unlocks and firewall rules that let just the
@@ -120,7 +127,7 @@ of the input. A first line that cannot become a code is refused at once with exi
 
 ```console
 $ sudo meshly join
-Invite code: m1atfqa4ikzjwg2zywqwljinoqqmmvkznfpk6kh55j6yhwhnxjtxndbo3gzdxpilqkmqaaagdk2uxkasjvuxzmxu2ljlylk2tq5xtgw2omnywbs
+Invite code: m2atfqa4ikzjwgpbrtj3phaxmxkj7mzkcutbejgrbusyvju73zukbjrppgtl6q4yakmqaaegdk2uxkamwtchm7oqnrrkialyu6jp4zrk7wlzcjm
 Connecting to 203.0.113.10:51820...
 Joined network "homelab" as "home" (10.100.0.2).
   peer:  vps 10.100.0.1 via 203.0.113.10:51820
@@ -135,7 +142,7 @@ to stdout; everything else goes to stderr, including the engine's steps, which t
 | Exit code | When | This node |
 |---|---|---|
 | 4 | The code is damaged or incomplete, from another meshly version, expired, or was made on this node; or the invite was already used by another node | unchanged |
-| 5 | This node is already a member of a network, or the name is taken (it is the inviting node's) | unchanged |
+| 5 | This node is already a member of a network, or the name is taken by the inviting node or by a node that joined it (`meshly revoke` that node there first to reuse the name) | unchanged |
 | 13 | The inviting node did not answer within 30 seconds: its invite is closed (expired, cancelled or already used), or UDP to its port does not get through | unchanged |
 | 7 | The connection through the new tunnel could not be confirmed. Run `sudo meshly join` again while the invite is open | rolled back |
 | 10 | Ctrl+C, SIGTERM or a hang-up from the temporary tunnel on (before it, Ctrl+C exits 130 as usual) | unchanged or rolled back |
@@ -206,7 +213,9 @@ Lists the rules of this node, each with its meaning in words.
 ### `meshly revoke <peer> [--yes] [--dry-run]`
 
 Closes all access of the peer first (firewall), then removes it from WireGuard and routing. It asks for
-confirmation unless `--yes` is given. After a revoke, the network can accept a new peer through a new invite.
+confirmation unless `--yes` is given. The other peers stay connected. On the first node, the address of the revoked
+node goes to the next node that joins. A node that revokes the node it joined through is alone; to join again, it
+needs `meshly reset` and a new invite.
 
 ## Link lifecycle
 
@@ -229,7 +238,7 @@ for a running link: a link stopped with `meshly stop` is brought back with `mesh
 
 | Setting | Values | Notes |
 |---|---|---|
-| `mtu` | `1280`–`8920` | Set the same value on both nodes |
+| `mtu` | `1280`–`8920` | Set the same value on every node |
 | `keepalive` | `0`–`3600` seconds | Towards all peers. `0` turns it off (not recommended behind NAT) |
 | `endpoint` | `IP`, `IP:PORT`, `auto` or `none` | This node's public address, used in new invites. A bare IP gets the listen port; `auto` [detects](#endpoint-detection) the address and fails if there is not exactly one |
 | `peer-endpoint` | `<peer> IP`, `<peer> IP:PORT` or `<peer> none` | Where to reach the peer, e.g. after the VPS changed its IP. A bare IP keeps the current port (or gets `51820`) |
@@ -269,13 +278,14 @@ it shows `idle or offline`. `never connected` means no handshake at all. `link s
 on this node. Without root the connection is `unknown`. The public address of a peer is where its packets last came
 from, or the configured endpoint before that. `MAY USE THIS NODE` lists the allow rules of the peer on this node. Under
 the table, meshly prints the next step for each peer: `ping` it, find out why it is not connected, or allow it a
-service.
+service. The first node lists every node of the network; a node that joined lists itself and the first node, because
+it knows no other.
 
 ### `meshly ping [<node>] [-c N] [--json]`
 
 Sends `N` (default 4, `--count` too) ICMP echo requests to another node through the VPN, from this node's VPN
 address, one per second, and waits up to 2 seconds for each reply. `<node>` is a name or a VPN address. Without it,
-meshly pings the only other node. Ctrl+C stops early and still prints the summary. Needs root, because it sends ICMP
+meshly pings the only other node; with several, it asks for one (exit code 2). Ctrl+C stops early and still prints the summary. Needs root, because it sends ICMP
 from a raw socket.
 
 ```
@@ -298,7 +308,8 @@ Exit code 0 means at least one reply. A local failure, such as a missing VPN add
 
 Runs every check and prints one line per finding: `✓` ok, `·` info, `!` warning, `✗` problem. Each finding has
 a certainty: `observed` (a measured fact), `likely` or `possible` (inferred), and a fix where one is known.
-`--probe` connects from this node's VPN address to a service on the peer. For TCP it tells apart "connected",
+`--probe` connects from this node's VPN address to a service on the peer; with several peers, `--peer` names it (exit
+code 2 without it). For TCP it tells apart "connected",
 "refused" (allowed, nothing listens), "timed out with a recent handshake" (the peer's policy does not allow the
 port) and "timed out without a handshake" (peer down or unreachable). For UDP, silence is inconclusive. It opens
 nothing locally. Check ids and runbooks are in
@@ -363,7 +374,7 @@ Exit codes are stable and safe to use in scripts.
 | 2 | usage | Invalid command line |
 | 3 | preflight | Unsupported or unprepared environment. **Nothing was changed** |
 | 4 | invalid-code | Invite code rejected: damaged or incomplete, from another meshly version, expired, made on this node, or already used. Nothing was changed |
-| 5 | conflict | Ownership, address or state conflict (e.g. unknown peer, a peer already exists, the name is taken). Nothing was changed |
+| 5 | conflict | Ownership, address or state conflict (e.g. unknown peer, the name is taken, an invite on a node that joined or in a full network). Nothing was changed |
 | 6 | busy | Another meshly operation holds the lock, for example a waiting `meshly invite` |
 | 7 | rolled-back | Apply failed and the previous configuration is active again (also: upgrade rolled back; `join` rolled back because the new tunnel could not be confirmed) |
 | 8 | safe-mode | Apply and rollback failed: the VPN interface was removed and VPN access is closed |
@@ -417,8 +428,8 @@ An abridged `meshly.status/v1` example:
 }
 ```
 
-`config.wg_public_key` and `peers[].wg_public_key` are the WireGuard public keys; compare them across the two nodes
-to check that each knows the other's key. On a host with UFW, iptables rules or Docker, `firewall.iptables_chains`
+`config.wg_public_key` and `peers[].wg_public_key` are the WireGuard public keys; compare them across two nodes to
+check that each knows the other's key. On a host with UFW, iptables rules or Docker, `firewall.iptables_chains`
 lists the chains that carry meshly's rule (`chain`, `meshly_rule_present`, `meshly_rule_first`). On a node with
 Docker networks, `firewall.docker_networks` lists them, for example `["br-3f1c2a9b7d01", "docker0"]`, and
 `firewall.forward_findings` the forward chains that may drop container traffic, for example `["inet filter forward"]`

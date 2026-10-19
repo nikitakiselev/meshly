@@ -62,7 +62,7 @@ func (a *App) renderNodes(ns *diag.Nodes) {
 	var hints []string
 	peers := ns.Nodes[1:]
 	if len(peers) == 0 {
-		hints = append(hints, "No other node has joined yet. Add one: `sudo meshly invite` here, then `sudo meshly join` on the other node.")
+		hints = append(hints, "No other node has joined yet. Add one: `sudo meshly invite` here, then `sudo meshly join` on the new node.")
 	}
 	for _, n := range peers {
 		switch n.Connection {
@@ -255,7 +255,7 @@ func pingTarget(c *model.Config, args []string) (model.Peer, error) {
 	if len(args) == 0 {
 		switch len(c.Peers) {
 		case 0:
-			return model.Peer{}, errorf(ExitConflict, "no other node has joined this network yet: run `sudo meshly invite` here and `sudo meshly join` on the other node")
+			return model.Peer{}, errorf(ExitConflict, "no other node has joined this network yet: run `sudo meshly invite` here and `sudo meshly join` on the new node")
 		case 1:
 			return c.Peers[0], nil
 		}
