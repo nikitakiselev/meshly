@@ -27,6 +27,54 @@ func writeAt(t *testing.T, root, rel, content string) string {
 	return p
 }
 
+// WireGuard is found loaded or among the modules of the running kernel. A
+// container has neither while its host has not loaded the module, and only
+// the host can load it, so the fix points there.
+func TestCheckWireGuard(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		want  Status
+		fix   []string // substrings of the fix
+		nofix []string
+	}{
+		{name: "loaded", files: map[string]string{"sys/module/wireguard/refcnt": "0\n"}, want: OK},
+		{name: "built in", files: map[string]string{"lib/modules/6.1.0-26-amd64/modules.builtin": "kernel/drivers/net/wireguard/wireguard.ko\n"}, want: OK},
+		{name: "module", files: map[string]string{"lib/modules/6.1.0-26-amd64/modules.dep": "kernel/drivers/net/wireguard/wireguard.ko: kernel/lib/crypto/libchacha.ko\n"}, want: OK},
+		{name: "loaded in a container", files: map[string]string{"sys/module/wireguard/refcnt": "0\n", "run/systemd/container": "lxc\n"}, want: OK},
+		{name: "host without it", want: Fail, fix: []string{"distribution kernel", "modprobe wireguard"}, nofix: []string{"host"}},
+		{
+			name: "container", files: map[string]string{"run/systemd/container": "lxc\n"}, want: Fail,
+			fix:   []string{"on the host", "modprobe wireguard", "/etc/modules-load.d/wireguard.conf"},
+			nofix: []string{"distribution kernel"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			for rel, content := range tc.files {
+				writeAt(t, root, rel, content)
+			}
+			s := &System{Root: root, KernelRe: "6.1.0-26-amd64"}
+			var r Report
+			s.checkWireGuard(&r)
+			if len(r.Checks) != 1 || r.Checks[0].ID != "wireguard" || r.Checks[0].Status != tc.want {
+				t.Fatalf("checks %+v, want one wireguard check %s", r.Checks, tc.want)
+			}
+			c := r.Checks[0]
+			for _, w := range tc.fix {
+				if !strings.Contains(c.Fix, w) {
+					t.Errorf("fix %q lacks %q", c.Fix, w)
+				}
+			}
+			for _, w := range tc.nofix {
+				if strings.Contains(c.Fix, w) {
+					t.Errorf("fix %q has %q", c.Fix, w)
+				}
+			}
+		})
+	}
+}
+
 func TestUFWEnabled(t *testing.T) {
 	tests := []struct {
 		conf string

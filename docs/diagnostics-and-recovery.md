@@ -165,7 +165,7 @@ never contains private keys.
 |---|---|---|
 | `os` | meshly runs only on Linux. | — |
 | `privileges` | Root is needed to inspect kernel state (warning when run without root). | `sudo meshly doctor` |
-| `wireguard` | Kernel WireGuard module loaded or available. | Use the distribution kernel or `modprobe wireguard`; meshly installs no packages. |
+| `wireguard` | Kernel WireGuard module loaded or available. | Use the distribution kernel or `modprobe wireguard`; meshly installs no packages. In a container (LXC on Proxmox, for example), load the module on the host: `modprobe wireguard` there, and `wireguard` in `/etc/modules-load.d/wireguard.conf` to load it at boot. |
 | `nftables` | `/usr/sbin/nft` exists and is version 1.0.6 or newer. | `apt install nftables` |
 | `systemd` | systemd is PID 1; without it there is no autostart. | — |
 | `config` | `/etc/meshly/meshly.json` is valid (or: not initialized). | Restore from `/var/lib/meshly/history/`, or `meshly reset`. Not initialized: `meshly init` or `sudo meshly join`. |

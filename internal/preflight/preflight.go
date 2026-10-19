@@ -163,8 +163,22 @@ func (s *System) checkWireGuard(r *Report) {
 			return
 		}
 	}
+	// A container runs the kernel of its host, without its modules: only
+	// the host can load WireGuard.
+	if c := s.container(); c != "" {
+		r.add("wireguard", Fail, "kernel WireGuard is not loaded, and this "+c+" container cannot load kernel modules",
+			"on the host that runs this container, run `modprobe wireguard`, and `echo wireguard > /etc/modules-load.d/wireguard.conf` to load it at boot")
+		return
+	}
 	r.add("wireguard", Fail, "kernel WireGuard is not available for kernel "+s.KernelRe,
 		"install the distribution kernel (Debian 12 / Ubuntu 24.04 include WireGuard) or run `modprobe wireguard`; meshly does not install packages itself")
+}
+
+// container returns the kind of container systemd detected (lxc, docker),
+// or "" on a host.
+func (s *System) container() string {
+	b, _ := os.ReadFile(s.path("/run/systemd/container"))
+	return strings.TrimSpace(string(b))
 }
 
 func (s *System) checkNft(ctx context.Context, r *Report) {

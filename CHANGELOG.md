@@ -7,6 +7,12 @@ on-disk formats.
 
 ## [Unreleased]
 
+### Fixed
+
+- In a container (LXC on Proxmox, for example) without kernel WireGuard, preflight says to load the module on the
+  host (`modprobe wireguard` there, and `/etc/modules-load.d/wireguard.conf` to load it at boot). It advised to
+  install a kernel or to run `modprobe`, which a container cannot do.
+
 ## [0.0.6] - 2026-10-19
 
 ### Added
