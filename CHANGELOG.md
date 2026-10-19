@@ -7,6 +7,8 @@ on-disk formats.
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-10-19
+
 ### Added
 
 - `meshly-watch.service` applies a new or removed Docker network within seconds, for example after `docker compose up`
@@ -118,7 +120,8 @@ First public release.
 - Signed self-upgrade from GitHub releases (`upgrade`), `install.sh` with signature verification, reproducible
   release builds for linux/amd64 and linux/arm64.
 
-[Unreleased]: https://github.com/nikitakiselev/meshly/compare/v0.0.4...HEAD
+[Unreleased]: https://github.com/nikitakiselev/meshly/compare/v0.0.5...HEAD
+[0.0.5]: https://github.com/nikitakiselev/meshly/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/nikitakiselev/meshly/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/nikitakiselev/meshly/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/nikitakiselev/meshly/compare/v0.0.1...v0.0.2
