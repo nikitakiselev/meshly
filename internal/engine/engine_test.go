@@ -154,6 +154,49 @@ func TestBringUpOrderProtectionFirst(t *testing.T) {
 	}
 }
 
+// The whole VPN network is routed into the interface, not only the peers:
+// a packet for another address of the network, such as a node that joined
+// through the same hub, meets the firewall there instead of leaving through
+// the default route unencrypted. A node set up by a meshly without that
+// route gets it from the next check.
+func TestRoutesCoverTheNetwork(t *testing.T) {
+	v := newEnv(t)
+	c := v.config()
+	v.commit(c)
+	routes := func() []netstack.Route {
+		l, _ := v.k.LinkOps().Observe("meshly0")
+		return l.Routes
+	}
+	self := netip.MustParseAddr("10.100.0.1")
+	want := []netstack.Route{
+		{Dst: netip.MustParsePrefix("10.100.0.0/24"), Src: self},
+		{Dst: netip.MustParsePrefix("10.100.0.2/32"), Src: self},
+	}
+	if got := routes(); !slices.Equal(got, want) {
+		t.Fatalf("routes %v, want %v", got, want)
+	}
+
+	if err := v.k.LinkOps().SyncRoutes("meshly0", want[1:]); err != nil {
+		t.Fatal(err)
+	}
+	if v.drift() == "" {
+		t.Fatal("a missing route for the network is not drift")
+	}
+	if _, err := v.repair(); err != nil {
+		t.Fatal(err)
+	}
+	if got := routes(); !slices.Equal(got, want) {
+		t.Fatalf("routes after the check %v, want %v", got, want)
+	}
+
+	alone := c.Clone()
+	alone.Peers = nil
+	v.commit(alone)
+	if got := routes(); !slices.Equal(got, want[:1]) {
+		t.Fatalf("routes without peers %v, want %v", got, want[:1])
+	}
+}
+
 func TestTeardownOrderTrafficPathFirst(t *testing.T) {
 	v := newEnv(t)
 	c := v.config()
@@ -592,7 +635,7 @@ func TestOverlayPeerAndAllow(t *testing.T) {
 		t.Fatal("preshared key not applied")
 	}
 	l, _ := v.k.LinkOps().Observe("meshly0")
-	if len(l.Routes) != 1 || l.Routes[0].Dst != netip.MustParsePrefix("10.100.0.2/32") {
+	if len(l.Routes) != 2 || l.Routes[1].Dst != netip.MustParsePrefix("10.100.0.2/32") {
 		t.Fatalf("routes %v", l.Routes)
 	}
 	if last := v.k.Scripts[len(v.k.Scripts)-1]; !strings.Contains(last, "10.100.0.2 . tcp . 51820") || !strings.Contains(last, exclusiveRule) {

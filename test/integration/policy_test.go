@@ -108,7 +108,7 @@ func TestPolicy(t *testing.T) {
 		if out := vps.MustSh("wg show meshly0 peers"); strings.TrimSpace(out) != "" {
 			t.Fatalf("peer key still configured after revoke: %q", out)
 		}
-		if out := vps.MustSh("ip route show proto 109"); strings.TrimSpace(out) != "" {
+		if out := vps.MustSh("ip route show proto 109 10.100.0.2/32"); strings.TrimSpace(out) != "" {
 			t.Fatalf("peer route remains after revoke: %q", out)
 		}
 		if r := vps.MustMeshly("rules"); strings.Contains(r.Out, "from home") {

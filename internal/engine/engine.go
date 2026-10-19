@@ -140,6 +140,10 @@ func DesiredWith(cfg *model.Config, ifname string, ov *Overlay, env Env) (*Desir
 	d.Address = netip.PrefixFrom(cfg.Self.Address, 32)
 	d.ListenPort = int(cfg.Self.ListenPort)
 	d.WGPublic = cfg.Self.WGPublicKey
+	// The whole network goes into the interface: a packet for an address
+	// that is no peer meets the firewall's drop there and never leaves
+	// through the default route.
+	d.Routes = append(d.Routes, netstack.Route{Dst: cfg.Network.CIDR, Src: cfg.Self.Address})
 	for _, p := range cfg.Peers {
 		d.Peers = append(d.Peers, wg.DesiredPeer{
 			PublicKey: p.WGPublicKey,

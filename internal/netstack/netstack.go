@@ -46,7 +46,8 @@ type Link struct {
 // Owned reports whether the link carries Meshly's ownership markers.
 func (l Link) Owned() bool { return l.Exists && l.Type == "wireguard" && IsOwnedAlias(l.Alias) }
 
-// Route is an IPv4 host route via the managed interface.
+// Route is an IPv4 route via the managed interface: the VPN network, or a
+// host route to a peer.
 type Route struct {
 	Dst netip.Prefix
 	Src netip.Addr
