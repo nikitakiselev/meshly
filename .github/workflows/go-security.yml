@@ -1,0 +1,31 @@
+name: Go security
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    env:
+      GOTOOLCHAIN: go1.27.3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Test binary scan qualification
+        run: python3 -m unittest discover -s scripts/tests -v
+      - name: Install pinned vulnerability scanner
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+      - name: Scan Linux source for both release architectures
+        working-directory: .
+        run: |
+          go version
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 govulncheck ./...
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 govulncheck ./...

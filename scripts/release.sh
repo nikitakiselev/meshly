@@ -6,9 +6,12 @@
 # Requirements: a clean work tree, tag v<version> on HEAD (created here if
 # missing), CHANGELOG.md with a "## [<version>]" section, the private
 # release key (see tools/release; default ~/.config/meshly-release/release.key)
-# and an authenticated gh CLI. The private key never leaves this machine;
+# Python 3 and an authenticated gh CLI. The private key never leaves this machine;
 # GitHub only receives the signed artifacts.
 set -eu
+
+# Keep local release builds on the reviewed security toolchain.
+export GOTOOLCHAIN=go1.27.3
 
 die() { printf 'release: %s\n' "$*" >&2; exit 1; }
 
@@ -34,7 +37,17 @@ else
 	git tag -a "v$V" -m "meshly $V"
 fi
 
+# Scan the exact Linux source and built artifacts before signing or publishing.
+SCAN_DIR=$(mktemp -d)
+trap 'rm -rf "$SCAN_DIR"' EXIT HUP INT TERM
+GOBIN="$SCAN_DIR" go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 "$SCAN_DIR/govulncheck" ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$SCAN_DIR/govulncheck" ./...
 make dist VERSION="$V" COMMIT="$(git rev-parse --short=12 HEAD)"
+for bin in dist/meshly-"$V"-linux-amd64 dist/meshly-"$V"-linux-arm64; do
+    go version -m "$bin"
+    GOVULNCHECK="$SCAN_DIR/govulncheck" python3 scripts/scan-binary.py "$bin"
+done
 make sign
 for f in dist/meshly-"$V"-linux-amd64 dist/meshly-"$V"-linux-arm64 dist/install.sh dist/SHA256SUMS dist/SHA256SUMS.sig; do
 	[ -s "$f" ] || die "missing $f"
