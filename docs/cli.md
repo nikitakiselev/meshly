@@ -337,8 +337,10 @@ The upgrade runs these steps:
 3. Download the binary for this architecture and check its SHA-256.
 4. Run the new binary to check that it reports the expected version.
 5. Replace the executable atomically, keeping the previous one as `<exe>.prev`.
-6. Reinstall the units and restart `meshly.service`. If the service does not come back, the previous binary is
-   restored and restarted, and the command exits with code 7.
+6. Reinstall the units. If `meshly.service` was running before replacement, restart it and verify it is active.
+   If it fails, restore the previous binary and restart and verify it even if the new unit is now failed.
+   Code 7 means the previous version is running again; a failed restoration returns an error. An intentionally
+   stopped service remains stopped.
 
 `--check` only reports whether a newer release exists. Downgrades are refused unless `--force` is given (exit code
 5). The version is taken only from the signed `SHA256SUMS`, so an old signed release cannot be replayed as a new
@@ -350,11 +352,16 @@ unchanged.
 Stops the link and removes the configuration, keys, runtime state, configuration history and units from this node.
 The binary and the operation journal stay. If `/etc/iptables/rules.v4` or `rules.v6` still contains meshly's iptables
 rule (saved with `netfilter-persistent save`), `reset` warns: run `sudo netfilter-persistent save` again.
+With a missing or unreadable configuration, owned WireGuard interfaces are discovered by their ownership markers,
+including custom names. Their traffic paths close before the shared firewall is removed. A failure keeps firewall
+protection and reports failure; foreign interfaces remain untouched.
 
 ### `meshly recover`
 
 Finishes or rolls back an operation interrupted by a crash or power loss. Every command does this first, so this
 command is rarely needed by hand.
+Safe mode leaves the transaction pending until recovery saves and applies its intended configuration. A pending
+access-removing operation completes before drift repair can restore any older configuration.
 
 ### `meshly service start|stop|reload|check|install|watch`
 

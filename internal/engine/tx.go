@@ -63,7 +63,7 @@ func (e *ApplyError) Error() string {
 		if e.Detail != nil {
 			msg += fmt.Sprintf(" (additional errors: %v)", e.Detail)
 		}
-		return msg + "; run `meshly doctor` to find the cause and `meshly start` to retry now (while meshly.service is active, its check timer also retries the saved configuration every minute)"
+		return msg + "; run `meshly doctor` to find the cause and `meshly start` to retry now (while meshly.service is active, its check timer also retries pending recovery and the saved configuration every minute)"
 	}
 	return e.Cause.Error()
 }
@@ -158,7 +158,8 @@ func (e *Engine) Execute(ctx context.Context, j *journal.Journal, op Op) (*Resul
 	}
 	begin := journal.Record{
 		OpID: opID, Event: journal.EventBegin, Op: op.Name, Args: op.Args, Actor: op.Actor,
-		Recovery: op.Recovery, Target: op.Target, TargetAbsent: op.Target == nil,
+		Recovery: op.Recovery, Base: op.Base, BaseAbsent: op.Base == nil,
+		Target: op.Target, TargetAbsent: op.Target == nil,
 		Interface: ifname, Plan: names,
 	}
 	if op.Base != nil {
@@ -168,9 +169,13 @@ func (e *Engine) Execute(ctx context.Context, j *journal.Journal, op Op) (*Resul
 		return nil, fmt.Errorf("cannot write transaction journal, nothing changed: %w", err)
 	}
 	fail := func(cause error) (*Result, error) {
-		if docker && !errors.Is(cause, ErrConflict) && e.withoutDocker(ctx, j, op, opID, ifname, cause) == nil {
-			res.WithoutDocker = cause
-			return res, nil
+		if docker && !errors.Is(cause, ErrConflict) {
+			if err := e.withoutDocker(ctx, j, op, opID, ifname, cause); err == nil {
+				res.WithoutDocker = cause
+				return res, nil
+			} else {
+				cause = errors.Join(cause, err)
+			}
 		}
 		return res, e.fail(ctx, j, op, opID, ifname, cause)
 	}
@@ -205,7 +210,7 @@ func (e *Engine) Execute(ctx context.Context, j *journal.Journal, op Op) (*Resul
 		return fail(err)
 	}
 	if err := j.Append(journal.Record{OpID: opID, Event: journal.EventCommit, Op: op.Name}); err != nil {
-		return res, fmt.Errorf("changes applied but the journal commit failed: %w", err)
+		return fail(fmt.Errorf("changes applied but the journal commit failed: %w", err))
 	}
 	return res, nil
 }
@@ -229,8 +234,7 @@ func (e *Engine) withoutDocker(ctx context.Context, j *journal.Journal, op Op, o
 	if err != nil {
 		return err
 	}
-	_ = j.Append(journal.Record{OpID: opID, Event: journal.EventCommit, Op: op.Name, Detail: WithoutDockerDetail + cause.Error()})
-	return nil
+	return j.Append(journal.Record{OpID: opID, Event: journal.EventCommit, Op: op.Name, Detail: WithoutDockerDetail + cause.Error()})
 }
 
 // reconcileWithout applies cfg plus ov as on a node without Docker
@@ -263,12 +267,14 @@ func (e *Engine) fail(ctx context.Context, j *journal.Journal, op Op, opID, ifna
 			err = e.persist(op.Target)
 		}
 		if err == nil {
-			_ = j.Append(journal.Record{OpID: opID, Event: journal.EventCommit, Op: op.Name, Detail: "completed after retry: " + cause.Error()})
+			if err := j.Append(journal.Record{OpID: opID, Event: journal.EventCommit, Op: op.Name, Detail: "completed after retry: " + cause.Error()}); err != nil {
+				return fmt.Errorf("access-reducing changes applied but the journal commit failed: %w", err)
+			}
 			return nil
 		}
 		smErr := e.SafeMode(ctx, op.Target, ifname)
-		_ = j.Append(journal.Record{OpID: opID, Event: journal.EventSafeMode, Op: op.Name, Detail: errors.Join(cause, smErr).Error()})
-		return &ApplyError{Cause: cause, SafeMode: true, Forward: true, Detail: smErr}
+		_ = j.Append(journal.Record{OpID: opID, Event: journal.EventSafeMode, Op: op.Name, Recovery: op.Recovery, Detail: errors.Join(cause, err, smErr).Error()})
+		return &ApplyError{Cause: cause, SafeMode: true, Forward: true, Detail: errors.Join(err, smErr)}
 	}
 	e.progress("apply failed (%v); rolling back", cause)
 	_, err := e.retry(ctx, op.Base, ifname)
@@ -282,7 +288,7 @@ func (e *Engine) fail(ctx context.Context, j *journal.Journal, op Op, opID, ifna
 		return &ApplyError{Cause: cause, RolledBack: true}
 	} else {
 		smErr := e.SafeMode(ctx, op.Base, ifname)
-		_ = j.Append(journal.Record{OpID: opID, Event: journal.EventSafeMode, Op: op.Name, Detail: errors.Join(cause, err, smErr).Error()})
+		_ = j.Append(journal.Record{OpID: opID, Event: journal.EventSafeMode, Op: op.Name, Recovery: op.Recovery, Detail: errors.Join(cause, err, smErr).Error()})
 		return &ApplyError{Cause: cause, SafeMode: true, Detail: errors.Join(err, smErr)}
 	}
 }
@@ -316,29 +322,37 @@ func (e *Engine) Recover(ctx context.Context, j *journal.Journal) (*RecoveryResu
 	if ifname == "" {
 		ifname = ifnameOf(inc.Target)
 	}
-	cur, err := e.Paths.LoadConfig()
-	switch {
-	case errors.Is(err, store.ErrNotInitialized):
-		cur = nil
-	case err != nil && !errors.Is(err, fs.ErrNotExist):
-		smErr := e.SafeMode(ctx, nil, ifname)
-		_ = j.Append(journal.Record{OpID: inc.OpID, Event: journal.EventSafeMode, Op: inc.Op, Detail: errors.Join(err, smErr).Error()})
-		return &RecoveryResult{Op: inc.Op, OpID: inc.OpID, Mode: "safe-mode"}, fmt.Errorf("recovery: cannot load config: %w", err)
-	}
-	committed := (inc.TargetAbsent && cur == nil) || (inc.Target != nil && cur != nil && cur.Revision == inc.Target.Revision && SameConfig(cur, inc.Target))
-	target := cur
+	// The journal is authoritative until commit. New backward records carry
+	// their base so a failed save or failed rollback cannot resurrect a grant.
+	// Legacy backward records retain their saved-config recovery semantics.
+	var target *model.Config
 	mode := "rolled-back"
+	forward := inc.Recovery == journal.Forward
+	needsSave := forward || inc.Base != nil || inc.BaseAbsent
 	switch {
-	case committed && inc.Recovery == journal.Forward:
-		// The target was written ahead; the kernel may still lag behind.
-		mode = "rolled-forward"
-	case committed:
-		mode = "completed"
-	case inc.Recovery == journal.Forward:
-		mode = "rolled-forward"
-		target = inc.Target
+	case forward:
+		target, mode = inc.Target, "rolled-forward"
+	case inc.Base != nil || inc.BaseAbsent:
+		target = inc.Base
+	default:
+		cur, loadErr := e.Paths.LoadConfig()
+		if loadErr != nil && !errors.Is(loadErr, store.ErrNotInitialized) && !errors.Is(loadErr, fs.ErrNotExist) {
+			smErr := e.SafeMode(ctx, nil, ifname)
+			_ = j.Append(journal.Record{OpID: inc.OpID, Event: journal.EventSafeMode, Op: inc.Op, Recovery: inc.Recovery, Detail: errors.Join(loadErr, smErr).Error()})
+			return &RecoveryResult{Op: inc.Op, OpID: inc.OpID, Mode: "safe-mode"}, fmt.Errorf("recovery: cannot load config: %w", loadErr)
+		}
+		target = cur
+		if (inc.TargetAbsent && cur == nil) || (inc.Target != nil && cur != nil && cur.Revision == inc.Target.Revision && SameConfig(cur, inc.Target)) {
+			mode = "completed"
+		}
+	}
+	if needsSave {
+		// Save before restoring a traffic path. A failed write must leave the
+		// VPN closed and the intent pending, including on repeated recovery.
 		if err := e.persist(target); err != nil {
-			return nil, fmt.Errorf("recovery: %w", err)
+			smErr := e.SafeMode(ctx, target, ifname)
+			_ = j.Append(journal.Record{OpID: inc.OpID, Event: journal.EventSafeMode, Op: inc.Op, Recovery: inc.Recovery, Detail: errors.Join(err, smErr).Error()})
+			return &RecoveryResult{Op: inc.Op, OpID: inc.OpID, Mode: "safe-mode"}, &ApplyError{Cause: fmt.Errorf("recovery: %w", err), SafeMode: true, Forward: forward, Detail: smErr}
 		}
 	}
 	e.progress("recovering interrupted operation %q (%s)", inc.Op, mode)
@@ -356,7 +370,7 @@ func (e *Engine) Recover(ctx context.Context, j *journal.Journal) (*RecoveryResu
 	}
 	if err != nil {
 		smErr := e.SafeMode(ctx, target, ifname)
-		_ = j.Append(journal.Record{OpID: inc.OpID, Event: journal.EventSafeMode, Op: inc.Op, Detail: errors.Join(err, smErr).Error()})
+		_ = j.Append(journal.Record{OpID: inc.OpID, Event: journal.EventSafeMode, Op: inc.Op, Recovery: inc.Recovery, Detail: errors.Join(err, smErr).Error()})
 		return &RecoveryResult{Op: inc.Op, OpID: inc.OpID, Mode: "safe-mode"}, &ApplyError{Cause: err, SafeMode: true, Detail: smErr}
 	}
 	detail := mode

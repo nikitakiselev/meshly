@@ -246,7 +246,7 @@ func (a *App) cmdReset(ctx context.Context, args []string) error {
 		}
 	} else {
 		a.printf("Removing leftover meshly objects:\n")
-		if _, err := a.Engine.Reconcile(ctx, nil, model.DefaultInterface, nil); err != nil {
+		if err := a.Engine.CleanupOwned(ctx); err != nil {
 			return err
 		}
 		_ = a.Paths.RemoveConfig()
@@ -363,8 +363,11 @@ func (a *App) serviceStop(ctx context.Context) error {
 	}
 	defer s.end()
 	cfg, err := a.Paths.LoadConfig()
-	if err != nil && !errors.Is(err, store.ErrNotInitialized) {
-		_, rerr := a.Engine.Reconcile(ctx, nil, model.DefaultInterface, nil)
+	if err != nil {
+		rerr := a.Engine.CleanupOwned(ctx)
+		if errors.Is(err, store.ErrNotInitialized) {
+			return rerr
+		}
 		return errors.Join(err, rerr)
 	}
 	ifname := model.DefaultInterface

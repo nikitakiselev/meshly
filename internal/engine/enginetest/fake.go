@@ -181,6 +181,22 @@ func (k *Kernel) LinkOps() *Links { return &Links{k} }
 
 type Links struct{ k *Kernel }
 
+func (f *Links) OwnedInterfaces() ([]string, error) {
+	f.k.mu.Lock()
+	defer f.k.mu.Unlock()
+	if err := f.k.call("link.list"); err != nil {
+		return nil, err
+	}
+	var names []string
+	for name, l := range f.k.Links {
+		if l.Owned() {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names, nil
+}
+
 func (f *Links) Observe(name string) (netstack.Link, error) {
 	f.k.mu.Lock()
 	defer f.k.mu.Unlock()

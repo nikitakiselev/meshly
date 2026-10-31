@@ -164,7 +164,7 @@ is a no-op ("kernel state already matches").
    the configuration nor the kernel would change, return without journaling.
 2. Append a fsync'ed `begin` record with the operation, audit arguments,
    actor (uid, `SUDO_USER`), recovery direction, base revision, interface,
-   plan, and the complete target configuration.
+   plan, and the complete base and target configurations (or explicit absence).
 3. For **forward** operations, save the target configuration first
    (write-ahead).
 4. Run the steps.
@@ -193,7 +193,9 @@ guards, no peers and no allow rules, so everything on the interface is
 dropped, and no mark on the WireGuard transport, so the host firewall closes
 the listen port again), but only if no foreign table with the same name exists, then
 deletes the interface (falling back to removing all peers). Nothing else is
-touched and the saved configuration is kept. `meshly start` re-applies it.
+touched. Safe mode is not transaction completion: the journal keeps the intended
+recovery configuration until it has been saved, applied and verified.
+`meshly start` first recovers that transaction.
 
 Ownership conflicts (a foreign interface or table with meshly's name) are
 never "repaired": the operation stops with exit 5 and nothing is changed.
@@ -216,21 +218,28 @@ leftover one.
 ### Recovery of interrupted operations
 
 An operation whose `begin` has no terminal record (`commit`, `rolled-back`,
-`safe-mode`, `recovered`) was interrupted, for example by a crash or power
+`recovered`) is incomplete, including after `safe-mode`, a crash or power
 loss. Every mutating command takes the lock and then calls
 `Engine.Recover` before doing anything else, and so do `meshly service start`
 (boot) and the check timer:
 
-- the saved configuration equals the journaled target → the operation had
-  committed its configuration: reconcile the kernel to it (`completed`, or
-  `rolled-forward` for forward operations);
-- forward operation not yet saved → save the target, reconcile
-  (`rolled-forward`);
-- backward operation not saved → reconcile to the saved (base) configuration
-  (`rolled-back`).
+- forward operation → save and reconcile to the journaled target
+  (`rolled-forward`), even if its write-ahead save previously failed;
+- backward operation → restore the journaled base (`rolled-back`), including
+  after the target was saved but before a terminal record was written;
+- older journal records without a recorded base retain their legacy recovery:
+  a saved target is completed, otherwise the saved configuration is restored.
+  Historical safe-mode records from older releases remain terminal, so upgrading
+  cannot replay an old operation over later committed changes.
 
-If reconciling fails, recovery enters safe mode. The result is journaled as
+If persistence or reconciling fails, recovery enters safe mode and leaves the
+operation incomplete. Successful recovery is journaled as
 `recovered` with the mode. `meshly recover` runs only this step.
+
+When configuration is absent or unreadable, `reset` and `service stop`
+discover WireGuard interfaces by validated meshly ownership aliases. They
+close every owned traffic path before removing shared firewall protection.
+A failure retains protection and reports failure; foreign interfaces are untouched.
 
 ### Locking
 
@@ -359,10 +368,13 @@ loopback included, and the listener answers no other source. Details:
    expected `version --short`, and then replaces the executable by rename.
    The previous binary is kept as `<exe>.prev`. This happens under the
    operation lock.
-5. The new binary rewrites the unit files (`meshly service install`). If
-   `meshly.service` was active it is restarted and must become active within
-   30 seconds. Otherwise the previous binary is restored from `.prev`, the
-   service is restarted again, and the command exits with 7.
+5. The new binary rewrites the unit files (`meshly service install`). The
+   service's running intent is captured before replacement: a stopped unit
+   stays stopped; a running unit is restarted and must become active within
+   30 seconds. On failure the previous binary is restored from `.prev`, its
+   units are installed and its service is restarted regardless of the failed
+   new unit's state. Exit 7 means restoration was verified; restoration failures
+   are reported as errors.
 
 `install.sh` performs the same signature and hash verification with
 `openssl` and `sha256sum` before the first installation. It embeds the

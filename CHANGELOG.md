@@ -7,8 +7,18 @@ on-disk formats.
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-10-31
+
 ### Fixed
 
+- `reset` and `service stop` discover owned WireGuard interfaces even when the configuration is missing or
+  unreadable. All owned traffic paths close before the shared firewall is removed; foreign interfaces stay untouched.
+- A failed configuration write no longer loses a pending `deny`, `revoke` or `stop` in safe mode. Recovery retains
+  the access-removal intent and keeps the VPN closed until it can save and apply it. An interrupted access-granting
+  transaction restores its journaled base, including when saving that base previously failed.
+- A failed upgrade restarts and verifies the restored version even when the new service is failed or inactive.
+  An intentionally stopped service stays stopped, and restoration failures are reported.
+- Release builds use Go 1.27.3. Source and binary vulnerability checks run before signing and publication.
 - In a container (LXC on Proxmox, for example) without kernel WireGuard, preflight says to load the module on the
   host (`modprobe wireguard` there, and `/etc/modules-load.d/wireguard.conf` to load it at boot). It advised to
   install a kernel or to run `modprobe`, which a container cannot do.
@@ -152,7 +162,8 @@ First public release.
 - Signed self-upgrade from GitHub releases (`upgrade`), `install.sh` with signature verification, reproducible
   release builds for linux/amd64 and linux/arm64.
 
-[Unreleased]: https://github.com/nikitakiselev/meshly/compare/v0.0.6...HEAD
+[Unreleased]: https://github.com/nikitakiselev/meshly/compare/v0.0.7...HEAD
+[0.0.7]: https://github.com/nikitakiselev/meshly/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/nikitakiselev/meshly/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/nikitakiselev/meshly/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/nikitakiselev/meshly/compare/v0.0.3...v0.0.4

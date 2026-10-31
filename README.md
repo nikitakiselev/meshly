@@ -69,7 +69,8 @@ flowchart LR
   expires after 10 minutes and never passes through command-line arguments.
 - **Safe changes.** Every change is a journaled transaction with verification and rollback. If a failure leaves the
   tunnel in an unknown state, meshly closes it (*safe mode*) rather than leaving it open. An operation interrupted by
-  a crash or power loss is finished or rolled back on the next start.
+  a crash or power loss is finished or rolled back on the next start. Safe mode retains pending access removals,
+  including when their configuration could not be saved, so recovery cannot silently restore an old allow rule.
 - **Works with your firewall.** meshly owns one nftables table, `inet meshly`, and replaces it atomically. With UFW or
   iptables rules, meshly keeps one rule at the top of their `INPUT` and `OUTPUT` chains (and `FORWARD` on a Docker
   host) that lets through only what meshly allowed; no `ufw allow` is needed. fail2ban needs nothing either. It

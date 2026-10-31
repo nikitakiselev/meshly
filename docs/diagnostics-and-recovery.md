@@ -223,8 +223,10 @@ it).
 
 Every mutating operation writes a `begin` record (operation, arguments,
 actor uid and `SUDO_USER`, recovery direction, plan, full target
-configuration) and a terminal record: `commit`, `rolled-back`, `safe-mode`
-or `recovered`. Events outside a transaction are recorded as `audit`
+configuration, plus the base configuration or its absence) and a terminal
+record: `commit`, `rolled-back` or `recovered`. `safe-mode` records a failure
+but leaves recovery pending. Historical safe-mode records written by older
+releases remain terminal to preserve later committed changes. Events outside a transaction are recorded as `audit`
 records: `invite` (opened, with its expiry, and closed: `joined <name>`,
 `cancelled`, `expired`, `failed` or `interrupted`), `upgrade` and
 `upgrade-rollback`, `reset`, `restart` and `service-stop`. The journal never
@@ -264,8 +266,9 @@ meshly: recovered interrupted operation "allow": rolled-back
 ```
 
 - Operations that grant access (`init`, `invite`, `join`, `allow`, `start`,
-  `set`) are rolled back unless their configuration had already been saved,
-  in which case they are completed.
+  `set`) restore their journaled base, including when the target was saved
+  before a crash. Older journal records without a base retain the previous
+  behavior: a saved target is completed.
 - Operations that reduce access (`deny`, `revoke`, `stop`, `reset`, and
   `invite-undo` and `join-undo`, which remove a node that joined but did not
   confirm) are always completed (`rolled-forward`).
@@ -292,7 +295,9 @@ the retry) fails too, meshly enters safe mode and exits with 8:
   transport either, so the integration rule of your firewall, or meshly's
   rule in the iptables chains, no longer opens the listen port;
 - the WireGuard interface is deleted;
-- nothing else on the host is changed, and the saved configuration is kept.
+- nothing else on the host is changed. The journal keeps the intended target
+  for an access-removing operation, or the base for an access-granting operation,
+  until it can be saved and applied.
 
 To leave safe mode, find the cause with `meshly doctor` and
 `journalctl -u meshly`, fix it, and run:
@@ -302,12 +307,14 @@ sudo meshly start
 ```
 
 While `meshly.service` is active, `meshly-watch.service` and the check
-timer also see the missing interface as drift and attempt the same repair:
+timer first recover the pending transaction, then check drift:
 the watch within about a second of safe mode, then, after an attempt that
 failed, once a minute, as the timer does. If the cause persists, each
 attempt fails, is rolled back or ends in safe mode again, and is visible in
-`meshly logs`. The re-applied configuration is the last committed one, so
-the change that failed is not part of it
+`meshly logs`. A configuration-write failure keeps the VPN closed and the
+transaction pending. Once fixed, recovery completes a pending `deny`, `revoke`
+or `stop`; an older allow rule is never restored in its place. A failed
+access-granting change restores the journaled base
 (`TestSystemdLifecycle/safe-mode-retried-by-check`, with the watch stopped,
 so that the check does it).
 

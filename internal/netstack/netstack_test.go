@@ -107,3 +107,14 @@ func TestServedBridges(t *testing.T) {
 		t.Fatalf("without bridges: %+v", got)
 	}
 }
+
+func TestOwnedAliasRequiresCompleteNetworkID(t *testing.T) {
+	for _, alias := range []string{"", "meshly:", "meshly:invalid", "meshly:0123456789abcdef0123456789abcdef-extra", "meshly:0123456789ABCDEF0123456789ABCDEF"} {
+		if IsOwnedAlias(alias) {
+			t.Errorf("malformed ownership marker accepted: %q", alias)
+		}
+	}
+	if !IsOwnedAlias("meshly:0123456789abcdef0123456789abcdef") {
+		t.Error("complete ownership marker rejected")
+	}
+}
