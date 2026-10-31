@@ -204,7 +204,10 @@ func TestIncomplete(t *testing.T) {
 		{"empty", nil, ""},
 		{"committed", []Record{begin("a"), ev("a", EventPhase), ev("a", EventCommit)}, ""},
 		{"rolled back", []Record{begin("a"), ev("a", EventRolledBack)}, ""},
-		{"safe mode", []Record{begin("a"), ev("a", EventSafeMode)}, ""},
+		{"legacy safe mode terminal", []Record{begin("a"), ev("a", EventSafeMode)}, ""},
+		{"new safe mode remains pending", []Record{{OpID: "a", Event: EventBegin, Op: "op-a", BaseAbsent: true}, ev("a", EventSafeMode)}, "a"},
+		{"new recovery safe mode remains pending", []Record{begin("a"), {OpID: "a", Event: EventSafeMode, Recovery: Forward}}, "a"},
+		{"legacy safe mode superseded by committed revoke", []Record{begin("a"), ev("a", EventSafeMode), begin("b"), ev("b", EventCommit)}, ""},
 		{"recovered", []Record{begin("a"), ev("a", EventRecovered)}, ""},
 		{"begin only", []Record{begin("a")}, "a"},
 		{"begin and phases", []Record{begin("a"), ev("a", EventPhase), ev("a", EventPhase)}, "a"},
@@ -366,6 +369,23 @@ func TestNoRotationWithOpenOperation(t *testing.T) {
 	}
 }
 
+func TestNoRotationWithPendingSafeMode(t *testing.T) {
+	j, path := newJournal(t)
+	fill(t, path, maxJournalSize, true)
+	appendAll(t, j,
+		Record{OpID: "old", Event: EventBegin, Recovery: Forward, BaseAbsent: true},
+		Record{OpID: "old", Event: EventSafeMode, Recovery: Forward},
+		Record{OpID: "read-only", Event: EventAudit},
+	)
+	if _, err := os.Stat(path + ".1"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rotation discarded pending safe-mode intent: %v", err)
+	}
+	inc, err := j.Incomplete()
+	if err != nil || inc == nil || inc.OpID != "old" || inc.Recovery != Forward {
+		t.Fatalf("pending safe-mode intent = %+v, %v", inc, err)
+	}
+}
+
 func TestReadError(t *testing.T) {
 	dir := t.TempDir()
 	j := Open(dir, clock()) // a directory cannot be read as a journal
@@ -377,5 +397,19 @@ func TestReadError(t *testing.T) {
 	}
 	if _, err := j.Last(1); err == nil {
 		t.Error("Last of a directory succeeded")
+	}
+}
+
+// Safe mode may follow a complete commit line whose Sync failed; its
+// earlier begin must stay available even at the rotation threshold.
+func TestSafeModeAfterCommitDoesNotRotateAwayIntent(t *testing.T) {
+	j, path := newJournal(t)
+	fill(t, path, maxJournalSize, false)
+	appendAll(t, j, Record{OpID: "old", Event: EventSafeMode, Recovery: Forward})
+	if _, err := os.Stat(path + ".1"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("safe-mode append rotated its begin: %v", err)
+	}
+	if inc, err := j.Incomplete(); err != nil || inc == nil || inc.OpID != "old" {
+		t.Fatalf("safe-mode lost begin after visible commit: %+v, %v", inc, err)
 	}
 }

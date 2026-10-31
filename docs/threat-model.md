@@ -418,6 +418,12 @@ release.
   reproducible, and `.github/workflows/release-verify.yml` rebuilds each
   published release from its tag and compares it with the signed
   `SHA256SUMS`.
+- **Failed upgrades restore the running service.** Running intent is captured
+  before replacement; rollback restarts the restored binary even after the
+  new unit fails, and verifies it becomes active before reporting success.
+  An intentionally stopped service stays stopped. *Integration:*
+  `TestUpgradeRollbackRestoresRunningService` checks the restored binary version,
+  active unit and allowed TCP traffic after a signed release fails to start.
 
 **Not protected:**
 
@@ -429,9 +435,6 @@ release.
   with the key.
 - **Freeze attacks.** A mirror can withhold new releases; meshly only
   refuses older ones.
-- **Automatic rollback after a failed restart is not verified.**
-  `upgrade` restores `<exe>.prev` if `meshly.service` does not come back
-  after the upgrade; this path is not covered by an integration test.
 
 ### 7. Misconfigured or changing foreign firewall, Docker
 
@@ -621,10 +624,23 @@ grants. Changes run as journaled transactions:
 - access-reducing changes are completed on recovery;
 - if a rollback itself fails, safe mode replaces the table with a lockdown
   table and removes the interface.
+- safe mode keeps incomplete intent in the journal. If persisting a deny,
+  revoke or stop fails, recovery keeps the VPN closed until the intended
+  target can be saved and applied. Pending access-granting transactions
+  restore their journaled base, even after the target was saved;
+- without readable configuration, reset and service stop discover every
+  owned WireGuard interface by its validated alias and close those paths
+  before removing shared firewall protection. Foreign objects stay untouched.
 
 *Integration:* `TestFaultsInit`, `TestFaultsAllow` (including safe mode),
 `TestFaultsReduce`, `TestFaultJoin`, which inject errors and crashes
 (immediate process exit without cleanup) at each step, and `TestSystemdLifecycle/recovery-at-boot`.
+`TestIssue1CleanupWithoutConfig` checks custom interface cleanup after missing
+and corrupt configuration with allowed and denied TCP probes and foreign objects.
+`TestIssue2ForwardPersistenceFailure` and `TestIssue2BackwardBasePersistenceFailure`
+check real TCP traffic stays closed across blocked configuration writes and repeated
+recovery. Unit tests also cover superseded historical safe-mode records and failure
+to append a commit, including completion without Docker networks.
 Concurrent commands are serialised by a lock (`TestConcurrentOperations`).
 The fault-injection points exist only in builds with the
 `meshly_faultinject` tag. Details:

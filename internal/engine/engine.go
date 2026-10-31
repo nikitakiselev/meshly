@@ -37,6 +37,7 @@ import (
 
 // LinkOps manages the interface (implemented by netstack.Netlink).
 type LinkOps interface {
+	OwnedInterfaces() ([]string, error)
 	Observe(name string) (netstack.Link, error)
 	Create(name string, mtu int, alias string) error
 	Delete(name string) error

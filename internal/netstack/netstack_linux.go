@@ -30,6 +30,23 @@ type Netlink struct {
 // New returns the production implementation.
 func New() *Netlink { return &Netlink{ProcSys: "/proc/sys"} }
 
+// OwnedInterfaces lists only WireGuard links with a complete ownership marker.
+// Interrupted dumps are retried; an incomplete inventory is never accepted.
+func (n *Netlink) OwnedInterfaces() ([]string, error) {
+	links, err := linkList()
+	if err != nil {
+		return nil, fmt.Errorf("list owned interfaces: %w", err)
+	}
+	var names []string
+	for _, l := range links {
+		if l.Type() == "wireguard" && IsOwnedAlias(l.Attrs().Alias) {
+			names = append(names, l.Attrs().Name)
+		}
+	}
+	slices.Sort(names)
+	return names, nil
+}
+
 // Observe reads the state of the interface name.
 func (n *Netlink) Observe(name string) (Link, error) {
 	l, err := netlink.LinkByName(name)

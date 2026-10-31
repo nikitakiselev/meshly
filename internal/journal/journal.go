@@ -2,6 +2,8 @@
 // mutating operation writes a "begin" record (with the full target config
 // needed for recovery), phase records and a terminal record. An operation
 // without a terminal record is incomplete and is recovered on the next run.
+// Safe mode in new records closes the traffic path and keeps the transaction
+// pending; legacy safe-mode records retain their terminal semantics.
 // The same records form the audit trail shown by `meshly logs`.
 package journal
 
@@ -52,10 +54,15 @@ type Record struct {
 	Actor  string    `json:"actor,omitempty"`
 	Detail string    `json:"detail,omitempty"`
 
+	// Recovery is also set on new safe-mode records to retain pending intent.
+	Recovery string `json:"recovery,omitempty"`
 	// begin only
-	Recovery     string        `json:"recovery,omitempty"`
-	BaseRevision uint64        `json:"base_revision,omitempty"`
-	Target       *model.Config `json:"target,omitempty"`
+	BaseRevision uint64 `json:"base_revision,omitempty"`
+	// Base/BaseAbsent make rollback durable even after the target was saved.
+	// Their absence identifies older records that recover from saved config.
+	Base       *model.Config `json:"base,omitempty"`
+	BaseAbsent bool          `json:"base_absent,omitempty"`
+	Target     *model.Config `json:"target,omitempty"`
 	// TargetAbsent means the operation removes the configuration (reset or
 	// a rolled back init).
 	TargetAbsent bool     `json:"target_absent,omitempty"`
@@ -84,7 +91,11 @@ func (j *Journal) Append(r Record) error {
 		return err
 	}
 	b = append(b, '\n')
-	j.rotateIfNeeded()
+	// Keep failure/recovery records beside their begin even when a complete
+	// commit line was written before Append reported a Sync/Close failure.
+	if r.Event == EventBegin || r.Event == EventAudit {
+		j.rotateIfNeeded()
+	}
 	f, err := os.OpenFile(j.path, os.O_RDWR|os.O_APPEND|os.O_CREATE|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
 		return fmt.Errorf("open journal: %w", err)
@@ -150,14 +161,18 @@ func (j *Journal) Read() ([]Record, error) {
 	return out, nil
 }
 
-// Incomplete returns the begin record of the last operation that has no
-// terminal record, or nil.
+// Incomplete returns the begin record of the last pending operation, or nil.
+// A new safe-mode record supersedes an earlier terminal record when an append
+// reported failure after writing that terminal line.
 func (j *Journal) Incomplete() (*Record, error) {
 	recs, err := j.Read()
 	if err != nil {
 		return nil, err
 	}
 	open := map[string]*Record{}
+	// A readable terminal line can precede a reported append failure. Keep
+	// its begin so an explicit subsequent safe mode can restore its intent.
+	begins := map[string]*Record{}
 	var order []string
 	for i := range recs {
 		r := recs[i]
@@ -165,8 +180,23 @@ func (j *Journal) Incomplete() (*Record, error) {
 		case EventBegin:
 			rr := r
 			open[r.OpID] = &rr
+			begins[r.OpID] = &rr
 			order = append(order, r.OpID)
-		case EventCommit, EventRolledBack, EventRecovered, EventSafeMode:
+		case EventSafeMode:
+			// Old releases treated safe mode as terminal and could commit
+			// later operations. Never resurrect their superseded intent.
+			// New begins and new recovery attempts explicitly remain pending.
+			if b := begins[r.OpID]; b != nil {
+				if b.Base == nil && !b.BaseAbsent && r.Recovery == "" {
+					delete(open, r.OpID)
+				} else {
+					if open[r.OpID] == nil {
+						order = append(order, r.OpID)
+					}
+					open[r.OpID] = b
+				}
+			}
+		case EventCommit, EventRolledBack, EventRecovered:
 			delete(open, r.OpID)
 		}
 	}

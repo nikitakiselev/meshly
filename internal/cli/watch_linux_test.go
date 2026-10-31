@@ -317,9 +317,17 @@ func TestServiceWatchBacksOffAfterFailure(t *testing.T) {
 		_, out := w.stop()
 		t.Fatalf("%d check-repair transactions during the backoff, want 1\n%s", n, out)
 	}
+	if n := checkRepairs(t, vps, journal.EventRolledBack, journal.EventSafeMode); n != 1 {
+		_, out := w.stop()
+		t.Fatalf("%d failed attempts during the backoff, want 1\n%s", n, out)
+	}
 	time.Sleep(vps.app.WatchBackoff - 100*time.Millisecond)
 	w.change()
-	if !within(time.Second, func() bool { return checkRepairs(t, vps, journal.EventBegin)-base == 2 }) {
+	// Safe-mode recovery retries the same pending transaction; a retry
+	// need not append another begin. Count actual failed attempts instead.
+	if !within(time.Second, func() bool {
+		return checkRepairs(t, vps, journal.EventRolledBack, journal.EventSafeMode) == 2
+	}) {
 		_, out := w.stop()
 		t.Fatalf("no new attempt after the backoff\n%s", out)
 	}

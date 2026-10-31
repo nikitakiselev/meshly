@@ -13,6 +13,8 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+
+	"github.com/nikitakiselev/meshly/internal/model"
 )
 
 // RouteProtocol marks routes installed by Meshly (rtm_protocol). 109 is
@@ -26,7 +28,10 @@ const AliasPrefix = "meshly:"
 func Alias(networkID string) string { return AliasPrefix + networkID }
 
 // IsOwnedAlias reports whether an alias marks a Meshly interface.
-func IsOwnedAlias(a string) bool { return strings.HasPrefix(a, AliasPrefix) }
+func IsOwnedAlias(a string) bool {
+	id, ok := strings.CutPrefix(a, AliasPrefix)
+	return ok && model.ValidateNetworkID(id) == nil
+}
 
 // Link is the observed state of the managed interface.
 type Link struct {
