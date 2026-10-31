@@ -18,7 +18,8 @@ on-disk formats.
   transaction restores its journaled base, including when saving that base previously failed.
 - A failed upgrade restarts and verifies the restored version even when the new service is failed or inactive.
   An intentionally stopped service stays stopped, and restoration failures are reported.
-- Release builds use Go 1.27.3. Source and binary vulnerability checks run before signing and publication.
+- Release builds use Go 1.27.3 and `golang.org/x/net` v0.62.0. Source and binary vulnerability checks run before
+  signing and publication.
 - In a container (LXC on Proxmox, for example) without kernel WireGuard, preflight says to load the module on the
   host (`modprobe wireguard` there, and `/etc/modules-load.d/wireguard.conf` to load it at boot). It advised to
   install a kernel or to run `modprobe`, which a container cannot do.

@@ -6,7 +6,7 @@ toolchain go1.27.3
 
 require (
 	github.com/vishvananda/netlink v1.3.1
-	golang.org/x/net v0.61.0
+	golang.org/x/net v0.62.0
 	golang.org/x/sys v0.49.0
 	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
 )
